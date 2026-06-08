@@ -1,7 +1,7 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 
 app = FastAPI()
 
@@ -68,3 +68,46 @@ def get_entries(limit: int = Query(20, gt=0, le=100)):
         return {"count": len(rows), "items": rows}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/entries/{entry_id}")
+def get_entry(entry_id: int):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        cur.execute("""
+            SELECT
+                id,
+                source_url,
+                source_domain,
+                source_title,
+                published_date,
+                detected_at,
+                country_region,
+                institution_type,
+                raw_snippet,
+                raw_content,
+                summary_factual,
+                why_it_matters,
+                theme_tags,
+                affected_principles,
+                risk_level,
+                debate_questions,
+                confidence_notes,
+                review_status,
+                reviewer,
+                reviewed_at,
+                editor_notes
+            FROM public.entries
+            WHERE id = %s
+        """, (entry_id,))
+
+        row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Entry not found")
+
+        return row
+    finally:
+        cur.close()
+        conn.close()
