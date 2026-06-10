@@ -7,6 +7,7 @@ from typing import Any, Literal
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from fastapi import FastAPI, Query, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 
 app = FastAPI()
@@ -232,11 +233,14 @@ def create_entry(entry: EntryIngest):
         existing = cur.fetchone()
 
         if existing:
-            return {
-                "status": "duplicate",
-                "id": existing["id"],
-                "dedup_key": existing["dedup_key"]
-            }
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "duplicate",
+                    "id": existing["id"],
+                    "dedup_key": existing["dedup_key"]
+                }
+            )
 
         cur.execute("""
             INSERT INTO public.entries (
