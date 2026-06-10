@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, status
 from pydantic import BaseModel, Field, HttpUrl
 
 app = FastAPI()
@@ -208,7 +208,7 @@ def get_entry(entry_id: int):
         conn.close()
 
 
-@app.post("/entries")
+@app.post("/entries", status_code=status.HTTP_201_CREATED)
 def create_entry(entry: EntryIngest):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
