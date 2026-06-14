@@ -209,7 +209,15 @@ def get_entry(entry_id: int):
         conn.close()
 
 
-@app.post("/entries", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/entries",
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        409: {
+            "description": "Duplicate entry"
+        }
+    }
+)
 def create_entry(entry: EntryIngest):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
