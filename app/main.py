@@ -12,6 +12,15 @@ from pydantic import BaseModel, Field, HttpUrl
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://asimovwatch.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_connection():
     database_url = os.getenv("DATABASE_URL")
