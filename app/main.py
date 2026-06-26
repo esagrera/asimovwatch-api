@@ -503,3 +503,51 @@ def review_entry(entry_id: int, review: EntryReview):
     finally:
         cur.close()
         conn.close()
+
+@app.delete(
+    "/entries/{entry_id}",
+    responses={
+        404: {"description": "Entry not found"}
+    }
+)
+def delete_entry(entry_id: int):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        cur.execute("""
+            SELECT id, source_title
+            FROM public.entries
+            WHERE id = %s
+        """, (entry_id,))
+        existing = cur.fetchone()
+
+        if not existing:
+            raise HTTPException(status_code=404, detail="Entry not found")
+
+        cur.execute("""
+            DELETE FROM public.entries
+            WHERE id = %s
+            RETURNING id, source_title
+        """, (entry_id,))
+        deleted = cur.fetchone()
+        conn.commit()
+
+        return {
+            "status": "deleted",
+            "item": deleted
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete entry: {str(e)}"
+        )
+
+    finally:
+        cur.close()
+        conn.close()
