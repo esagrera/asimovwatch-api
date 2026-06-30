@@ -175,14 +175,14 @@ def db_check():
 def list_entries(
     limit: int = 20,
     offset: int = 0,
-    status: str | None = None,
-    risk_level: str | None = None,
-    source_type: str | None = None,
-    country_region: str | None = None,
-    reviewer: str | None = None,
-    processing_status: str | None = None,
-    relevance_score: str | None = None,
-    q: str | None = None,
+    status: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    source_type: Optional[str] = None,
+    country_region: Optional[str] = None,
+    reviewer: Optional[str] = None,
+    processing_status: Optional[str] = None,
+    relevance_score: Optional[str] = None,
+    q: Optional[str] = None,
 ):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
