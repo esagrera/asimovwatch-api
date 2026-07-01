@@ -1,22 +1,63 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import base64
 import hashlib
 import json
 import os
+import secrets
 
 import psycopg2
 import psycopg2.errors
 from psycopg2.extras import RealDictCursor, Json
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Security, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, AnyUrl
 from typing import Optional
 from datetime import datetime, timezone
 
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Asimovwatch API", version="2.0.0")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    expected = os.environ.get("API_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=500, detail="API_KEY no configurada al servidor")
+    if not secrets.compare_digest(api_key or "", expected):
+        raise HTTPException(status_code=401, detail="API Key invàlida o absent")
+    return api_key
+
+# ─── APP ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="Asimovwatch API",
+    version="2.0.0",
+    dependencies=[Depends(verify_api_key)]
+)
+
+@app.middleware("http")
+async def protect_docs(request: Request, call_next):
+    if request.url.path in ("/docs", "/openapi.json", "/redoc"):
+        docs_user = os.environ.get("DOCS_USER", "")
+        docs_password = os.environ.get("DOCS_PASSWORD", "")
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                user, pwd = decoded.split(":", 1)
+                if secrets.compare_digest(user, docs_user) and secrets.compare_digest(pwd, docs_password):
+                    return await call_next(request)
+            except Exception:
+                pass
+        return Response(
+            status_code=401,
+            headers={"WWW-Authenticate": "Basic realm=\"AsimovWatch Docs\""},
+            content="Accés no autoritzat"
+        )
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +71,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 
