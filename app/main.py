@@ -190,12 +190,12 @@ def build_dedup_key(entry: EntryIngest) -> str:
 
 # ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.get("/", dependencies=[])
 def read_root():
     return {"message": "Asimovwatch API v2 is alive"}
 
 
-@app.get("/db-check")
+@app.get("/db-check", dependencies=[])
 def db_check():
     try:
         conn = get_connection()
