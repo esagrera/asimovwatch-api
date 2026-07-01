@@ -34,9 +34,10 @@ def verify_api_key(api_key: str = Security(api_key_header)):
 
 app = FastAPI(
     title="Asimovwatch API",
-    version="2.0.0",
-    dependencies=[Depends(verify_api_key)]
+    version="2.0.0"
 )
+
+protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 @app.middleware("http")
 async def protect_docs(request: Request, call_next):
@@ -54,7 +55,7 @@ async def protect_docs(request: Request, call_next):
                 pass
         return Response(
             status_code=401,
-            headers={"WWW-Authenticate": "Basic realm=\"AsimovWatch Docs\""},
+            headers={"WWW-Authenticate": 'Basic realm="AsimovWatch Docs"'},
             content="Accés no autoritzat"
         )
     return await call_next(request)
@@ -83,12 +84,10 @@ def get_connection():
         password=os.environ["DB_PASSWORD"],
     )
 
-
 # ─── UTILS ────────────────────────────────────────────────────────────────────
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
 
 def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
@@ -96,7 +95,6 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
-
 
 # ─── MODELS ───────────────────────────────────────────────────────────────────
 
@@ -120,10 +118,10 @@ class EntryIngest(BaseModel):
     raw_payload: Optional[dict] = None
     summary_factual: Optional[str] = None
     why_it_matters: Optional[str] = None
-    theme_tags: Optional[list[str]] = None
-    affected_principles: Optional[list[str]] = None
+    theme_tags: Optional[list] = None
+    affected_principles: Optional[list] = None
     risk_level: Optional[str] = None
-    debate_questions: Optional[list[str]] = None
+    debate_questions: Optional[list] = None
     confidence_notes: Optional[str] = None
     review_status: Optional[str] = "NEW"
     reviewer: Optional[str] = None
@@ -131,13 +129,11 @@ class EntryIngest(BaseModel):
     editor_notes: Optional[str] = None
     validation_notes: Optional[str] = None
 
-
 class EntryReview(BaseModel):
     review_status: str
     reviewer: Optional[str] = None
     editor_notes: Optional[str] = None
     validation_notes: Optional[str] = None
-
 
 class EntryEnrich(BaseModel):
     processing_status: Optional[str] = None
@@ -153,15 +149,13 @@ class EntryEnrich(BaseModel):
     source_language: Optional[str] = None
     summary_factual: Optional[str] = None
     why_it_matters: Optional[str] = None
-    debate_questions: Optional[list[str]] = None
-    theme_tags: Optional[list[str]] = None
-    affected_principles: Optional[list[str]] = None
+    debate_questions: Optional[list] = None
+    theme_tags: Optional[list] = None
+    affected_principles: Optional[list] = None
     risk_level: Optional[str] = None
-
 
 class ConfigUpdate(BaseModel):
     value: str
-
 
 class CrawlerLogCreate(BaseModel):
     sources_checked: int = 0
@@ -171,7 +165,6 @@ class CrawlerLogCreate(BaseModel):
     items_failed: int = 0
     duration_seconds: Optional[float] = None
     notes: Optional[str] = None
-
 
 # ─── DEDUP ────────────────────────────────────────────────────────────────────
 
@@ -187,20 +180,17 @@ def build_dedup_key(entry: EntryIngest) -> str:
     normalized = json.dumps(base, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
+# ─── HEALTH (públic, sense API Key) ───────────────────────────────────────────
 
-# ─── HEALTH ───────────────────────────────────────────────────────────────────
-
-public_router = APIRouter()
-
-@public_router.get("/")
+@app.get("/")
 def read_root():
     return {"message": "Asimovwatch API v2 is alive"}
 
-@public_router.get("/health")
+@app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-@public_router.get("/db-check")
+@app.get("/db-check")
 def db_check():
     try:
         conn = get_connection()
@@ -213,11 +203,9 @@ def db_check():
     except Exception as e:
         return {"database": "error", "detail": str(e)}
 
-app.include_router(public_router)
-
 # ─── ENTRIES LIST ─────────────────────────────────────────────────────────────
 
-@app.get("/entries")
+@protected_router.get("/entries")
 def list_entries(
     limit: int = 20,
     offset: int = 0,
@@ -270,12 +258,10 @@ def list_entries(
 
         if q:
             filters.append("""
-                (
-                    LOWER(source_title) LIKE LOWER(%s)
-                    OR LOWER(raw_snippet) LIKE LOWER(%s)
-                    OR LOWER(summary_factual) LIKE LOWER(%s)
-                    OR LOWER(translated_summary_ca) LIKE LOWER(%s)
-                )
+                (LOWER(source_title) LIKE LOWER(%s)
+                OR LOWER(raw_snippet) LIKE LOWER(%s)
+                OR LOWER(summary_factual) LIKE LOWER(%s)
+                OR LOWER(translated_summary_ca) LIKE LOWER(%s))
             """)
             like_q = f"%{q}%"
             params.extend([like_q, like_q, like_q, like_q])
@@ -290,28 +276,11 @@ def list_entries(
 
         data_query = f"""
             SELECT
-                id,
-                source_url,
-                source_domain,
-                source_title,
-                source_type,
-                source_language,
-                country_region,
-                risk_level,
-                review_status,
-                reviewer,
-                published_date,
-                detected_at,
-                ingested_at,
-                ingest_status,
-                summary_factual,
-                theme_tags,
-                affected_principles,
-                processing_status,
-                relevance_score,
-                relevance_reason,
-                enriched_at,
-                enriched_model,
+                id, source_url, source_domain, source_title, source_type,
+                source_language, country_region, risk_level, review_status,
+                reviewer, published_date, detected_at, ingested_at, ingest_status,
+                summary_factual, theme_tags, affected_principles, processing_status,
+                relevance_score, relevance_reason, enriched_at, enriched_model,
                 translated_summary_ca
             FROM public.entries
             {where_clause}
@@ -337,10 +306,9 @@ def list_entries(
         cur.close()
         conn.close()
 
-
 # ─── ENTRY DETAIL ─────────────────────────────────────────────────────────────
 
-@app.get("/entries/{entry_id}")
+@protected_router.get("/entries/{entry_id}")
 def get_entry(entry_id: int):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -348,50 +316,17 @@ def get_entry(entry_id: int):
     try:
         cur.execute("""
             SELECT
-                id,
-                source_url,
-                source_domain,
-                source_title,
-                source_type,
-                source_language,
-                ingest_method,
-                external_id,
-                author_name,
-                canonical_url,
-                published_date,
-                detected_at,
-                country_region,
-                institution_type,
-                raw_snippet,
-                raw_snippet_original,
-                raw_content,
-                raw_content_format,
-                raw_payload,
-                summary_factual,
-                why_it_matters,
-                theme_tags,
-                affected_principles,
-                risk_level,
-                debate_questions,
-                confidence_notes,
-                review_status,
-                reviewer,
-                reviewed_at,
-                editor_notes,
-                validation_notes,
-                dedup_key,
-                ingest_status,
-                ingested_at,
-                updated_at,
-                processing_status,
-                processing_error,
-                processing_retries,
-                relevance_score,
-                relevance_reason,
-                enriched_at,
-                enriched_model,
-                translated_summary_ca,
-                translated_whyitmatters_ca,
+                id, source_url, source_domain, source_title, source_type,
+                source_language, ingest_method, external_id, author_name,
+                canonical_url, published_date, detected_at, country_region,
+                institution_type, raw_snippet, raw_snippet_original, raw_content,
+                raw_content_format, raw_payload, summary_factual, why_it_matters,
+                theme_tags, affected_principles, risk_level, debate_questions,
+                confidence_notes, review_status, reviewer, reviewed_at,
+                editor_notes, validation_notes, dedup_key, ingest_status,
+                ingested_at, updated_at, processing_status, processing_error,
+                processing_retries, relevance_score, relevance_reason, enriched_at,
+                enriched_model, translated_summary_ca, translated_whyitmatters_ca,
                 translated_debatequestions_ca
             FROM public.entries
             WHERE id = %s
@@ -406,11 +341,10 @@ def get_entry(entry_id: int):
         cur.close()
         conn.close()
 
-
 # ─── CREATE ENTRY ─────────────────────────────────────────────────────────────
 
-@app.post("/entries", status_code=status.HTTP_201_CREATED,
-          responses={409: {"description": "Duplicate entry"}})
+@protected_router.post("/entries", status_code=status.HTTP_201_CREATED,
+    responses={409: {"description": "Duplicate entry"}})
 def create_entry(entry: EntryIngest):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -482,11 +416,10 @@ def create_entry(entry: EntryIngest):
         cur.close()
         conn.close()
 
-
 # ─── REVIEW ENTRY ─────────────────────────────────────────────────────────────
 
-@app.put("/entries/{entry_id}/review",
-         responses={404: {"description": "Entry not found"}})
+@protected_router.put("/entries/{entry_id}/review",
+    responses={404: {"description": "Entry not found"}})
 def review_entry(entry_id: int, review: EntryReview):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -501,12 +434,12 @@ def review_entry(entry_id: int, review: EntryReview):
         cur.execute("""
             UPDATE public.entries
             SET
-                review_status    = %s,
-                reviewer         = %s,
-                editor_notes     = %s,
+                review_status = %s,
+                reviewer = %s,
+                editor_notes = %s,
                 validation_notes = %s,
-                reviewed_at      = COALESCE(%s, reviewed_at),
-                updated_at       = now()
+                reviewed_at = COALESCE(%s, reviewed_at),
+                updated_at = now()
             WHERE id = %s
             RETURNING
                 id, source_url, source_title, source_domain,
@@ -530,11 +463,10 @@ def review_entry(entry_id: int, review: EntryReview):
         cur.close()
         conn.close()
 
+# ─── ENRICH ENTRY ─────────────────────────────────────────────────────────────
 
-# ─── ENRICH ENTRY (NOU) ───────────────────────────────────────────────────────
-
-@app.put("/entries/{entry_id}/enrich",
-         responses={404: {"description": "Entry not found"}})
+@protected_router.put("/entries/{entry_id}/enrich",
+    responses={404: {"description": "Entry not found"}})
 def enrich_entry(entry_id: int, enrich: EntryEnrich):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -601,10 +533,9 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
         cur.close()
         conn.close()
 
+# ─── ENTRIES PENDING ENRICHMENT ───────────────────────────────────────────────
 
-# ─── ENTRIES PENDING ENRICHMENT (NOU) ────────────────────────────────────────
-
-@app.get("/entries/pending/enrichment")
+@protected_router.get("/entries/pending/enrichment")
 def list_pending_enrichment(limit: int = 50):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -618,7 +549,7 @@ def list_pending_enrichment(limit: int = 50):
                 detected_at, processing_status, processing_retries
             FROM public.entries
             WHERE processing_status IN ('RAW', 'ERROR')
-              AND processing_retries < 3
+            AND processing_retries < 3
             ORDER BY detected_at ASC NULLS LAST
             LIMIT %s
         """, (safe_limit,))
@@ -631,11 +562,10 @@ def list_pending_enrichment(limit: int = 50):
         cur.close()
         conn.close()
 
-
 # ─── DELETE ENTRY ─────────────────────────────────────────────────────────────
 
-@app.delete("/entries/{entry_id}",
-            responses={404: {"description": "Entry not found"}})
+@protected_router.delete("/entries/{entry_id}",
+    responses={404: {"description": "Entry not found"}})
 def delete_entry(entry_id: int):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -659,10 +589,9 @@ def delete_entry(entry_id: int):
         cur.close()
         conn.close()
 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-# ─── CONFIG (NOU) ─────────────────────────────────────────────────────────────
-
-@app.get("/config")
+@protected_router.get("/config")
 def get_config():
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -676,8 +605,7 @@ def get_config():
         cur.close()
         conn.close()
 
-
-@app.put("/config/{key}")
+@protected_router.put("/config/{key}")
 def update_config(key: str, body: ConfigUpdate):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -699,10 +627,9 @@ def update_config(key: str, body: ConfigUpdate):
         cur.close()
         conn.close()
 
+# ─── CRAWLER LOG ──────────────────────────────────────────────────────────────
 
-# ─── CRAWLER LOG (NOU) ────────────────────────────────────────────────────────
-
-@app.get("/crawler-log")
+@protected_router.get("/crawler-log")
 def get_crawler_log(limit: int = 20):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -721,8 +648,7 @@ def get_crawler_log(limit: int = 20):
         cur.close()
         conn.close()
 
-
-@app.post("/crawler-log", status_code=status.HTTP_201_CREATED)
+@protected_router.post("/crawler-log", status_code=status.HTTP_201_CREATED)
 def create_crawler_log(log: CrawlerLogCreate):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -747,10 +673,9 @@ def create_crawler_log(log: CrawlerLogCreate):
         cur.close()
         conn.close()
 
+# ─── STATS ────────────────────────────────────────────────────────────────────
 
-# ─── STATS (NOU) ──────────────────────────────────────────────────────────────
-
-@app.get("/stats")
+@protected_router.get("/stats")
 def get_stats():
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -776,3 +701,7 @@ def get_stats():
     finally:
         cur.close()
         conn.close()
+
+# ─── REGISTRE DE ROUTERS ──────────────────────────────────────────────────────
+
+app.include_router(protected_router)
