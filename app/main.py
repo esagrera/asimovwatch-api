@@ -10,7 +10,7 @@ import secrets
 import psycopg2
 import psycopg2.errors
 from psycopg2.extras import RealDictCursor, Json
-from fastapi import FastAPI, HTTPException, status, Security, Depends, Request
+from fastapi import FastAPI, HTTPException, status, Security, Depends, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
@@ -190,15 +190,17 @@ def build_dedup_key(entry: EntryIngest) -> str:
 
 # ─── HEALTH ───────────────────────────────────────────────────────────────────
 
-@app.get("/", dependencies=[])
+public_router = APIRouter()
+
+@public_router.get("/")
 def read_root():
     return {"message": "Asimovwatch API v2 is alive"}
 
-@app.get("/health", dependencies=[])
+@public_router.get("/health")
 def health_check():
     return {"status": "ok"}
 
-@app.get("/db-check", dependencies=[])
+@public_router.get("/db-check")
 def db_check():
     try:
         conn = get_connection()
@@ -211,6 +213,7 @@ def db_check():
     except Exception as e:
         return {"database": "error", "detail": str(e)}
 
+app.include_router(public_router)
 
 # ─── ENTRIES LIST ─────────────────────────────────────────────────────────────
 
