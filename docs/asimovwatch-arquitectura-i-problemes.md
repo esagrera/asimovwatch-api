@@ -191,6 +191,32 @@ sleep 3 && curl http://localhost:8000/stats
 
 ---
 
+### Problema 5 — Conflicte d'ordre de rutes GET: `/entries/pending/enrichment` vs `/entries/{entry_id}`
+
+**Símptoma:** `GET /entries/pending/enrichment` retornava `422 Unprocessable Entity` en lloc de la llista d'entrades pendents d'enriquiment.
+
+**Causa:** FastAPI (via Starlette) avalua les rutes en l'ordre en què es registren, separades per verb HTTP. El bloc `list_pending_enrichment` (ruta `/entries/pending/enrichment`) estava registrat *després* de `get_entry` (ruta `/entries/{entry_id}`) dins dels endpoints `GET`. En arribar una petició a `/entries/pending/enrichment`, FastAPI la comparava primer contra el patró `/entries/{entry_id}` i intentava convertir el segment `"pending"` al tipus `int` esperat per `entry_id`, provocant l'error de validació.
+
+**Solució:** Moure el bloc complet de:
+```python
+@protected_router.get("/entries/pending/enrichment")
+def list_pending_enrichment(limit: int = 50):
+    ...
+```
+a una posició **anterior** a:
+```python
+@protected_router.get("/entries/{entry_id}")
+def get_entry(entry_id: int):
+    ...
+```
+dins de `app/main.py`.
+
+**Regla general per a futurs endpoints:** Qualsevol ruta amb segments fixos (p. ex. `/entries/pending/enrichment`, `/entries/stats`) ha de registrar-se **sempre abans** que rutes amb paràmetres dinàmics del mateix nivell i del mateix verb HTTP (p. ex. `/entries/{entry_id}`). Aquesta regla és rellevant especialment durant la fase d'ingesta, quan s'afegiran nous endpoints sota `/entries/`.
+
+**Verificat:** 4 de juliol de 2026. Provades ambdues rutes després del reordenament — `GET /entries/pending/enrichment` i `GET /entries/{entry_id}` amb ID real — totes dues retornen `200 OK` correctament.
+
+---
+
 ## Procediment de diagnòstic estàndard
 
 Quan alguna cosa falla, executar sempre aquests comandos **en ordre** al servidor SSH:
