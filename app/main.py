@@ -34,7 +34,8 @@ def verify_api_key(api_key: str = Security(api_key_header)):
 
 app = FastAPI(
     title="Asimovwatch API",
-    version="2.0.0"
+    version="2.0.0",
+    swagger_ui_parameters={"persistAuthorization": True}
 )
 
 protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
