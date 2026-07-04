@@ -307,6 +307,35 @@ def list_entries(
         cur.close()
         conn.close()
 
+# ─── ENTRIES PENDING ENRICHMENT ───────────────────────────────────────────────
+
+@protected_router.get("/entries/pending/enrichment")
+def list_pending_enrichment(limit: int = 50):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        safe_limit = min(max(limit, 1), 200)
+        cur.execute("""
+            SELECT
+                id, source_url, source_domain, source_title,
+                source_language, raw_snippet, published_date,
+                detected_at, processing_status, processing_retries
+            FROM public.entries
+            WHERE processing_status IN ('RAW', 'ERROR')
+            AND processing_retries < 3
+            ORDER BY detected_at ASC NULLS LAST
+            LIMIT %s
+        """, (safe_limit,))
+        rows = cur.fetchall()
+        return {"count": len(rows), "items": rows}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 # ─── ENTRY DETAIL ─────────────────────────────────────────────────────────────
 
 @protected_router.get("/entries/{entry_id}")
@@ -530,35 +559,6 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to enrich entry: {str(e)}")
-    finally:
-        cur.close()
-        conn.close()
-
-# ─── ENTRIES PENDING ENRICHMENT ───────────────────────────────────────────────
-
-@protected_router.get("/entries/pending/enrichment")
-def list_pending_enrichment(limit: int = 50):
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-
-    try:
-        safe_limit = min(max(limit, 1), 200)
-        cur.execute("""
-            SELECT
-                id, source_url, source_domain, source_title,
-                source_language, raw_snippet, published_date,
-                detected_at, processing_status, processing_retries
-            FROM public.entries
-            WHERE processing_status IN ('RAW', 'ERROR')
-            AND processing_retries < 3
-            ORDER BY detected_at ASC NULLS LAST
-            LIMIT %s
-        """, (safe_limit,))
-        rows = cur.fetchall()
-        return {"count": len(rows), "items": rows}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
