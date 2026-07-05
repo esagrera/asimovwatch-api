@@ -53,11 +53,11 @@ Aquestes 5 variables han d'existir a Render per connectar amb la BD de Dinahosti
 
 | Variable | Valor |
 |---|---|
-| `DB_HOST` | `REDACTED_HOST` |
-| `DB_PORT` | `5432` |
-| `DB_NAME` | `asimovwatch` |
-| `DB_USER` | `REDACTED_USER` |
-| `DB_PASSWORD` | *(contrasenya real — no publicar)* |
+| `DB_HOST` |
+| `DB_PORT` |
+| `DB_NAME` |
+| `DB_USER` |
+| `DB_PASSWORD` |
 
 > ⚠️ La variable `DATABASE_URL` és opcional i no és suficient per si sola si el `main.py` usa `os.environ["DB_HOST"]`. Cal que hi siguin les 5 variables individuals.
 
@@ -66,12 +66,12 @@ Aquestes 5 variables han d'existir a Render per connectar amb la BD de Dinahosti
 El fitxer `.env` al servidor ha de contenir les mateixes variables per arrencar Uvicorn localment:
 
 ```
-DB_HOST=REDACTED_HOST
-DB_PORT=5432
-DB_NAME=asimovwatch
-DB_USER=REDACTED_USER
-DB_PASSWORD=<contrasenya>
-PERPLEXITY_API_KEY=<clau>
+DB_HOST
+DB_PORT
+DB_NAME
+DB_USER
+DB_PASSWORD
+PERPLEXITY_API_KEY
 ```
 
 El `main.py` ha de tenir al principi:

@@ -6,11 +6,11 @@ Render ha de connectar-se a la base de dades PostgreSQL de Dinahosting amb les v
 
 ## Variables necessàries a Render
 A Render → asimovwatch-api → Environment han d'existir aquestes 5 variables:
-- `DB_HOST=REDACTED_HOST`
-- `DB_PORT=5432`
-- `DB_NAME=asimovwatch`
-- `DB_USER=REDACTED_USER`
-- `DB_PASSWORD=<contrasenya real>`
+- `DB_HOST`
+- `DB_PORT`
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
 
 ## Per què no n'hi ha prou amb `DATABASE_URL`
 El backend està preparat per llegir les variables individuals i no només una URL compacta. Per això, si a Render hi falta `DB_HOST` o alguna de les altres, poden aparèixer errors del tipus `KeyError: 'DB_HOST'`.
