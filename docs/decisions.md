@@ -7,6 +7,14 @@ AsimovWatch no pretén dictaminar l’ètica final de cada cas, sinó detectar, 
 ## Marc de referència
 El marc editorial i conceptual s’ha de basar en estàndards reals i verificables, especialment la Recomanació de la UNESCO sobre l’ètica de la IA, els principis de l’OCDE i l’EU AI Act.
 
+## Marc conceptual: Protecció humana
+AsimovWatch incorpora Protecció humana com a capa editorial i marc conceptual propi per analitzar fins a quin punt sistemes, empreses i institucions orienten el desenvolupament de la IA cap a la protecció efectiva de les persones. Aquest concepte no substitueix els marcs verificables existents, sinó que es construeix sobre estàndards reals i contrastables com la Recomanació de la UNESCO sobre l’ètica de la IA, els principis de l’OCDE i l’EU AI Act.
+
+La Protecció humana s’entén com una manera de comparar el que els actors declaren, el que realment es pot verificar i a quin nivell tècnic s’apliquen les mesures de salvaguarda. El projecte no pretén decidir de manera definitiva què és ètic, sinó obrir un espai de lectura crítica que ajudi a detectar si la IA es desplega amb una orientació real al bé de la humanitat o només amb una narrativa declarativa.
+
+### Criteri editorial
+El relat d’AsimovWatch ha de distingir clarament entre tres nivells: allò que un actor diu que fa, allò que es pot comprovar amb evidència i allò que efectivament està integrat en el producte, el model, la infraestructura o el xip. Aquesta separació és necessària per evitar confondre màrqueting, política pública i implementació tècnica.
+
 ## Llengua i contingut
 La llengua per defecte del projecte és el català. Les traduccions a ES i EN s’han de fer sota demanda i guardar-se a la base de dades per evitar crides repetides.
 

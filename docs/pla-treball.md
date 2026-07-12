@@ -16,6 +16,12 @@ També està completada. `app/main.py` ja incorpora `load_dotenv()`, endpoints C
 ## Fase 3 — Fonts i prompts
 El proper pas és crear `feeds.json` i `prompts.py` [file:789]. `feeds.json` ha de reunir les fonts MVP prioritàries, i `prompts.py` ha de contenir plantilles per resum factual, classificació temàtica i generació de preguntes de debat amb sortida JSON [file:789].
 
+### Evolució de la fase 3
+La fase 3 no només inclou la creació de feeds.json i prompts.py, sinó també la preparació del primer sistema de classificació de Protecció humana. Aquest sistema ha de permetre assignar a cada entitat o notícia un estat inicial en tres àmbits: protecció declarada, protecció verificable i profunditat de la protecció.
+
+### Primer criteri de classificació
+La classificació inicial es farà amb semàfors simples per facilitar la lectura i la validació humana. El verd indicarà una protecció clara i ben definida; el groc, una protecció parcial, ambigua o incompletament verifica
+
 ## Fase 4 — Crawler
 Després cal construir `crawler.py` [file:789]. Aquest script ha de llegir fonts, fer parsing, deduplicar continguts i enviar entrades a l’API via `POST /entries` [file:789].
 
