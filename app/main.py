@@ -414,13 +414,18 @@ def create_entry(entry: EntryIngest):
                 raw_content_format, raw_payload, summary_factual, why_it_matters,
                 theme_tags, affected_principles, risk_level, debate_questions,
                 confidence_notes, human_protection_declared, human_protection_verifiable,
-                human_protection_depth, human_protection_notes, review_status, reviewer, reviewed_at, editor_notes,
-                validation_notes, dedup_key, ingested_at, updated_at, ingest_status,
-                processing_status
+                human_protection_depth, human_protection_notes, review_status, reviewer,
+                reviewed_at, editor_notes, validation_notes, dedup_key, ingested_at,
+                updated_at, ingest_status, processing_status
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                now(), now(), 'ingested', 'RAW'
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, now(),
+                now(), 'ingested', 'RAW'
             )
             RETURNING
                 id, source_url, source_domain, source_title, source_type,
@@ -435,9 +440,10 @@ def create_entry(entry: EntryIngest):
             entry.raw_content, entry.raw_content_format, Json(entry.raw_payload),
             entry.summary_factual, entry.why_it_matters, entry.theme_tags,
             entry.affected_principles, entry.risk_level, entry.debate_questions,
-            entry.confidence_notes, entry.human_protection_declared, entry.human_protection_verifiable,
-            entry.human_protection_depth, entry.human_protection_notes, 
-            entry.review_status, entry.reviewer, reviewed_at, entry.editor_notes, entry.validation_notes, dedup_key
+            entry.confidence_notes, entry.human_protection_declared,
+            entry.human_protection_verifiable, entry.human_protection_depth,
+            entry.human_protection_notes, entry.review_status, entry.reviewer, reviewed_at, 
+            entry.editor_notes, entry.validation_notes, dedup_key
         ))
 
         created = cur.fetchone()

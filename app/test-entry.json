@@ -1,0 +1,27 @@
+{
+  "source_url": "https://example.org/test-entry-human-protection-2",
+  "source_domain": "example.org",
+  "source_title": "Test d'entrada Protecció humana",
+  "source_type": "other",
+  "source_language": "ca",
+  "ingest_method": "manual",
+  "country_region": "Catalunya",
+  "institution_type": "test",
+  "raw_snippet": "Entrada de prova per validar el model i la persistència.",
+  "raw_content": "Això és una prova tècnica per comprovar que el POST /entries desa correctament els camps.",
+  "summary_factual": "Entrada de prova per validar la integració del model.",
+  "why_it_matters": "Permet comprovar que l'API accepta i desa els camps nous.",
+  "theme_tags": ["test", "validation", "human-protection"],
+  "affected_principles": ["transparency", "human_oversight"],
+  "risk_level": "low",
+  "debate_questions": [
+    "El model desa els camps correctament?",
+    "El GET retorna la mateixa informació?"
+  ],
+  "confidence_notes": "Prova manual local.",
+  "human_protection_declared": "green",
+  "human_protection_verifiable": "yellow",
+  "human_protection_depth": "yellow",
+  "human_protection_notes": "Prova local dels semàfors de protecció humana.",
+  "review_status": "NEW"
+}
