@@ -126,6 +126,10 @@ class EntryIngest(BaseModel):
     risk_level: Optional[str] = None
     debate_questions: Optional[list] = None
     confidence_notes: Optional[str] = None
+    human_protection_declared: Optional[str] = None
+    human_protection_verifiable: Optional[str] = None
+    human_protection_depth: Optional[str] = None
+    human_protection_notes: Optional[str] = None
     review_status: Optional[str] = "NEW"
     reviewer: Optional[str] = None
     reviewed_at: Optional[datetime] = None
@@ -354,7 +358,9 @@ def get_entry(entry_id: int):
                 institution_type, raw_snippet, raw_snippet_original, raw_content,
                 raw_content_format, raw_payload, summary_factual, why_it_matters,
                 theme_tags, affected_principles, risk_level, debate_questions,
-                confidence_notes, review_status, reviewer, reviewed_at,
+                confidence_notes, human_protection_declared,
+                human_protection_verifiable, human_protection_depth,
+                human_protection_notes, review_status, reviewer, reviewed_at,
                 editor_notes, validation_notes, dedup_key, ingest_status,
                 ingested_at, updated_at, processing_status, processing_error,
                 processing_retries, relevance_score, relevance_reason, enriched_at,
@@ -407,7 +413,8 @@ def create_entry(entry: EntryIngest):
                 detected_at, country_region, institution_type, raw_snippet, raw_content,
                 raw_content_format, raw_payload, summary_factual, why_it_matters,
                 theme_tags, affected_principles, risk_level, debate_questions,
-                confidence_notes, review_status, reviewer, reviewed_at, editor_notes,
+                confidence_notes, human_protection_declared, human_protection_verifiable,
+                human_protection_depth, human_protection_notes, review_status, reviewer, reviewed_at, editor_notes,
                 validation_notes, dedup_key, ingested_at, updated_at, ingest_status,
                 processing_status
             ) VALUES (
@@ -428,8 +435,9 @@ def create_entry(entry: EntryIngest):
             entry.raw_content, entry.raw_content_format, Json(entry.raw_payload),
             entry.summary_factual, entry.why_it_matters, entry.theme_tags,
             entry.affected_principles, entry.risk_level, entry.debate_questions,
-            entry.confidence_notes, entry.review_status, entry.reviewer,
-            reviewed_at, entry.editor_notes, entry.validation_notes, dedup_key
+            entry.confidence_notes, entry.human_protection_declared, entry.human_protection_verifiable,
+            entry.human_protection_depth, entry.human_protection_notes, 
+            entry.review_status, entry.reviewer, reviewed_at, entry.editor_notes, entry.validation_notes, dedup_key
         ))
 
         created = cur.fetchone()
