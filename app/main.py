@@ -419,7 +419,7 @@ def create_entry(entry: EntryIngest):
                 processing_status
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 now(), now(), 'ingested', 'RAW'
             )
             RETURNING

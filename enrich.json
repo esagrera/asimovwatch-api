@@ -1,0 +1,21 @@
+{
+  "processing_status": "ENRICHED",
+  "processing_retries": 0,
+  "relevance_score": "high",
+  "relevance_reason": "Demo entry for testing the enrichment flow.",
+  "translated_summary_ca": "Això és un resum factual de prova en català.",
+  "translated_whyitmatters_ca": "Això és una explicació de per què importa en català.",
+  "translated_debatequestions_ca": "Qui en té la responsabilitat? Quines garanties hi ha?",
+  "enriched_model": "manual-test",
+  "raw_snippet_original": "Short excerpt from the article.",
+  "source_language": "en",
+  "summary_factual": "This is a factual summary.",
+  "why_it_matters": "It matters because it affects AI governance.",
+  "debate_questions": [
+    "Who is responsible?",
+    "What safeguards are in place?"
+  ],
+  "theme_tags": ["governance", "transparency"],
+  "affected_principles": ["accountability", "human oversight"],
+  "risk_level": "medium"
+}
