@@ -667,6 +667,67 @@ def update_config(key: str, body: ConfigUpdate):
         cur.close()
         conn.close()
 
+class PromptUpdate(BaseModel):
+    value: str
+
+
+@protected_router.get("/prompts")
+def get_prompts():
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT key, value, updated_at FROM public.prompts ORDER BY key")
+        rows = cur.fetchall()
+        return {"items": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@protected_router.get("/prompts/{key}")
+def get_prompt_versions(key: str):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT id, prompt_key, version, value, change_note, changed_by, changed_at, is_active
+            FROM public.prompt_versions
+            WHERE prompt_key = %s
+            ORDER BY version DESC, changed_at DESC
+        """, (key,))
+        rows = cur.fetchall()
+        return {"items": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@protected_router.put("/prompts/{key}")
+def update_prompt(key: str, body: PromptUpdate):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            INSERT INTO public.prompts (key, value, updated_at)
+            VALUES (%s, %s, now())
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = now()
+            RETURNING key, value, updated_at
+        """, (key, body.value))
+        row = cur.fetchone()
+        conn.commit()
+        return {"status": "ok", "item": row}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 # ─── CRAWLER LOG ──────────────────────────────────────────────────────────────
 
 @protected_router.get("/crawler-log")
