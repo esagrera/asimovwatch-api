@@ -223,15 +223,7 @@ def db_check():
         conn.close()
         return {"database": "connected", "result": result[0]}
     except Exception as e:
-        return {"database": "error", "detail": str(e)}
-    
-@app.get("/gemini-test")
-def gemini_test():
-    try:
-        text = call_gemini("Respon només amb: connexio correcta")
-        return {"ok": True, "response": text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))    
+        return {"database": "error", "detail": str(e)}    
 
 # ─── ENTRIES LIST ─────────────────────────────────────────────────────────────
 
