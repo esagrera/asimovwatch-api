@@ -11,23 +11,59 @@ DEFAULT_CONFIG = {
     "llm_fallback_model": "gemini-3.1-flash-lite",
 }
 
+
 def get_llm_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     merged = dict(DEFAULT_CONFIG)
     if config:
         merged.update({k: v for k, v in config.items() if v is not None})
     return merged
 
+
+def resolve_prompt_phase(phase: str) -> str:
+    phase = (phase or "").strip().lower()
+
+    if phase == "fallback":
+        return "primary"
+    if phase in {"input", "primary", "output"}:
+        return phase
+
+    raise ValueError(f"Unknown phase for prompt resolution: {phase}")
+
+
+def resolve_prompt_key(phase: str) -> str:
+    prompt_phase = resolve_prompt_phase(phase)
+
+    mapping = {
+        "input": "Input",
+        "primary": "Primary",
+        "output": "Output",
+    }
+    return mapping[prompt_phase]
+
+
 def pick_llm(config: Optional[Dict[str, Any]], phase: str) -> Dict[str, str]:
     cfg = get_llm_config(config)
-    phase = phase.lower()
+    phase = (phase or "").strip().lower()
 
     if phase == "input":
-        return {"provider": cfg["llm_input_provider"], "model": cfg["llm_input_model"]}
+        return {
+            "provider": cfg["llm_input_provider"],
+            "model": cfg["llm_input_model"],
+        }
     if phase == "primary":
-        return {"provider": cfg["llm_primary_provider"], "model": cfg["llm_primary_model"]}
+        return {
+            "provider": cfg["llm_primary_provider"],
+            "model": cfg["llm_primary_model"],
+        }
     if phase == "output":
-        return {"provider": cfg["llm_output_provider"], "model": cfg["llm_output_model"]}
+        return {
+            "provider": cfg["llm_output_provider"],
+            "model": cfg["llm_output_model"],
+        }
     if phase == "fallback":
-        return {"provider": cfg["llm_fallback_provider"], "model": cfg["llm_fallback_model"]}
+        return {
+            "provider": cfg["llm_fallback_provider"],
+            "model": cfg["llm_fallback_model"],
+        }
 
     raise ValueError(f"Unknown phase: {phase}")
