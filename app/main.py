@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+from functools import lru_cache
 
 import psycopg2
 import psycopg2.errors
@@ -17,6 +18,9 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, AnyUrl
 from typing import Optional
 from datetime import datetime, timezone
+
+from llm_client import call_gemini
+from llm_router import pick_llm, get_llm_config
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -98,6 +102,17 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+def get_config_map():
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT key, value FROM public.config")
+        rows = cur.fetchall()
+        return {row["key"]: row["value"] for row in rows}
+    finally:
+        cur.close()
+        conn.close()
 
 # ─── MODELS ───────────────────────────────────────────────────────────────────
 
@@ -209,6 +224,14 @@ def db_check():
         return {"database": "connected", "result": result[0]}
     except Exception as e:
         return {"database": "error", "detail": str(e)}
+    
+@app.get("/gemini-test")
+def gemini_test():
+    try:
+        text = call_gemini("Respon només amb: connexio correcta")
+        return {"ok": True, "response": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))    
 
 # ─── ENTRIES LIST ─────────────────────────────────────────────────────────────
 
