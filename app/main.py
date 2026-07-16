@@ -19,8 +19,8 @@ from pydantic import BaseModel, AnyUrl
 from typing import Optional
 from datetime import datetime, timezone
 
-from llm_client import call_gemini
-from llm_router import pick_llm, get_llm_config
+from app.llm_client import call_gemini
+from app.llm_router import pick_llm, get_llm_config
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
