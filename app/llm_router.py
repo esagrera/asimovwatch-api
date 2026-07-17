@@ -9,7 +9,7 @@ DEFAULT_CONFIG = {
     "llm_input_provider": "gemini",
     "llm_input_model": "gemini-3.1-flash-lite",
     "llm_primary_provider": "gemini",
-    "llm_primary_model": "gemini-2.5-flash",
+    "llm_primary_model": "gemini-3.1-flash-lite",
     "llm_output_provider": "gemini",
     "llm_output_model": "gemini-3.1-flash-lite",
     "llm_fallback_provider": "gemini",

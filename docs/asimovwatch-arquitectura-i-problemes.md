@@ -305,3 +305,38 @@ Si load_dotenv() és al main.py, el `source ~/.env` no és necessari.
 4. Si un endpoint com `/stats` retorna 401, comprovar que el client envia `X-API-Key` i que `APIKEY` segueix definida al servei.
 
 **Nota operativa:** El redeploy de Render no hauria de perdre configuració persistent; si sembla que la key desapareix, el problema és de configuració o d’autenticació, no del deploy en si.
+
+## Configuració LLM i prompts en runtime
+
+AsimovWatch ja no depèn només dels valors definits al codi per configurar el comportament del sistema LLM. La configuració activa de providers, models i prompts es pot gestionar des del panell `admin.html`, i es desa a la base de dades per ser llegida en temps d’execució.
+
+### Flux operatiu actual
+
+El flux actual funciona així:
+
+1. L’usuari edita providers, models o prompts des del panell d’administració.
+2. El frontend envia els canvis a l’API.
+3. L’API desa la configuració a `public.config` i els prompts a `public.prompts`.
+4. `llm_router.py` carrega aquesta configuració en runtime i la fa prevaldre sobre els valors per defecte definits al codi.
+
+### Implicació operativa
+
+Això vol dir que fer `git commit` del repositori no és suficient per conservar tota la configuració activa del sistema. Els fitxers del codi poden contenir valors base o de reserva, però la configuració efectiva en producció pot estar vivint a la base de dades.
+
+Per aquest motiu, cada vegada que es validin nous models o prompts des del panell admin convé deixar-ne constància també a la documentació del repositori, especialment si aquests valors passen a formar part del comportament estable del sistema.
+
+### Estat validat
+
+Durant les proves de juliol de 2026 s’ha validat el següent:
+
+- El panell `admin.html` guarda correctament la configuració LLM.
+- `main.py` exposa els endpoints necessaris perquè la configuració quedi persistida.
+- `llm_router.py` resol correctament la configuració activa des de la base de dades.
+- El model `gemini-3.1-flash-lite` ha quedat validat en execució real.
+- El prompt `Primary` ha quedat validat i retorna una sortida JSON coherent amb l’esquema d’enriquiment d’AsimovWatch.
+
+### Nota sobre els valors per defecte
+
+Els valors definits dins `DEFAULT_CONFIG` a `llm_router.py` s’han d’entendre com a reserva tècnica. Si existeixen claus equivalents a `public.config`, aquestes tenen prioritat en temps d’execució.
+
+De la mateixa manera, `prompts.py` continua sent útil com a font base de plantilles i com a referència de desenvolupament, però els prompts efectivament actius poden ser els editats i desats des del panell admin.

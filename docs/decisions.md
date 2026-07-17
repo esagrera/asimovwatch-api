@@ -51,3 +51,11 @@ No s’ha d’exposar l’API sense autenticació bàsica quan hi hagi dades sen
 
 ## Criteri operatiu
 Cada nova font ha de tenir una finalitat clara: cobertura geogràfica, cobertura institucional o diversitat de perspectives. Si una font no aporta valor diferencial, es deixa fora.
+
+## Configuració runtime de models i prompts
+
+La configuració activa dels models i prompts del sistema es gestiona des del panell admin i es persisteix a la base de dades. Els valors definits al codi s’han de considerar valors base o de reserva, però no necessàriament la configuració efectiva en producció.
+
+Això permet ajustar providers, models i prompts sense redeploy immediat del backend i facilita iterar sobre el comportament del sistema des del backoffice.
+
+Com a criteri operatiu, qualsevol canvi que es consolidi com a configuració estable s’hauria de reflectir també a la documentació del repositori, per evitar que el coneixement del sistema quedi només dins la base de dades.
