@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 
 from app.llm_client import call_gemini
 from app.llm_router import pick_llm, get_llm_config
+from app.db import get_connection
+from app.source_candidates import router_candidates
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -41,6 +43,7 @@ app = FastAPI(
     version="2.0.0",
     swagger_ui_parameters={"persistAuthorization": True}
 )
+app.include_router(router_candidates)
 
 protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
 
@@ -79,17 +82,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ─── DB ───────────────────────────────────────────────────────────────────────
-
-def get_connection():
-    return psycopg2.connect(
-        host=os.environ["DB_HOST"],
-        port=os.environ.get("DB_PORT", 5432),
-        dbname=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-    )
 
 # ─── UTILS ────────────────────────────────────────────────────────────────────
 
