@@ -467,21 +467,28 @@ Si no tens prou dades, retorna exactament {{"items": []}}.
             runtime_config = get_llm_config()
             llm_choice = pick_llm(runtime_config, "primary")
 
-            print("DISCOVER: abans call_gemini")
+          print("DISCOVER: abans call_gemini", flush=True)
             llm_response = call_gemini(
                 prompt=llm_input,
                 model=llm_choice.get("model")
             )
-            print("DISCOVER: després call_gemini")
-
-            parsed = llm_response if isinstance(llm_response, dict) else _extract_json_candidate(llm_response)
+            print("DISCOVER: després call_gemini", flush=True)
+            print("DISCOVER RESPONSE TYPE:", type(llm_response), flush=True)
+            print("DISCOVER RAW RESPONSE:", flush=True)
+            print(repr(llm_response), flush=True)
+        
+            if isinstance(llm_response, dict):
+                parsed = llm_response
+            elif isinstance(llm_response, list):
+                parsed = {"items": llm_response}
+            else:
+                parsed = _extract_json_candidate(llm_response)
 
             if not isinstance(parsed, dict):
                 raise HTTPException(
                     status_code=500,
                     detail="La resposta del model no és JSON vàlid"
                 )
-
             items = _normalize_discovery_items(parsed.get("items"))
             detected = len(items)
 
