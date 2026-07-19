@@ -1,10 +1,24 @@
 # =============================================================================
+# IMPORTS
+# =============================================================================
+import json
+from datetime import datetime
+from typing import Optional, Literal
+
+import psycopg2
+import psycopg2.errors
+import psycopg2.extras
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.db import get_connection
+from app.llm_client import call_gemini
+from app.llm_router import pick_llm, get_llm_config
+
+
+# =============================================================================
 # MODELS PYDANTIC — source_candidates
 # =============================================================================
-from pydantic import BaseModel
-from typing import Optional, Literal
-from datetime import datetime
-
 SourceCandidateStatus = Literal["PENDING", "APPROVED", "REJECTED"]
 SourceCandidatePhase = Literal["1", "2", "3", "later"]
 
@@ -54,6 +68,24 @@ class SourcePromoteOverride(BaseModel):
     notes: Optional[str] = None
     created_by: Optional[str] = None
 
+# =============================================================================
+# MODELS PYDANTIC — source_candidates discovery
+# =============================================================================
+
+class SourceCandidateDiscoverRequest(BaseModel):
+    """
+    Request per executar descoberta de fonts candidates.
+
+    - prompt_key: clau del prompt guardat a public.prompts
+    - input_text: briefing concret de la cerca; si és buit o None, es farà
+      servir source_discovery_default_brief de public.config
+    - proposed_by: etiqueta d'origen per les files creades
+    - dry_run: si True, no escriu a BD; només retorna els items detectats
+    """
+    prompt_key: str = "Source candidates discovery"
+    input_text: Optional[str] = None
+    proposed_by: Optional[str] = "ai-discovery"
+    dry_run: bool = False
 
 # =============================================================================
 # ENDPOINTS CRUD — /source-candidates
@@ -256,6 +288,316 @@ def delete_source_candidate(candidate_id: int):
         if conn:
             conn.close()
 
+# =============================================================================
+# HELPERS — source_candidates discovery
+# =============================================================================
+
+def _get_prompt_value(cur, prompt_key: str) -> str:
+    cur.execute(
+        """
+        SELECT value
+        FROM public.prompts
+        WHERE key = %s
+        """,
+        (prompt_key,)
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Prompt no trobat: {prompt_key}"
+        )
+    return row["value"]
+
+
+def _get_default_discovery_brief(cur) -> Optional[str]:
+    cur.execute(
+        """
+        SELECT value
+        FROM public.config
+        WHERE key = 'source_discovery_default_brief'
+        """
+    )
+    row = cur.fetchone()
+    return row["value"] if row else None
+
+
+def _normalize_discovery_items(raw_items):
+    """
+    Valida i normalitza la llista retornada pel model.
+    Exigeix com a mínim: name i url.
+    """
+    if not isinstance(raw_items, list):
+        raise HTTPException(
+            status_code=500,
+            detail="La resposta del model no conté una llista 'items' vàlida"
+        )
+
+    normalized = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        name = (item.get("name") or "").strip()
+        url = (item.get("url") or "").strip()
+
+        if not name or not url:
+            continue
+
+        normalized.append({
+            "name": name,
+            "url": url,
+            "domain": (item.get("domain") or "").strip() or None,
+            "source_type": (item.get("source_type") or "").strip() or None,
+            "country_region": (item.get("country_region") or "").strip() or None,
+            "institution_type": (item.get("institution_type") or "").strip() or None,
+            "proposed_phase": item.get("proposed_phase"),
+            "human_protection_relevance": (item.get("human_protection_relevance") or "").strip() or None,
+            "justification": (item.get("justification") or "").strip() or None,
+        })
+
+    return normalized
+
+def _extract_json_candidate(text: str):
+    if text is None:
+        raise HTTPException(status_code=500, detail="La resposta del model és buida")
+
+    if isinstance(text, dict):
+        return text
+
+    raw = text.strip()
+    if not raw:
+        raise HTTPException(status_code=500, detail="La resposta del model és buida")
+
+    if raw.startswith("```"):
+        raw = raw.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+
+    first_obj = raw.find("{")
+    last_obj = raw.rfind("}")
+    first_arr = raw.find("[")
+    last_arr = raw.rfind("]")
+
+    candidates = []
+
+    if first_obj != -1 and last_obj != -1 and last_obj > first_obj:
+        candidates.append(raw[first_obj:last_obj + 1])
+
+    if first_arr != -1 and last_arr != -1 and last_arr > first_arr:
+        candidates.append(raw[first_arr:last_arr + 1])
+
+    candidates.append(raw)
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=500, detail="La resposta del model no és JSON vàlid")
+
+# =============================================================================
+# ENDPOINT DE DESCOBERTA — POST /source-candidates/discover
+# =============================================================================
+
+@router_candidates.post("/discover", status_code=201)
+def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
+    """
+    Executa una descoberta de fonts candidates via prompt + briefing.
+
+    Comportament:
+    - Llegeix el prompt de public.prompts segons prompt_key.
+    - Si input_text és buit, usa source_discovery_default_brief de public.config.
+    - Crida el model LLM.
+    - Espera JSON amb forma: {"items": [...]}
+    - Valida i normalitza items.
+    - Deduplica contra public.source_candidates i public.sources per URL.
+    - Insereix només noves files amb status='PENDING' (excepte dry_run=True).
+
+    IMPORTANT:
+    - No aprova ni promociona res.
+    - La revisió humana continua sent obligatòria.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            prompt_value = _get_prompt_value(cur, payload.prompt_key)
+
+            effective_input = (payload.input_text or "").strip()
+            if not effective_input:
+                effective_input = (_get_default_discovery_brief(cur) or "").strip()
+
+            if not effective_input:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Falta input_text i no hi ha source_discovery_default_brief "
+                        "configurat a public.config"
+                    )
+                )
+
+            llm_input = f"""
+{prompt_value}
+
+[DISCOVERY BRIEF]
+{effective_input}
+
+[INSTRUCCIONS DE SORTIDA]
+Retorna exclusivament JSON vàlid amb aquesta estructura:
+{{
+  "items": [
+    {{
+      "name": "Nom de la font",
+      "url": "https://example.org",
+      "domain": "example.org",
+      "source_type": "website|rss|blog|news|government|company|ngo|academic|other",
+      "country_region": "string o null",
+      "institution_type": "string o null",
+      "proposed_phase": "1|2|3|later|null",
+      "human_protection_relevance": "string o null",
+      "justification": "string o null"
+    }}
+  ]
+}}
+No escriguis text fora del JSON. No facis servir markdown.
+Si no tens prou dades, retorna exactament {{"items": []}}.
+""".strip()
+
+            runtime_config = get_llm_config()
+            llm_choice = pick_llm(runtime_config, "primary")
+
+            print("DISCOVER: abans call_gemini")
+            llm_response = call_gemini(
+                prompt=llm_input,
+                model=llm_choice.get("model")
+            )
+            print("DISCOVER: després call_gemini")
+
+            parsed = llm_response if isinstance(llm_response, dict) else _extract_json_candidate(llm_response)
+
+            if not isinstance(parsed, dict):
+                raise HTTPException(
+                    status_code=500,
+                    detail="La resposta del model no és JSON vàlid"
+                )
+
+            items = _normalize_discovery_items(parsed.get("items"))
+            detected = len(items)
+
+            inserted = []
+            skipped_existing = []
+
+            for item in items:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM public.source_candidates
+                    WHERE url = %s
+                    """,
+                    (item["url"],)
+                )
+                existing_candidate = cur.fetchone()
+
+                if existing_candidate:
+                    skipped_existing.append({
+                        "url": item["url"],
+                        "reason": "already_exists_in_source_candidates",
+                        "id": existing_candidate["id"]
+                    })
+                    continue
+
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM public.sources
+                    WHERE url = %s
+                    """,
+                    (item["url"],)
+                )
+                existing_source = cur.fetchone()
+
+                if existing_source:
+                    skipped_existing.append({
+                        "url": item["url"],
+                        "reason": "already_exists_in_sources",
+                        "id": existing_source["id"]
+                    })
+                    continue
+
+                if payload.dry_run:
+                    inserted.append({
+                        "status": "dry_run",
+                        "item": {
+                            **item,
+                            "status": "PENDING",
+                            "proposed_by": payload.proposed_by
+                        }
+                    })
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO public.source_candidates
+                    (name, url, domain, source_type, country_region,
+                     institution_type, proposed_phase,
+                     human_protection_relevance, justification,
+                     proposed_by, status, created_at)
+                    VALUES
+                    (%s, %s, %s, %s, %s,
+                     %s, %s,
+                     %s, %s,
+                     %s, 'PENDING', NOW())
+                    RETURNING *
+                    """,
+                    (
+                        item["name"],
+                        item["url"],
+                        item["domain"],
+                        item["source_type"],
+                        item["country_region"],
+                        item["institution_type"],
+                        item["proposed_phase"],
+                        item["human_protection_relevance"],
+                        item["justification"],
+                        payload.proposed_by,
+                    )
+                )
+                inserted.append(cur.fetchone())
+
+            if not payload.dry_run:
+                conn.commit()
+
+            return {
+                "status": "ok" if payload.dry_run else "created",
+                "prompt_key": payload.prompt_key,
+                "input_used": effective_input,
+                "dry_run": payload.dry_run,
+                "detected": detected,
+                "inserted": len(inserted),
+                "skipped_existing": len(skipped_existing),
+                "items": inserted,
+                "skipped": skipped_existing,
+            }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except psycopg2.errors.UniqueViolation:
+        if conn:
+            conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="S'ha detectat una URL duplicada durant la descoberta"
+        )
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 # =============================================================================
 # ENDPOINT DE REVISIÓ — POST /source-candidates/{id}/review
