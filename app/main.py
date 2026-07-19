@@ -43,9 +43,8 @@ app = FastAPI(
     version="2.0.0",
     swagger_ui_parameters={"persistAuthorization": True}
 )
-protected_router.include_router(router_candidates)
-
 protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
+protected_router.include_router(router_candidates)
 
 @app.middleware("http")
 async def protect_docs(request: Request, call_next):

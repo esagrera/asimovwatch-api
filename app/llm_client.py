@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-3.1-flash-lite"
     gemini_temperature: float = 0.2
-    gemini_max_output_tokens: int = 256
+    gemini_max_output_tokens: int = 2048
 
     class Config:
         env_file = ".env"

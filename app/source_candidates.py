@@ -438,45 +438,46 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                 )
 
             llm_input = f"""
-{prompt_value}
+            {prompt_value}
 
-[DISCOVERY BRIEF]
-{effective_input}
+            [DISCOVERY BRIEF]
+            {effective_input}
 
-[INSTRUCCIONS DE SORTIDA]
-Retorna exclusivament JSON vàlid amb aquesta estructura:
-{{
-  "items": [
-    {{
-      "name": "Nom de la font",
-      "url": "https://example.org",
-      "domain": "example.org",
-      "source_type": "website|rss|blog|news|government|company|ngo|academic|other",
-      "country_region": "string o null",
-      "institution_type": "string o null",
-      "proposed_phase": "1|2|3|later|null",
-      "human_protection_relevance": "string o null",
-      "justification": "string o null"
-    }}
-  ]
-}}
-No escriguis text fora del JSON. No facis servir markdown.
-Si no tens prou dades, retorna exactament {{"items": []}}.
-""".strip()
+            [INSTRUCCIONS DE SORTIDA]
+            Retorna exclusivament JSON vàlid amb aquesta estructura:
+            {{
+            "items": [
+                {{
+                "name": "Nom de la font",
+                "url": "https://example.org",
+                "domain": "example.org",
+                "source_type": "website|rss|blog|news|government|company|ngo|academic|other",
+                "country_region": "string o null",
+                "institution_type": "string o null",
+                "proposed_phase": "1|2|3|later|null",
+                "human_protection_relevance": "string o null",
+                "justification": "string o null"
+                }}
+            ]
+            }}
+            No escriguis text fora del JSON. No facis servir markdown.
+            Si no tens prou dades, retorna exactament {{"items": []}}.
+            """.strip()
 
             runtime_config = get_llm_config()
             llm_choice = pick_llm(runtime_config, "primary")
 
-          print("DISCOVER: abans call_gemini", flush=True)
+            print("DISCOVER: abans call_gemini", flush=True)
             llm_response = call_gemini(
                 prompt=llm_input,
-                model=llm_choice.get("model")
+                model=llm_choice.get("model"),
+                max_output_tokens=2048
             )
             print("DISCOVER: després call_gemini", flush=True)
             print("DISCOVER RESPONSE TYPE:", type(llm_response), flush=True)
             print("DISCOVER RAW RESPONSE:", flush=True)
             print(repr(llm_response), flush=True)
-        
+
             if isinstance(llm_response, dict):
                 parsed = llm_response
             elif isinstance(llm_response, list):
@@ -489,6 +490,7 @@ Si no tens prou dades, retorna exactament {{"items": []}}.
                     status_code=500,
                     detail="La resposta del model no és JSON vàlid"
                 )
+
             items = _normalize_discovery_items(parsed.get("items"))
             detected = len(items)
 
