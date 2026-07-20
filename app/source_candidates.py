@@ -51,8 +51,8 @@ class SourceCandidateUpdate(BaseModel):
 
 
 class SourceCandidateReview(BaseModel):
-    """Payload per revisar (aprovar/rebutjar) un candidate."""
-    status: Literal["APPROVED", "REJECTED"]  # PENDING no és una decisió de revisió
+    """Payload per canviar l'estat editorial d'un candidate."""
+    status: Literal["PENDING", "APPROVED", "REJECTED"]
     review_notes: Optional[str] = None
 
 
@@ -615,9 +615,10 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
 @router_candidates.post("/{candidate_id}/review")
 def review_source_candidate(candidate_id: int, payload: SourceCandidateReview):
     """
-    Canvia l'status d'un candidate a APPROVED o REJECTED.
+    Canvia l'status d'un candidate a PENDING, APPROVED o REJECTED.
     Registra la data de revisió i les notes.
     SUPERVISIÓ HUMANA: porta obligatòria abans de qualsevol promoció.
+    Permet reobrir candidates aprovats o rebutjats tornant-los a PENDING.
     """
     conn = None
     try:
@@ -794,6 +795,110 @@ def promote_source_candidate(
         if conn:
             conn.close()
 
+# =============================================================================
+# ENDPOINT DE DESPROMOCIÓ — POST /source-candidates/{id}/demote
+# =============================================================================
+
+@router_candidates.post("/{candidate_id}/demote", status_code=200)
+def demote_source_candidate(candidate_id: int):
+    """
+    Despromociona una source activa creada des d'un candidate i retorna el candidate a APPROVED.
+
+    Comprovacions:
+    1. El candidate existeix.
+    2. Té promoted_source_id informat.
+    3. La source vinculada existeix.
+
+    Operació atòmica:
+    a. DELETE de la source vinculada a public.sources
+    b. UPDATE del candidate: promoted_source_id = NULL i status = 'APPROVED'
+
+    Errors possibles:
+    404 → candidate no trobat, o source vinculada no trobada
+    409 → el candidate no està promocionat
+    500 → error intern
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            # -- Pas 1: existència del candidate --
+            cur.execute(
+                "SELECT * FROM public.source_candidates WHERE id = %s",
+                (candidate_id,)
+            )
+            candidate = cur.fetchone()
+
+            if not candidate:
+                raise HTTPException(status_code=404, detail="Candidate no trobat")
+
+            # -- Pas 2: comprovar que està promocionat --
+            promoted_source_id = candidate.get("promoted_source_id")
+            if promoted_source_id is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="El candidate no està promocionat a cap source"
+                )
+
+            # -- Pas 3: comprovar que la source vinculada existeix --
+            cur.execute(
+                "SELECT id, created_from_candidate_id FROM public.sources WHERE id = %s",
+                (promoted_source_id,)
+            )
+            source_row = cur.fetchone()
+
+            if not source_row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="La source promocionada no existeix"
+                )
+
+            # Seguretat addicional: que la source apunte al mateix candidate
+            if source_row.get("created_from_candidate_id") != candidate_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="La source vinculada no correspon a aquest candidate"
+                )
+
+            # -- Pas 4a: esborrar la source activa --
+            cur.execute(
+                "DELETE FROM public.sources WHERE id = %s",
+                (promoted_source_id,)
+            )
+
+            # -- Pas 4b: tornar el candidate a APPROVED --
+            cur.execute(
+                """
+                UPDATE public.source_candidates
+                SET promoted_source_id = NULL,
+                    status = 'APPROVED'
+                WHERE id = %s
+                RETURNING *
+                """,
+                (candidate_id,)
+            )
+            updated_candidate = cur.fetchone()
+
+            conn.commit()
+
+            return {
+                "status": "demoted",
+                "candidate_id": candidate_id,
+                "item": updated_candidate
+            }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 # =============================================================================
 # REGISTRE AL ROUTER PRINCIPAL — afegir al final de main.py
