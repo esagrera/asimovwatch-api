@@ -901,6 +901,140 @@ def demote_source_candidate(candidate_id: int):
             conn.close()
 
 # =============================================================================
+# ENDPOINT DETAIL SOURCE — GET /source-candidates/{candidate_id}/source
+# =============================================================================
+
+@router_candidates.get("/{candidate_id}/source")
+def get_source_detail(candidate_id: int):
+    """
+    Retorna el detall de la source promocionada d'un candidate
+    i un resum de les entrades relacionades pel domini.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            # -- Pas 1: carregar el candidate i trobar la source promocionada --
+            cur.execute(
+                """
+                SELECT id, promoted_source_id
+                FROM public.source_candidates
+                WHERE id = %s
+                """,
+                (candidate_id,)
+            )
+            candidate = cur.fetchone()
+
+            if not candidate:
+                raise HTTPException(status_code=404, detail="Candidate no trobat")
+
+            if not candidate["promoted_source_id"]:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Aquest candidate encara no té cap source promocionada"
+                )
+
+            # -- Pas 2: carregar la source real --
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    name,
+                    url,
+                    domain,
+                    source_type,
+                    country_region,
+                    institution_type,
+                    phase,
+                    priority,
+                    status,
+                    ingest_method,
+                    feed_url,
+                    language_default,
+                    crawl_frequency_minutes,
+                    last_checked_at,
+                    last_success_at,
+                    last_error_at,
+                    last_error_message,
+                    notes,
+                    created_from_candidate_id,
+                    created_by,
+                    created_at,
+                    updated_at
+                FROM public.sources
+                WHERE id = %s
+                """,
+                (candidate["promoted_source_id"],)
+            )
+            source = cur.fetchone()
+
+            if not source:
+                raise HTTPException(status_code=404, detail="Source no trobada")
+
+            # -- Pas 3: estadístiques de les entries vinculades pel domini --
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)::int AS entries_count,
+                    COUNT(*) FILTER (WHERE review_status = 'NEW')::int AS pending_review_count,
+                    COUNT(*) FILTER (WHERE review_status = 'APPROVED')::int AS approved_count,
+                    COUNT(*) FILTER (WHERE review_status = 'REJECTED')::int AS rejected_count,
+                    MAX(COALESCE(detected_at, ingested_at)) AS latest_entry_at
+                FROM public.entries
+                WHERE LOWER(COALESCE(source_domain, '')) = LOWER(COALESCE(%s, ''))
+                """,
+                (source["domain"],)
+            )
+            stats = cur.fetchone()
+
+            # -- Pas 4: darreres entrades de la mateixa source/domain --
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    source_title,
+                    source_url,
+                    source_domain,
+                    summary_factual,
+                    review_status,
+                    risk_level,
+                    published_date,
+                    detected_at,
+                    ingested_at
+                FROM public.entries
+                WHERE LOWER(COALESCE(source_domain, '')) = LOWER(COALESCE(%s, ''))
+                ORDER BY COALESCE(detected_at, ingested_at) DESC, id DESC
+                LIMIT 8
+                """,
+                (source["domain"],)
+            )
+            latest_entries = cur.fetchall()
+
+            return {
+                "status": "ok",
+                "candidate_id": candidate_id,
+                "source": source,
+                "stats": stats or {},
+                "latest_entries": latest_entries
+            }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error obtenint detall de la source: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+# =============================================================================
 # REGISTRE AL ROUTER PRINCIPAL — afegir al final de main.py
 # =============================================================================
 #
