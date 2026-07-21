@@ -861,13 +861,7 @@ def demote_source_candidate(candidate_id: int):
                     detail="La source vinculada no correspon a aquest candidate"
                 )
 
-            # -- Pas 4a: esborrar la source activa --
-            cur.execute(
-                "DELETE FROM public.sources WHERE id = %s",
-                (promoted_source_id,)
-            )
-
-            # -- Pas 4b: tornar el candidate a APPROVED --
+            # -- Pas 4a: desvincular el candidate i tornar-lo a APPROVED --
             cur.execute(
                 """
                 UPDATE public.source_candidates
@@ -879,6 +873,12 @@ def demote_source_candidate(candidate_id: int):
                 (candidate_id,)
             )
             updated_candidate = cur.fetchone()
+
+            # -- Pas 4b: esborrar la source activa --
+            cur.execute(
+                "DELETE FROM public.sources WHERE id = %s",
+                (promoted_source_id,)
+            )
 
             conn.commit()
 
