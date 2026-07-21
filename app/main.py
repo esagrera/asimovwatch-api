@@ -757,6 +757,202 @@ def create_crawler_log(log: CrawlerLogCreate):
         cur.close()
         conn.close()
 
+# ─── MODELS CRAWLER OPS ───────────────────────────────────────────────────────
+
+class CrawlerRunRequest(BaseModel):
+    brief: Optional[str] = None
+    dry_run: bool = True
+    proposed_by: Optional[str] = "admin-run-now"
+    prompt_key: str = "Source candidates discovery"
+
+# ─── HELPERS CRAWLER OPS ──────────────────────────────────────────────────────
+
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+def _parse_int(value: Optional[str], default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+def _get_config_value(cur, key: str, default: Optional[str] = None) -> Optional[str]:
+    cur.execute("SELECT value FROM public.config WHERE key = %s", (key,))
+    row = cur.fetchone()
+    return row["value"] if row else default
+
+def _set_config_value(cur, key: str, value: Optional[str]):
+    safe_value = "" if value is None else str(value)
+    cur.execute("""
+        INSERT INTO public.config (key, value, updated_at)
+        VALUES (%s, %s, now())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = now()
+    """, (key, safe_value))
+
+# ─── CRAWLER STATUS ────────────────────────────────────────────────────────────
+
+@protected_router.get("/crawler/status")
+def get_crawler_status():
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        config_map = get_config_map()
+
+        cur.execute("""
+            SELECT *
+            FROM public.crawler_log
+            ORDER BY executed_at DESC
+            LIMIT 1
+        """)
+        last_log = cur.fetchone()
+
+        enabled = _parse_bool(config_map.get("crawler_enabled"), default=False)
+        frequency_minutes = _parse_int(
+            config_map.get("crawler_frequency_minutes"),
+            default=1440
+        )
+
+        return {
+            "status": "ok",
+            "crawler": {
+                "enabled": enabled,
+                "frequency_minutes": frequency_minutes,
+                "prompt_key": config_map.get(
+                    "crawler_prompt_key",
+                    "Source candidates discovery"
+                ),
+                "default_brief": config_map.get("source_discovery_default_brief", ""),
+                "last_status": config_map.get("crawler_last_status"),
+                "last_run_at": config_map.get("crawler_last_run_at"),
+                "last_duration_seconds": config_map.get("crawler_last_duration_seconds"),
+                "last_error": config_map.get("crawler_last_error"),
+            },
+            "last_log": last_log
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+# ─── CRAWLER RUN NOW ───────────────────────────────────────────────────────────
+
+@protected_router.post("/crawler/run", status_code=status.HTTP_201_CREATED)
+def run_crawler_now(body: CrawlerRunRequest):
+    from app.source_candidates import discover_source_candidates, SourceCandidateDiscoverRequest
+
+    started_at = utc_now()
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        effective_brief = (body.brief or "").strip()
+        if not effective_brief:
+            effective_brief = _get_config_value(cur, "source_discovery_default_brief", "") or ""
+
+        if not effective_brief:
+            raise HTTPException(
+                status_code=400,
+                detail="Falta brief i no hi ha source_discovery_default_brief configurat"
+            )
+
+        prompt_key = (body.prompt_key or "").strip() or "Source candidates discovery"
+
+        _set_config_value(cur, "crawler_last_status", "RUNNING")
+        _set_config_value(cur, "crawler_last_run_at", started_at.isoformat())
+        _set_config_value(cur, "crawler_last_error", None)
+        conn.commit()
+
+        discovery_payload = SourceCandidateDiscoverRequest(
+            prompt_key=prompt_key,
+            input_text=effective_brief,
+            proposed_by=body.proposed_by or "admin-run-now",
+            dry_run=body.dry_run
+        )
+
+        result = discover_source_candidates(discovery_payload)
+
+        finished_at = utc_now()
+        duration_seconds = round((finished_at - started_at).total_seconds(), 3)
+
+        cur.execute("""
+            INSERT INTO public.crawler_log (
+                sources_checked,
+                items_found,
+                items_relevant,
+                items_enriched,
+                items_failed,
+                duration_seconds,
+                notes
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (
+            1,
+            result.get("detected", 0),
+            result.get("inserted", 0),
+            0,
+            0,
+            duration_seconds,
+            f"run_now prompt={prompt_key} dry_run={body.dry_run} proposed_by={body.proposed_by or 'admin-run-now'}"
+        ))
+        log_row = cur.fetchone()
+
+        _set_config_value(cur, "crawler_last_status", "OK")
+        _set_config_value(cur, "crawler_last_run_at", started_at.isoformat())
+        _set_config_value(cur, "crawler_last_duration_seconds", str(duration_seconds))
+        _set_config_value(cur, "crawler_last_error", None)
+
+        conn.commit()
+
+        return {
+            "status": "created",
+            "message": "Crawler run completat",
+            "run": {
+                "started_at": started_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "duration_seconds": duration_seconds,
+                "prompt_key": prompt_key,
+                "brief_used": effective_brief,
+                "dry_run": body.dry_run,
+                "proposed_by": body.proposed_by or "admin-run-now"
+            },
+            "discovery": result,
+            "log": log_row
+        }
+
+    except HTTPException as e:
+        try:
+            _set_config_value(cur, "crawler_last_status", "ERROR")
+            _set_config_value(cur, "crawler_last_run_at", started_at.isoformat())
+            _set_config_value(cur, "crawler_last_error", str(e.detail))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        try:
+            conn = get_connection()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            _set_config_value(cur, "crawler_last_status", "ERROR")
+            _set_config_value(cur, "crawler_last_run_at", started_at.isoformat())
+            _set_config_value(cur, "crawler_last_error", str(e))
+            conn.commit()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
 # ─── STATS ────────────────────────────────────────────────────────────────────
 
 @protected_router.get("/stats")
