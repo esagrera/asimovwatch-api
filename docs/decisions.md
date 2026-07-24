@@ -59,3 +59,35 @@ La configuració activa dels models i prompts del sistema es gestiona des del pa
 Això permet ajustar providers, models i prompts sense redeploy immediat del backend i facilita iterar sobre el comportament del sistema des del backoffice.
 
 Com a criteri operatiu, qualsevol canvi que es consolidi com a configuració estable s’hauria de reflectir també a la documentació del repositori, per evitar que el coneixement del sistema quedi només dins la base de dades.
+
+## Decisions operatives recents — juliol de 2026
+
+### Descoberta separada de promoció
+La descoberta automàtica de fonts no crea fonts actives directament. Tota troballa nova entra primer com a `source_candidate` i només pot esdevenir `source` després de revisió humana i promoció explícita.
+
+**Motiu:** mantenir la coherència amb AsimovWatch com a observatori editorial i no com a sistema de publicació automàtica.
+
+### Supervisió humana obligatòria per a noves fonts
+Cap candidate es pot promocionar si no està en estat `APPROVED`. El sistema pot descobrir, classificar i proposar, però la decisió editorial final continua essent humana.
+
+**Motiu:** la fiabilitat i la pertinència editorial d’una font no s’han d’automatitzar completament.
+
+### `dry_run=True` no persisteix dades
+S’ha decidit que `dry_run=True` serveixi només per validar si el crawler troba fonts potencialment útils. Aquest mode no escriu cap resultat a la base de dades.
+
+**Motiu:** separar clarament simulació i persistència, i evitar contaminar la taula de candidates amb execucions provisionals.
+
+### No es mostrarà detall operatiu complet del `dry_run=True` a l’admin
+Per ara, no es construirà una vista específica per navegar els resultats detallats d’un `dry_run=True` dins del panell admin. El resum operatiu indica si hi ha hagut troballes, però per revisar-les realment cal fer un `dry_run=False`.
+
+**Motiu:** simplificar la UX editorial i evitar una doble capa de gestió entre resultats temporals i persistits.
+
+### El crawler manual passa a formar part del flux editorial normal
+El botó “Run now” del panell admin no és només una eina tècnica de prova, sinó una part del flux editorial de descoberta. El seu resultat, quan s’executa amb `dry_run=False`, genera candidates reals que entren a la cua de revisió.
+
+**Motiu:** donar al panell una funció operativa real sobre el radar de fonts.
+
+### Gemini és el provider LLM operatiu actual del discovery
+Tot i que el sistema ja incorpora configuració runtime de models i prompts, la descoberta de `source_candidates` funciona avui efectivament amb Gemini com a provider real.
+
+**Motiu:** prioritzar un MVP estable i funcional abans del refactor complet a una arquitectura modular de `llm_clients_xxxx` amb múltiples proveïdors.

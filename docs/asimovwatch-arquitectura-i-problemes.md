@@ -61,6 +61,18 @@ Aquestes 5 variables han d'existir a Render per connectar amb la BD de Dinahosti
 
 > ⚠️ La variable `DATABASE_URL` és opcional i no és suficient per si sola si el `main.py` usa `os.environ["DB_HOST"]`. Cal que hi siguin les 5 variables individuals.
 
+### Claus LLM necessàries a Render
+
+A més de les variables de connexió a la base de dades, el servei de Render ha de tenir definides les claus dels proveïdors LLM que es facin servir en runtime.
+
+| Variable | Ús actual |
+|---|---|
+| `GEMINI_API_KEY` | Necessària per al flux actual de discovery de `source_candidates` |
+| `OPENAI_API_KEY` | Reservada per a evolució futura |
+| `CLAUDE_API_KEY` | Reservada per a evolució futura |
+
+> En l’estat actual del sistema, el discovery de fonts candidates depèn operativament de Gemini. Si `GEMINI_API_KEY` no està definida a Render, el crawler manual i la descoberta assistida per LLM fallaran.
+
 ### Al servidor Dinahosting (~/asimovwatch-api/.env)
 
 El fitxer `.env` al servidor ha de contenir les mateixes variables per arrencar Uvicorn localment:
@@ -217,6 +229,18 @@ dins de `app/main.py`.
 
 ---
 
+### Problema 6 — El crawler mostra “items trobats” però no apareixen candidates noves a l’admin
+
+**Símptoma:** Després d’executar `Run now`, el resum operatiu del crawler mostra valors com `Fonts revisades: 1`, `Items trobats: 3` o `Items rellevants: 3`, però a la secció de candidates no apareix cap nova fila.
+
+**Causa més freqüent:** L’execució s’ha fet amb `dry_run=True`. En aquest mode, el backend executa tota la descoberta, calcula comptadors i retorna els items detectats, però **no escriu res** a `public.source_candidates`.
+
+**Solució:** Si només es vol validar si el brief troba resultats útils, `dry_run=True` és correcte. Si es vol revisar i gestionar els resultats des del panell admin, cal repetir l’execució amb `dry_run=False` perquè els candidats quedin persistits amb estat `PENDING`.
+
+**Nota operativa:** Aquesta és una decisió funcional deliberada. El `dry_run=True` s’interpreta com una simulació de descoberta, no com una alta real de candidates.
+
+---
+
 ## Procediment de diagnòstic estàndard
 
 Quan alguna cosa falla, executar sempre aquests comandos **en ordre** al servidor SSH:
@@ -340,3 +364,24 @@ Durant les proves de juliol de 2026 s’ha validat el següent:
 Els valors definits dins `DEFAULT_CONFIG` a `llm_router.py` s’han d’entendre com a reserva tècnica. Si existeixen claus equivalents a `public.config`, aquestes tenen prioritat en temps d’execució.
 
 De la mateixa manera, `prompts.py` continua sent útil com a font base de plantilles i com a referència de desenvolupament, però els prompts efectivament actius poden ser els editats i desats des del panell admin.
+
+### Estat actual del discovery de fonts candidates
+
+A juliol de 2026, el sistema ja disposa d’un flux específic de descoberta, revisió i promoció de fonts candidates.
+
+Aquest flux es basa en un mòdul `source_candidates.py` que introdueix una capa editorial intermèdia entre la cerca automàtica i l’activació d’una font real dins del radar d’ingesta. La descoberta assistida per LLM no crea directament fonts actives a `public.sources`, sinó candidates a `public.source_candidates` que requereixen revisió humana posterior.
+
+Els endpoints clau d’aquest flux són:
+
+- `GET /source-candidates`
+- `GET /source-candidates/{candidate_id}`
+- `POST /source-candidates`
+- `PATCH /source-candidates/{candidate_id}`
+- `DELETE /source-candidates/{candidate_id}`
+- `POST /source-candidates/discover`
+- `POST /source-candidates/{candidate_id}/review`
+- `POST /source-candidates/{candidate_id}/promote`
+- `POST /source-candidates/{candidate_id}/demote`
+- `GET /source-candidates/{candidate_id}/source`
+
+Aquesta arquitectura reforça el criteri editorial d’AsimovWatch: el sistema pot proposar, però no pot aprovar ni activar autònomament noves fonts.
