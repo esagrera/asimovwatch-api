@@ -2,7 +2,6 @@
 # IMPORTS
 # =============================================================================
 import json
-from datetime import datetime
 from typing import Optional, Literal
 
 import psycopg2
@@ -12,8 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db import get_connection
-from app.llm_client import call_gemini
-from app.llm_router import pick_llm, get_llm_config
+from app.llm_router import call_with_fallback
 
 
 # =============================================================================
@@ -93,11 +91,6 @@ class SourceCandidateDiscoverRequest(BaseModel):
 # Afegir a main.py o importar com a router separat.
 # Prerequisit: get_connection() ja definit al projecte.
 
-from fastapi import APIRouter, HTTPException
-import psycopg2
-import psycopg2.extras
-import psycopg2.errors
-from app.db import get_connection
 
 router_candidates = APIRouter(prefix="/source-candidates", tags=["source-candidates"])
 
@@ -464,19 +457,14 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
             Si no tens prou dades, retorna exactament {{"items": []}}.
             """.strip()
 
-            runtime_config = get_llm_config()
-            llm_choice = pick_llm(runtime_config, "primary")
-
-            print("DISCOVER: abans call_gemini", flush=True)
-            llm_response = call_gemini(
+            llm_result = call_with_fallback(
+                conn=conn,
+                scope_type="task",
+                scope_key="source_discovery",
                 prompt=llm_input,
-                model=llm_choice.get("model"),
-                max_output_tokens=2048
             )
-            print("DISCOVER: després call_gemini", flush=True)
-            print("DISCOVER RESPONSE TYPE:", type(llm_response), flush=True)
-            print("DISCOVER RAW RESPONSE:", flush=True)
-            print(repr(llm_response), flush=True)
+
+            llm_response = llm_result["text"]
 
             if isinstance(llm_response, dict):
                 parsed = llm_response
@@ -587,6 +575,14 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                 "skipped_existing": len(skipped_existing),
                 "items": inserted,
                 "skipped": skipped_existing,
+                "llm": {
+                    "scope_type": llm_result["scope_type"],
+                    "scope_key": llm_result["scope_key"],
+                    "provider": llm_result["provider"],
+                    "model": llm_result["model"],
+                    "used_fallback": llm_result["used_fallback"],
+                    "attempts": llm_result["attempts"],
+                }
             }
 
     except HTTPException:
