@@ -19,7 +19,6 @@ from pydantic import BaseModel, AnyUrl
 from typing import Optional
 from datetime import datetime, timezone
 
-from app.llm_client import call_gemini
 from app.llm_router import pick_llm, get_llm_config
 from app.db import get_connection
 from app.source_candidates import router_candidates
