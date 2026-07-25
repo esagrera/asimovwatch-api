@@ -653,6 +653,13 @@ def update_config(key: str, body: ConfigUpdate):
 
 class PromptUpdate(BaseModel):
     value: str
+    category: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    use_fallback: Optional[bool] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    timeout_secs: Optional[int] = None
 
 
 @protected_router.get("/prompts")
@@ -660,7 +667,25 @@ def get_prompts():
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        cur.execute("SELECT key, value, updated_at FROM public.prompts ORDER BY key")
+        cur.execute("""
+            SELECT
+                p.key,
+                p.category,
+                p.value,
+                p.updated_at,
+                c.provider,
+                c.model,
+                c.use_fallback,
+                c.max_tokens,
+                c.temperature,
+                c.timeout_secs
+            FROM public.prompts p
+            LEFT JOIN public.llm_runtime_config c
+              ON c.scope_type = 'prompt'
+             AND c.scope_key = 'prompt'
+             AND c.prompt_key = p.key
+            ORDER BY p.key
+        """)
         rows = cur.fetchall()
         return {"items": rows}
     except Exception as e:
@@ -681,8 +706,39 @@ def get_prompt_versions(key: str):
             WHERE prompt_key = %s
             ORDER BY version DESC, changed_at DESC
         """, (key,))
-        rows = cur.fetchall()
-        return {"items": rows}
+        versions = cur.fetchall()
+
+        cur.execute("""
+            SELECT
+                p.key,
+                p.category,
+                p.value,
+                p.updated_at,
+                c.provider,
+                c.model,
+                c.use_fallback,
+                c.max_tokens,
+                c.temperature,
+                c.timeout_secs
+            FROM public.prompts p
+            LEFT JOIN public.llm_runtime_config c
+              ON c.scope_type = 'prompt'
+             AND c.scope_key = 'prompt'
+             AND c.prompt_key = p.key
+            WHERE p.key = %s
+            LIMIT 1
+        """, (key,))
+        prompt = cur.fetchone()
+
+        if not prompt:
+            raise HTTPException(status_code=404, detail="Prompt not found")
+
+        return {
+            "item": prompt,
+            "versions": versions
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -695,16 +751,123 @@ def update_prompt(key: str, body: PromptUpdate):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        clean_key = (key or "").strip()
+        if not clean_key:
+            raise HTTPException(status_code=400, detail="Prompt key buit")
+
+        clean_value = (body.value or "").strip()
+        if not clean_value:
+            raise HTTPException(status_code=400, detail="Prompt value buit")
+
+        clean_category = (body.category or "").strip() or None
+        clean_provider = (body.provider or "gemini").strip().lower()
+        clean_model = (body.model or "gemini-3.1-flash-lite").strip()
+
+        if clean_provider not in {"gemini", "claude", "openai"}:
+            raise HTTPException(status_code=400, detail="Provider no suportat")
+
+        if not clean_model:
+            raise HTTPException(status_code=400, detail="Model buit")
+
+        if body.max_tokens is not None and body.max_tokens <= 0:
+            raise HTTPException(status_code=400, detail="max_tokens ha de ser > 0")
+
+        if body.temperature is not None and (body.temperature < 0 or body.temperature > 2):
+            raise HTTPException(status_code=400, detail="temperature ha d'estar entre 0 i 2")
+
+        if body.timeout_secs is not None and body.timeout_secs <= 0:
+            raise HTTPException(status_code=400, detail="timeout_secs ha de ser > 0")
+
         cur.execute("""
-            INSERT INTO public.prompts (key, value, updated_at)
-            VALUES (%s, %s, now())
+            INSERT INTO public.prompts (key, category, value, updated_at)
+            VALUES (%s, %s, %s, now())
             ON CONFLICT (key) DO UPDATE
-            SET value = EXCLUDED.value, updated_at = now()
-            RETURNING key, value, updated_at
-        """, (key, body.value))
-        row = cur.fetchone()
+            SET
+                category = EXCLUDED.category,
+                value = EXCLUDED.value,
+                updated_at = now()
+            RETURNING key, category, value, updated_at
+        """, (clean_key, clean_category, clean_value))
+        prompt_row = cur.fetchone()
+
+        cur.execute("""
+            INSERT INTO public.llm_runtime_config (
+                scope_type,
+                scope_key,
+                prompt_key,
+                provider,
+                model,
+                enabled,
+                use_fallback,
+                max_tokens,
+                temperature,
+                timeout_secs,
+                notes,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                'prompt',
+                'prompt',
+                %s,
+                %s,
+                %s,
+                true,
+                COALESCE(%s, true),
+                %s,
+                %s,
+                %s,
+                NULL,
+                now(),
+                now()
+            )
+            ON CONFLICT (scope_type, scope_key, prompt_key) DO UPDATE
+            SET
+                provider = EXCLUDED.provider,
+                model = EXCLUDED.model,
+                use_fallback = EXCLUDED.use_fallback,
+                max_tokens = EXCLUDED.max_tokens,
+                temperature = EXCLUDED.temperature,
+                timeout_secs = EXCLUDED.timeout_secs,
+                updated_at = now()
+            RETURNING
+                provider,
+                model,
+                use_fallback,
+                max_tokens,
+                temperature,
+                timeout_secs
+        """, (
+            clean_key,
+            clean_provider,
+            clean_model,
+            body.use_fallback,
+            body.max_tokens,
+            body.temperature,
+            body.timeout_secs
+        ))
+        llm_row = cur.fetchone()
+
         conn.commit()
-        return {"status": "ok", "item": row}
+
+        return {
+            "status": "ok",
+            "item": {
+                "key": prompt_row["key"],
+                "category": prompt_row["category"],
+                "value": prompt_row["value"],
+                "updated_at": prompt_row["updated_at"],
+                "provider": llm_row["provider"],
+                "model": llm_row["model"],
+                "use_fallback": llm_row["use_fallback"],
+                "max_tokens": llm_row["max_tokens"],
+                "temperature": float(llm_row["temperature"]) if llm_row["temperature"] is not None else None,
+                "timeout_secs": llm_row["timeout_secs"],
+            }
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
