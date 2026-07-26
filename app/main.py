@@ -779,16 +779,50 @@ def update_prompt(key: str, body: PromptUpdate):
             raise HTTPException(status_code=400, detail="timeout_secs ha de ser > 0")
 
         cur.execute("""
-            INSERT INTO public.prompts (key, category, value, updated_at)
-            VALUES (%s, %s, %s, now())
-            ON CONFLICT (key) DO UPDATE
-            SET
-                category = EXCLUDED.category,
-                value = EXCLUDED.value,
-                updated_at = now()
-            RETURNING key, category, value, updated_at
-        """, (clean_key, clean_category, clean_value))
-        prompt_row = cur.fetchone()
+            SELECT key, category, value, updated_at
+            FROM public.prompts
+            WHERE key = %s
+            LIMIT 1
+        """, (clean_key,))
+        existing_prompt = cur.fetchone()
+
+        old_value = existing_prompt["value"] if existing_prompt and existing_prompt["value"] is not None else ""
+        value_changed = (not existing_prompt) or (old_value != clean_value)
+
+        old_category = existing_prompt["category"] if existing_prompt else None
+        category_changed = (not existing_prompt) or (old_category != clean_category)
+
+        if existing_prompt:
+            if value_changed:
+                cur.execute("""
+                    UPDATE public.prompts
+                    SET
+                        category = %s,
+                        value = %s,
+                        updated_at = now()
+                    WHERE key = %s
+                    RETURNING key, category, value, updated_at
+                """, (clean_category, clean_value, clean_key))
+                prompt_row = cur.fetchone()
+            elif category_changed:
+                cur.execute("""
+                    UPDATE public.prompts
+                    SET
+                        category = %s,
+                        updated_at = now()
+                    WHERE key = %s
+                    RETURNING key, category, value, updated_at
+                """, (clean_category, clean_key))
+                prompt_row = cur.fetchone()
+            else:
+                prompt_row = existing_prompt
+        else:
+            cur.execute("""
+                INSERT INTO public.prompts (key, category, value, updated_at)
+                VALUES (%s, %s, %s, now())
+                RETURNING key, category, value, updated_at
+            """, (clean_key, clean_category, clean_value))
+            prompt_row = cur.fetchone()
 
         cur.execute("""
             INSERT INTO public.llm_runtime_config (
