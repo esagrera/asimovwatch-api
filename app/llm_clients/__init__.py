@@ -5,7 +5,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_supported_providers() -> list[str]:
-    return ["claude", "gemini", "openai"]
+    return ["claude", "gemini", "openai", "perplexity"]
 
 
 def _resolve_provider_callable(provider: str):
@@ -22,6 +22,10 @@ def _resolve_provider_callable(provider: str):
     if provider == "openai":
         from app.llm_clients.openai_client import call_openai_client
         return call_openai_client
+
+    if provider == "perplexity":
+        from app.llm_clients.perplexity_client import call_perplexity_client
+        return call_perplexity_client
 
     raise ValueError(
         f"provider no suportat: {provider}. "

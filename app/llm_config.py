@@ -6,12 +6,13 @@ from psycopg2.extras import RealDictCursor
 VALID_SCOPE_TYPES = {"task", "phase"}
 VALID_PHASE_KEYS = {"input", "primary", "output", "fallback"}
 VALID_TASK_KEYS = {"source_discovery", "source_evaluation"}
-SUPPORTED_PROVIDERS = {"gemini", "claude", "openai"}
+SUPPORTED_PROVIDERS = {"gemini", "claude", "openai", "perplexity"}
 
 PROVIDER_ENV_MAP = {
     "gemini": "GEMINI_API_KEY",
     "claude": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
 }
 
 DEFAULT_SCOPE_VALUES = {
