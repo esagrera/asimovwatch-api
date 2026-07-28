@@ -4,14 +4,12 @@ from typing import Optional
 
 import anthropic
 
-
 @lru_cache(maxsize=1)
 def _get_claude_client():
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY no configurada")
     return anthropic.Anthropic(api_key=api_key)
-
 
 def call_claude_client(
     model: str,
@@ -29,10 +27,7 @@ def call_claude_client(
             max_tokens=max_tokens,
             temperature=temperature,
             messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
+                {"role": "user", "content": prompt}
             ],
         )
     except Exception as e:
