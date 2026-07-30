@@ -1,36 +1,28 @@
+import importlib
 import logging
 from typing import Any
+
+from app.llm_config import SUPPORTED_PROVIDERS, PROVIDER_CLIENT_MAP
 
 logger = logging.getLogger(__name__)
 
 
 def get_supported_providers() -> list[str]:
-    return ["claude", "gemini", "openai", "perplexity"]
+    return sorted(SUPPORTED_PROVIDERS)
 
 
 def _resolve_provider_callable(provider: str):
     provider = (provider or "").strip().lower()
 
-    if provider == "gemini":
-        from app.llm_clients.gemini_client import call_gemini_client
-        return call_gemini_client
+    if provider not in PROVIDER_CLIENT_MAP:
+        raise ValueError(
+            f"provider no suportat: {provider}. "
+            f"Disponibles: {', '.join(get_supported_providers())}"
+        )
 
-    if provider == "claude":
-        from app.llm_clients.claude_client import call_claude_client
-        return call_claude_client
-
-    if provider == "openai":
-        from app.llm_clients.openai_client import call_openai_client
-        return call_openai_client
-
-    if provider == "perplexity":
-        from app.llm_clients.perplexity_client import call_perplexity_client
-        return call_perplexity_client
-
-    raise ValueError(
-        f"provider no suportat: {provider}. "
-        f"Disponibles: {', '.join(get_supported_providers())}"
-    )
+    module_path, func_name = PROVIDER_CLIENT_MAP[provider]
+    module = importlib.import_module(module_path)
+    return getattr(module, func_name)
 
 
 def call_llm(

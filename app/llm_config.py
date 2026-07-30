@@ -6,13 +6,20 @@ from psycopg2.extras import RealDictCursor
 VALID_SCOPE_TYPES = {"task", "phase"}
 VALID_PHASE_KEYS = {"input", "primary", "output", "fallback"}
 VALID_TASK_KEYS = {"source_discovery", "source_evaluation"}
-SUPPORTED_PROVIDERS = {"gemini", "claude", "openai", "perplexity"}
+SUPPORTED_PROVIDERS = ("claude", "gemini", "openai", "perplexity")
 
 PROVIDER_ENV_MAP = {
     "gemini": "GEMINI_API_KEY",
     "claude": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "perplexity": "PERPLEXITY_API_KEY",
+}
+
+PROVIDER_CLIENT_MAP = {
+    "gemini": ("app.llm_clients.gemini_client", "call_gemini_client"),
+    "claude": ("app.llm_clients.claude_client", "call_claude_client"),
+    "openai": ("app.llm_clients.openai_client", "call_openai_client"),
+    "perplexity": ("app.llm_clients.perplexity_client", "call_perplexity_client"),
 }
 
 DEFAULT_SCOPE_VALUES = {
@@ -69,6 +76,7 @@ def _validate_scope(scope_type: str, scope_key: str) -> None:
 
 
 def _validate_provider(provider: str) -> None:
+    provider = (provider or "").strip().lower()
     if provider not in SUPPORTED_PROVIDERS:
         raise ValueError(
             f"provider no suportat: {provider}. "
@@ -77,8 +85,15 @@ def _validate_provider(provider: str) -> None:
 
 
 def _build_key_status(provider: str) -> dict:
+    provider = (provider or "").strip().lower()
     env_name = PROVIDER_ENV_MAP.get(provider)
     configured = bool(env_name and os.getenv(env_name, "").strip())
+
+    return {
+        "provider": provider,
+        "env_var": env_name,
+        "key_configured": configured,
+    }
 
     return {
         "provider": provider,
