@@ -261,6 +261,26 @@ def get_llm_runtime_item_detail(scope_type: LLMScopeType, scope_key: str):
         if conn:
             conn.close()
 
+@router_llm_admin.get("/models/{provider}")
+def list_provider_models(provider: str):
+    provider = provider.strip().lower()
+
+    if provider == "gemini":
+        from app.llm_clients.gemini_client import list_available_models
+    elif provider == "claude":
+        from app.llm_clients.claude_client import list_available_models
+    elif provider == "openai":
+        from app.llm_clients.openai_client import list_available_models
+    elif provider == "perplexity":
+        from app.llm_clients.perplexity_client import list_available_models
+    else:
+        raise HTTPException(status_code=400, detail=f"provider no suportat: {provider}")
+
+    return {
+        "status": "ok",
+        "provider": provider,
+        "models": list_available_models(),
+    }
 
 @router_llm_admin.post("/test")
 def test_llm_provider(payload: LLMTestRequest):

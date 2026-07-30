@@ -5,6 +5,13 @@ from typing import Optional
 from google import genai
 from google.genai import types
 
+AVAILABLE_MODELS = [
+    {"name": "gemini-3.1-flash-lite", "stable": True},
+    {"name": "gemini-3.1-pro", "stable": True},
+]
+
+def list_available_models():
+    return AVAILABLE_MODELS
 
 @lru_cache(maxsize=1)
 def _get_gemini_client():
