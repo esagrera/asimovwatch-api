@@ -5,6 +5,8 @@
 
 from typing import Optional, Literal
 
+from psycopg2.extras import RealDictCursor
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -281,6 +283,72 @@ def list_provider_models(provider: str):
         "provider": provider,
         "models": list_available_models(),
     }
+
+@router_llm_admin.post("/models/advisor")
+def get_model_advisor():
+    conn = None
+    try:
+        conn = get_connection()
+
+        providers = get_supported_providers()
+        summary_lines = []
+        for provider in providers:
+            try:
+                if provider == "gemini":
+                    from app.llm_clients.gemini_client import list_available_models
+                elif provider == "claude":
+                    from app.llm_clients.claude_client import list_available_models
+                elif provider == "openai":
+                    from app.llm_clients.openai_client import list_available_models
+                elif provider == "perplexity":
+                    from app.llm_clients.perplexity_client import list_available_models
+                else:
+                    continue
+                models = list_available_models()
+                names = ", ".join(m["name"] for m in models)
+                summary_lines.append(f"{provider}: {names}")
+            except Exception:
+                continue
+
+        models_list_text = "\n".join(summary_lines)
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT key, category, value FROM public.prompts WHERE key = %s LIMIT 1",
+                ("llm_model_advisor",),
+            )
+            prompt_row = cur.fetchone()
+
+        if not prompt_row:
+            raise HTTPException(
+                status_code=404,
+                detail="Prompt 'llm_model_advisor' no trobat. Crea'l primer a la vista Prompts amb categoria Sistema.",
+            )
+
+        prompt_template = prompt_row["value"] or ""
+        final_prompt = prompt_template.replace("{{models_list}}", models_list_text)
+
+        output = call_llm(
+            provider="perplexity",
+            model="sonar-pro",
+            prompt=final_prompt,
+            max_tokens=2000,
+            temperature=0.3,
+            timeout_secs=60,
+        )
+
+        return {
+            "status": "ok",
+            "models_summary": models_list_text,
+            "recommendation": output,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 @router_llm_admin.post("/test")
 def test_llm_provider(payload: LLMTestRequest):
