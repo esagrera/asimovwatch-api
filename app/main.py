@@ -23,6 +23,8 @@ from app.llm_router import pick_llm, get_llm_config
 from app.db import get_connection
 from app.source_candidates import router_candidates
 from app.llm_admin import router_llm_admin
+from app.llm_clients import get_supported_providers
+
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -760,14 +762,17 @@ def update_prompt(key: str, body: PromptUpdate):
             raise HTTPException(status_code=400, detail="Prompt value buit")
 
         clean_category = (body.category or "").strip() or None
-        clean_provider = (body.provider or "gemini").strip().lower()
-        clean_model = (body.model or "gemini-3.1-flash-lite").strip()
+        clean_provider = (body.provider or "").strip().lower()
+        clean_model = (body.model or "").strip()
 
-        if clean_provider not in {"gemini", "claude", "openai"}:
-            raise HTTPException(status_code=400, detail="Provider no suportat")
+        if not clean_provider:
+            raise HTTPException(status_code=400, detail="Provider és obligatori")
 
         if not clean_model:
-            raise HTTPException(status_code=400, detail="Model buit")
+            raise HTTPException(status_code=400, detail="Model és obligatori")
+
+        if clean_provider not in get_supported_providers():
+            raise HTTPException(status_code=400, detail="Provider no suportat")
 
         if body.max_tokens is not None and body.max_tokens <= 0:
             raise HTTPException(status_code=400, detail="max_tokens ha de ser > 0")
