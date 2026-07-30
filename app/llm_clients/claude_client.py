@@ -4,6 +4,14 @@ from typing import Optional
 
 import anthropic
 
+AVAILABLE_MODELS = [
+    {"name": "claude-3.5-sonnet", "stable": True},
+    {"name": "claude-3.5-haiku", "stable": True},
+]
+
+def list_available_models():
+    return AVAILABLE_MODELS
+
 @lru_cache(maxsize=1)
 def _get_claude_client():
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()

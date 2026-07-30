@@ -4,6 +4,14 @@ from typing import Optional
 
 from openai import OpenAI
 
+AVAILABLE_MODELS = [
+    {"name": "gpt-4.1-mini", "stable": True},
+    {"name": "gpt-4.1", "stable": True},
+]
+
+def list_available_models():
+    return AVAILABLE_MODELS
+
 @lru_cache(maxsize=1)
 def _get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY", "").strip()

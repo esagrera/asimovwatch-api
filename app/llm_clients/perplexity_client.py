@@ -2,6 +2,14 @@ import os
 from functools import lru_cache
 from openai import OpenAI
 
+AVAILABLE_MODELS = [
+    {"name": "sonar", "stable": True},
+    {"name": "sonar-pro", "stable": True},
+]
+
+def list_available_models():
+    return AVAILABLE_MODELS
+
 @lru_cache(maxsize=1)
 def _get_perplexity_client():
     api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
