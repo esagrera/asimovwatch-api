@@ -1,16 +1,40 @@
 import os
+import time
 from functools import lru_cache
 from typing import Optional
 
 from openai import OpenAI
 
-AVAILABLE_MODELS = [
+FALLBACK_MODELS = [
     {"name": "gpt-4.1-mini", "stable": True},
     {"name": "gpt-4.1", "stable": True},
 ]
 
+_MODELS_CACHE = {"data": None, "ts": 0}
+_CACHE_TTL_SECS = 3600
+
 def list_available_models():
-    return AVAILABLE_MODELS
+    now = time.time()
+    if _MODELS_CACHE["data"] is not None and (now - _MODELS_CACHE["ts"]) < _CACHE_TTL_SECS:
+        return _MODELS_CACHE["data"]
+
+    models = []
+    try:
+        client = _get_openai_client()
+        response = client.models.list()
+        for m in response.data:
+            model_id = getattr(m, "id", "") or ""
+            if model_id.startswith("gpt-"):
+                is_stable = "preview" not in model_id and "exp" not in model_id
+                models.append({"name": model_id, "stable": is_stable})
+        if not models:
+            raise RuntimeError("Cap model trobat a l'API d'OpenAI")
+    except Exception:
+        models = FALLBACK_MODELS
+
+    _MODELS_CACHE["data"] = models
+    _MODELS_CACHE["ts"] = now
+    return models
 
 @lru_cache(maxsize=1)
 def _get_openai_client():
