@@ -411,3 +411,82 @@ def resolve_phase_llm_config(conn, phase_name: str) -> dict:
 
     row = get_llm_runtime_item(conn, "phase", phase_key)
     return _resolve_runtime_config(row, "phase", phase_key)
+
+def call_llm_for_prompt(
+    conn,
+    prompt_key: str,
+    prompt_overrides: Optional[dict] = None,
+) -> dict:
+    """
+    Executa un prompt fent servir SEMPRE el provider/model configurats
+    al propi prompt (taula public.prompts). Només recorre al fallback
+    (phase='fallback') si la crida primària falla I el prompt té
+    use_fallback = true.
+    """
+    from app.llm_clients import call_llm
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT value, provider, model, max_tokens, temperature,
+                   timeout_secs, use_fallback
+            FROM public.prompts
+            WHERE key = %s
+            LIMIT 1
+            """,
+            (prompt_key,),
+        )
+        prompt_row = cur.fetchone()
+
+    if not prompt_row or not prompt_row.get("value"):
+        raise ValueError(f"Prompt '{prompt_key}' no trobat")
+
+    provider = (prompt_row.get("provider") or "").strip().lower()
+    model = (prompt_row.get("model") or "").strip()
+    use_fallback = bool(prompt_row.get("use_fallback"))
+
+    if not provider or not model:
+        raise ValueError(f"El prompt '{prompt_key}' no té provider/model configurats")
+
+    prompt_text = prompt_row["value"]
+    if prompt_overrides:
+        for placeholder, value in prompt_overrides.items():
+            prompt_text = prompt_text.replace(placeholder, value)
+
+    call_kwargs = dict(
+        max_tokens=prompt_row.get("max_tokens") or DEFAULT_SCOPE_VALUES["max_tokens"],
+        temperature=float(prompt_row["temperature"]) if prompt_row.get("temperature") is not None else DEFAULT_SCOPE_VALUES["temperature"],
+        timeout_secs=prompt_row.get("timeout_secs") or DEFAULT_SCOPE_VALUES["timeout_secs"],
+    )
+
+    try:
+        output = call_llm(provider=provider, model=model, prompt=prompt_text, **call_kwargs)
+        return {
+            "output": output,
+            "provider_used": provider,
+            "model_used": model,
+            "used_fallback": False,
+            "primary_error": None,
+        }
+    except Exception as primary_error:
+        if not use_fallback:
+            raise
+
+        fallback_row = get_phase_config(conn, "fallback")
+        if not fallback_row or not fallback_row.get("provider") or not fallback_row.get("model"):
+            raise RuntimeError(
+                f"Crida primària a '{prompt_key}' ha fallat ({primary_error}) "
+                f"i no hi ha fallback configurat"
+            ) from primary_error
+
+        fb_provider = fallback_row["provider"]
+        fb_model = fallback_row["model"]
+
+        output = call_llm(provider=fb_provider, model=fb_model, prompt=prompt_text, **call_kwargs)
+        return {
+            "output": output,
+            "provider_used": fb_provider,
+            "model_used": fb_model,
+            "used_fallback": True,
+            "primary_error": str(primary_error),
+        }
