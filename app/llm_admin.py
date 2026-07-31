@@ -4,11 +4,17 @@
 # =============================================================================
 
 from typing import Optional, Literal
+from io import BytesIO
+from datetime import datetime, timezone
 
 from psycopg2.extras import RealDictCursor
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 from app.db import get_connection
 from app.llm_clients import call_llm, get_supported_providers
@@ -290,58 +296,83 @@ def get_model_advisor():
     try:
         conn = get_connection()
 
-        providers = get_supported_providers()
-        summary_lines = []
-        for provider in providers:
-            try:
-                if provider == "gemini":
-                    from app.llm_clients.gemini_client import list_available_models
-                elif provider == "claude":
-                    from app.llm_clients.claude_client import list_available_models
-                elif provider == "openai":
-                    from app.llm_clients.openai_client import list_available_models
-                elif provider == "perplexity":
-                    from app.llm_clients.perplexity_client import list_available_models
-                else:
-                    continue
-                models = list_available_models()
-                names = ", ".join(m["name"] for m in models)
-                summary_lines.append(f"{provider}: {names}")
-            except Exception:
-                continue
-
-        models_list_text = "\n".join(summary_lines)
-
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT provider, model
+                FROM public.llm_runtime_config
+                WHERE scope_type = 'phase'
+                  AND scope_key = 'primary'
+                LIMIT 1
+            """)
+            runtime = cur.fetchone()
+
+            if not runtime:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No hi ha configuració LLM per a la fase primary",
+                )
+
+            provider = (runtime["provider"] or "").strip().lower()
+            model = (runtime["model"] or "").strip()
+
+            if not provider:
+                raise HTTPException(status_code=400, detail="provider primary buit")
+            if not model:
+                raise HTTPException(status_code=400, detail="model primary buit")
+
             cur.execute(
                 "SELECT key, category, value FROM public.prompts WHERE key = %s LIMIT 1",
                 ("llm_model_advisor",),
             )
             prompt_row = cur.fetchone()
 
-        if not prompt_row:
-            raise HTTPException(
-                status_code=404,
-                detail="Prompt 'llm_model_advisor' no trobat. Crea'l primer a la vista Prompts amb categoria Sistema.",
+            if not prompt_row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Prompt 'llm_model_advisor' no trobat. Crea'l primer a la vista Prompts amb categoria Sistema.",
+                )
+
+            prompt_template = prompt_row["value"] or ""
+
+            summary_lines = []
+            for p in get_supported_providers():
+                try:
+                    if p == "gemini":
+                        from app.llm_clients.gemini_client import list_available_models
+                    elif p == "claude":
+                        from app.llm_clients.claude_client import list_available_models
+                    elif p == "openai":
+                        from app.llm_clients.openai_client import list_available_models
+                    elif p == "perplexity":
+                        from app.llm_clients.perplexity_client import list_available_models
+                    else:
+                        continue
+
+                    models = list_available_models()
+                    names = ", ".join(m["name"] for m in models)
+                    summary_lines.append(f"{p}: {names}")
+                except Exception:
+                    continue
+
+            models_list_text = "\n".join(summary_lines)
+            final_prompt = prompt_template.replace("{{models_list}}", models_list_text)
+
+            output = call_llm(
+                provider=provider,
+                model=model,
+                prompt=final_prompt,
+                max_tokens=2000,
+                temperature=0.3,
+                timeout_secs=60,
             )
 
-        prompt_template = prompt_row["value"] or ""
-        final_prompt = prompt_template.replace("{{models_list}}", models_list_text)
-
-        output = call_llm(
-            provider="perplexity",
-            model="sonar-pro",
-            prompt=final_prompt,
-            max_tokens=2000,
-            temperature=0.3,
-            timeout_secs=60,
-        )
-
-        return {
-            "status": "ok",
-            "models_summary": models_list_text,
-            "recommendation": output,
-        }
+            return {
+                "status": "ok",
+                "provider": provider,
+                "model": model,
+                "models_summary": models_list_text,
+                "recommendation": output,
+            }
     except HTTPException:
         raise
     except Exception as e:
