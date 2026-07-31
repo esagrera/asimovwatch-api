@@ -432,10 +432,9 @@ def call_llm_for_prompt(
         cur.execute(
             """
             SELECT provider, model, max_tokens, temperature,
-                   timeout_secs, use_fallback
+                timeout_secs, use_fallback
             FROM public.llm_runtime_config
-            WHERE scope_type = 'prompt'
-              AND scope_key = %s
+            WHERE prompt_key = %s
             LIMIT 1
             """,
             (prompt_key,),
