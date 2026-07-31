@@ -5,3 +5,4 @@ google-genai
 anthropic
 openai
 pydantic-settings
+reportlab==4.4.3
