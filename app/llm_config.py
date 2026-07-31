@@ -417,33 +417,37 @@ def call_llm_for_prompt(
     prompt_key: str,
     prompt_overrides: Optional[dict] = None,
 ) -> dict:
-    """
-    Executa un prompt fent servir SEMPRE el provider/model configurats
-    al propi prompt (taula public.prompts). Només recorre al fallback
-    (phase='fallback') si la crida primària falla I el prompt té
-    use_fallback = true.
-    """
     from app.llm_clients import call_llm
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
-            SELECT value, provider, model, max_tokens, temperature,
-                   timeout_secs, use_fallback
-            FROM public.prompts
-            WHERE key = %s
-            LIMIT 1
-            """,
+            "SELECT value FROM public.prompts WHERE key = %s LIMIT 1",
             (prompt_key,),
         )
         prompt_row = cur.fetchone()
 
-    if not prompt_row or not prompt_row.get("value"):
-        raise ValueError(f"Prompt '{prompt_key}' no trobat")
+        if not prompt_row or not prompt_row.get("value"):
+            raise ValueError(f"Prompt '{prompt_key}' no trobat")
 
-    provider = (prompt_row.get("provider") or "").strip().lower()
-    model = (prompt_row.get("model") or "").strip()
-    use_fallback = bool(prompt_row.get("use_fallback"))
+        cur.execute(
+            """
+            SELECT provider, model, max_tokens, temperature,
+                   timeout_secs, use_fallback
+            FROM public.llm_runtime_config
+            WHERE scope_type = 'prompt'
+              AND scope_key = %s
+            LIMIT 1
+            """,
+            (prompt_key,),
+        )
+        config_row = cur.fetchone()
+
+    if not config_row:
+        raise ValueError(f"El prompt '{prompt_key}' no té configuració LLM (llm_runtime_config)")
+
+    provider = (config_row.get("provider") or "").strip().lower()
+    model = (config_row.get("model") or "").strip()
+    use_fallback = bool(config_row.get("use_fallback"))
 
     if not provider or not model:
         raise ValueError(f"El prompt '{prompt_key}' no té provider/model configurats")
@@ -454,9 +458,9 @@ def call_llm_for_prompt(
             prompt_text = prompt_text.replace(placeholder, value)
 
     call_kwargs = dict(
-        max_tokens=prompt_row.get("max_tokens") or DEFAULT_SCOPE_VALUES["max_tokens"],
-        temperature=float(prompt_row["temperature"]) if prompt_row.get("temperature") is not None else DEFAULT_SCOPE_VALUES["temperature"],
-        timeout_secs=prompt_row.get("timeout_secs") or DEFAULT_SCOPE_VALUES["timeout_secs"],
+        max_tokens=config_row.get("max_tokens") or DEFAULT_SCOPE_VALUES["max_tokens"],
+        temperature=float(config_row["temperature"]) if config_row.get("temperature") is not None else DEFAULT_SCOPE_VALUES["temperature"],
+        timeout_secs=config_row.get("timeout_secs") or DEFAULT_SCOPE_VALUES["timeout_secs"],
     )
 
     try:
