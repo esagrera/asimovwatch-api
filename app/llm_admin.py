@@ -2,20 +2,13 @@
 # app/llm_admin.py
 # Router d'administració per a configuració LLM
 # =============================================================================
-import textwrap
-
 from typing import Optional, Literal
-from io import BytesIO
 from datetime import datetime, timezone
 
 from psycopg2.extras import RealDictCursor
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
 
 from app.db import get_connection
 from app.llm_clients import call_llm, get_supported_providers
@@ -298,32 +291,45 @@ def get_model_advisor():
     try:
         conn = get_connection()
 
-        summary_lines = []
-        for p in get_supported_providers():
-            try:
-                if p == "gemini":
-                    from app.llm_clients.gemini_client import list_available_models
-                elif p == "claude":
-                    from app.llm_clients.claude_client import list_available_models
-                elif p == "openai":
-                    from app.llm_clients.openai_client import list_available_models
-                elif p == "perplexity":
-                    from app.llm_clients.perplexity_client import list_available_models
-                else:
-                    continue
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    p.key,
+                    p.category,
+                    p.value,
+                    c.provider,
+                    c.model,
+                    c.max_tokens,
+                    c.temperature,
+                    c.timeout_secs,
+                    c.use_fallback
+                FROM public.prompts p
+                LEFT JOIN public.llm_runtime_config c
+                    ON c.prompt_key = p.key
+                ORDER BY p.key
+            """)
+            prompts_rows = cur.fetchall()
 
-                models = list_available_models()
-                names = ", ".join(m["name"] for m in models)
-                summary_lines.append(f"{p}: {names}")
-            except Exception:
-                continue
+        prompts_summary_lines = []
+        for row in prompts_rows:
+            snippet = (row.get("value") or "").strip().replace("\n", " ")
+            if len(snippet) > 220:
+                snippet = snippet[:220] + "..."
 
-        models_list_text = "\n".join(summary_lines)
+            prompts_summary_lines.append(
+                f"- Prompt: {row['key']} (categoria: {row.get('category') or 'sense categoria'})\n"
+                f"  Extracte del prompt: {snippet}\n"
+                f"  Config actual: provider={row.get('provider') or '-'}, model={row.get('model') or '-'}, "
+                f"max_tokens={row.get('max_tokens') or '-'}, temperature={row.get('temperature') if row.get('temperature') is not None else '-'}, "
+                f"timeout_secs={row.get('timeout_secs') or '-'}, use_fallback={bool(row.get('use_fallback'))}"
+            )
+
+        prompts_summary_text = "\n".join(prompts_summary_lines)
 
         result = call_llm_for_prompt(
             conn,
             "llm_model_advisor",
-            prompt_overrides={"{{models_list}}": models_list_text},
+            prompt_overrides={"{{prompts_config}}": prompts_summary_text},
         )
 
         return {
@@ -331,99 +337,9 @@ def get_model_advisor():
             "provider": result["provider_used"],
             "model": result["model_used"],
             "used_fallback": result["used_fallback"],
-            "models_summary": models_list_text,
+            "prompts_summary": prompts_summary_text,
             "recommendation": result["output"],
         }
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn:
-            conn.close()
-
-@router_llm_admin.post("/models/advisor/pdf")
-def model_advisor_pdf():
-    conn = None
-    try:
-        conn = get_connection()
-
-        summary_lines = []
-        for p in get_supported_providers():
-            try:
-                if p == "gemini":
-                    from app.llm_clients.gemini_client import list_available_models
-                elif p == "claude":
-                    from app.llm_clients.claude_client import list_available_models
-                elif p == "openai":
-                    from app.llm_clients.openai_client import list_available_models
-                elif p == "perplexity":
-                    from app.llm_clients.perplexity_client import list_available_models
-                else:
-                    continue
-
-                models = list_available_models()
-                names = ", ".join(m["name"] for m in models)
-                summary_lines.append(f"{p}: {names}")
-            except Exception:
-                continue
-
-        models_list_text = "\n".join(summary_lines)
-
-        result = call_llm_for_prompt(
-            conn,
-            "llm_model_advisor",
-            prompt_overrides={"{{models_list}}": models_list_text},
-        )
-
-        provider = result["provider_used"]
-        model = result["model_used"]
-        used_fallback = result["used_fallback"]
-        output = result["output"]
-
-        buffer = BytesIO()
-        pdf = canvas.Canvas(buffer, pagesize=A4)
-        width, height = A4
-
-        y = height - 50
-        pdf.setFont("Helvetica-Bold", 14)
-        pdf.drawString(50, y, "Recomanació de models LLM")
-        y -= 20
-
-        pdf.setFont("Helvetica", 9)
-        pdf.drawString(50, y, f"Provider: {provider}" + (" (fallback)" if used_fallback else ""))
-        y -= 12
-        pdf.drawString(50, y, f"Model: {model}")
-        y -= 12
-        pdf.drawString(50, y, f"Data: {datetime.now(timezone.utc).isoformat()}")
-        y -= 20
-
-        pdf.setFont("Helvetica", 10)
-        for line in output.splitlines():
-            if line.strip() == "":
-                y -= 14
-                continue
-            wrapped_lines = textwrap.wrap(line, width=95) or [""]
-            for wrapped in wrapped_lines:
-                if y < 60:
-                    pdf.showPage()
-                    pdf.setFont("Helvetica", 10)
-                    y = height - 50
-                pdf.drawString(50, y, wrapped)
-                y -= 14
-
-        pdf.save()
-        buffer.seek(0)
-
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": 'attachment; filename="llm_model_advisor.pdf"'
-            },
-        )
     except HTTPException:
         raise
     except ValueError as e:
