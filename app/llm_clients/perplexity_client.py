@@ -40,3 +40,13 @@ def call_perplexity_client(
         raise RuntimeError("Perplexity ha retornat contingut buit")
 
     return final_text
+
+
+def list_available_models() -> list[dict]:
+    return [
+        {"name": "sonar", "stable": True},
+        {"name": "sonar-pro", "stable": True},
+        {"name": "sonar-reasoning", "stable": True},
+        {"name": "sonar-reasoning-pro", "stable": True},
+        {"name": "sonar-deep-research", "stable": True},
+    ]
