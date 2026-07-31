@@ -381,6 +381,124 @@ def get_model_advisor():
         if conn:
             conn.close()
 
+@router_llm_admin.post("/models/advisor/pdf")
+def model_advisor_pdf():
+    conn = None
+    try:
+        conn = get_connection()
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT provider, model
+                FROM public.llm_runtime_config
+                WHERE scope_type = 'phase'
+                  AND scope_key = 'primary'
+                LIMIT 1
+            """)
+            runtime = cur.fetchone()
+
+            if not runtime:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No hi ha configuració LLM per a la fase primary",
+                )
+
+            provider = (runtime["provider"] or "").strip().lower()
+            model = (runtime["model"] or "").strip()
+
+            if not provider:
+                raise HTTPException(status_code=400, detail="provider primary buit")
+            if not model:
+                raise HTTPException(status_code=400, detail="model primary buit")
+
+            cur.execute("""
+                SELECT value
+                FROM public.prompts
+                WHERE key = %s
+                LIMIT 1
+            """, ("llm_model_advisor",))
+            prompt_row = cur.fetchone()
+
+            if not prompt_row or not prompt_row["value"]:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Prompt 'llm_model_advisor' no trobat",
+                )
+
+            prompt_template = prompt_row["value"] or ""
+
+            summary_lines = []
+            for p in get_supported_providers():
+                try:
+                    if p == "gemini":
+                        from app.llm_clients.gemini_client import list_available_models
+                    elif p == "claude":
+                        from app.llm_clients.claude_client import list_available_models
+                    elif p == "openai":
+                        from app.llm_clients.openai_client import list_available_models
+                    elif p == "perplexity":
+                        from app.llm_clients.perplexity_client import list_available_models
+                    else:
+                        continue
+
+                    models = list_available_models()
+                    names = ", ".join(m["name"] for m in models)
+                    summary_lines.append(f"{p}: {names}")
+                except Exception:
+                    continue
+
+            models_list_text = "\n".join(summary_lines)
+            final_prompt = prompt_template.replace("{{models_list}}", models_list_text)
+
+            output = call_llm(
+                provider=provider,
+                model=model,
+                prompt=final_prompt,
+                max_tokens=2000,
+                temperature=0.3,
+                timeout_secs=60,
+            )
+
+            buffer = BytesIO()
+            pdf = canvas.Canvas(buffer, pagesize=A4)
+            width, height = A4
+
+            y = height - 50
+            pdf.setFont("Helvetica-Bold", 14)
+            pdf.drawString(50, y, "Recomanació de models LLM")
+            y -= 20
+
+            pdf.setFont("Helvetica", 9)
+            pdf.drawString(50, y, f"Provider: {provider}")
+            y -= 12
+            pdf.drawString(50, y, f"Model: {model}")
+            y -= 12
+            pdf.drawString(50, y, f"Data: {datetime.now(timezone.utc).isoformat()}")
+            y -= 20
+
+            pdf.setFont("Helvetica", 10)
+            for line in output.splitlines():
+                if y < 60:
+                    pdf.showPage()
+                    pdf.setFont("Helvetica", 10)
+                    y = height - 50
+                pdf.drawString(50, y, line[:110])
+                y -= 14
+
+            pdf.save()
+            buffer.seek(0)
+
+            return StreamingResponse(
+                buffer,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": 'attachment; filename="llm_model_advisor.pdf"'
+                },
+            )
+    finally:
+        if conn:
+            conn.close()
+
 @router_llm_admin.post("/test")
 def test_llm_provider(payload: LLMTestRequest):
     try:
