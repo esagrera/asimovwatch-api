@@ -655,7 +655,7 @@ def evaluate_source_candidate(
             if isinstance(llm_response, dict):
                 parsed = llm_response
             else:
-                parsed = extract_json_candidate(llm_response)
+                parsed = _extract_json_candidate(llm_response)
 
             if not isinstance(parsed, dict):
                 raise HTTPException(
