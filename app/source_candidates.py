@@ -29,7 +29,7 @@ class SourceCandidateCreate(BaseModel):
     country_region: Optional[str] = None
     institution_type: Optional[str] = None
     proposed_phase: Optional[SourceCandidatePhase] = None
-    human_protection_relevance: Optional[str] = None
+    built_in_human_protection_rationale: Optional[str] = None
     justification: Optional[str] = None
     proposed_by: Optional[str] = None
 
@@ -43,7 +43,7 @@ class SourceCandidateUpdate(BaseModel):
     country_region: Optional[str] = None
     institution_type: Optional[str] = None
     proposed_phase: Optional[SourceCandidatePhase] = None
-    human_protection_relevance: Optional[str] = None
+    built_in_human_protection_rationale: Optional[str] = None
     justification: Optional[str] = None
     proposed_by: Optional[str] = None
 
@@ -84,6 +84,17 @@ class SourceCandidateDiscoverRequest(BaseModel):
     input_text: Optional[str] = None
     proposed_by: Optional[str] = "ai-discovery"
     dry_run: bool = False
+
+class SourceCandidateEvaluateRequest(BaseModel):
+    """
+    Request per executar l'avaluació BIHP d'un candidate ja existent.
+
+    - prompt_key: clau del prompt guardat a public.prompts
+    - apply_addendum: si True, permet que el model afegeixi context
+      addicional a justification sense sobreescriure el text existent
+    """
+    prompt_key: str = "Source candidate evaluation"
+    apply_addendum: bool = True
 
 # =============================================================================
 # ENDPOINTS CRUD — /source-candidates
@@ -172,7 +183,7 @@ def create_source_candidate(payload: SourceCandidateCreate):
                 """
                 INSERT INTO public.source_candidates
                     (name, url, domain, source_type, country_region,
-                     institution_type, proposed_phase, human_protection_relevance,
+                     institution_type, proposed_phase, built_in_human_protection_rationale,
                      justification, proposed_by, status, created_at)
                 VALUES
                     (%s, %s, %s, %s, %s,
@@ -183,7 +194,7 @@ def create_source_candidate(payload: SourceCandidateCreate):
                 (
                     payload.name, payload.url, payload.domain, payload.source_type,
                     payload.country_region, payload.institution_type,
-                    payload.proposed_phase, payload.human_protection_relevance,
+                    payload.proposed_phase, payload.built_in_human_protection_rationale,
                     payload.justification, payload.proposed_by,
                 )
             )
@@ -345,7 +356,7 @@ def _normalize_discovery_items(raw_items):
             "country_region": (item.get("country_region") or "").strip() or None,
             "institution_type": (item.get("institution_type") or "").strip() or None,
             "proposed_phase": item.get("proposed_phase"),
-            "human_protection_relevance": (item.get("human_protection_relevance") or "").strip() or None,
+            "built_in_human_protection_rationale": (item.get("built_in_human_protection_rationale") or "").strip() or None,
             "justification": (item.get("justification") or "").strip() or None,
         })
 
@@ -448,7 +459,7 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                 "country_region": "string o null",
                 "institution_type": "string o null",
                 "proposed_phase": "1|2|3|later|null",
-                "human_protection_relevance": "string o null",
+                "built_in_human_protection_rationale": "string o null",
                 "justification": "string o null"
                 }}
             ]
@@ -538,7 +549,7 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                     INSERT INTO public.source_candidates
                     (name, url, domain, source_type, country_region,
                      institution_type, proposed_phase,
-                     human_protection_relevance, justification,
+                     built_in_human_protection_rationale, justification,
                      proposed_by, status, created_at)
                     VALUES
                     (%s, %s, %s, %s, %s,
@@ -555,7 +566,7 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                         item["country_region"],
                         item["institution_type"],
                         item["proposed_phase"],
-                        item["human_protection_relevance"],
+                        item["built_in_human_protection_rationale"],
                         item["justification"],
                         payload.proposed_by,
                     )
@@ -596,6 +607,155 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
             status_code=409,
             detail="S'ha detectat una URL duplicada durant la descoberta"
         )
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+# =============================================================================
+# ENDPOINT DE EVALUACIO — POST /source-candidates/{candidate_id}/evaluate
+# =============================================================================
+
+@router_candidates.post("/{candidate_id}/evaluate", status_code=200)
+def evaluate_source_candidate(
+    candidate_id: int,
+    payload: Optional[SourceCandidateEvaluateRequest] = None
+):
+    """
+    Executa l'avaluació BIHP d'un candidate existent via prompt dedicat.
+
+    Comportament:
+    - Llegeix el candidate. Ha d'existir.
+    - Llegeix el prompt de public.prompts segons prompt_key.
+    - Crida el model LLM amb scope_key="source_evaluation".
+    - Espera JSON amb forma:
+        {
+          "built_in_human_protection_rationale": string,
+          "justification": string o null
+        }
+    - Si el model no té evidència fiable, built_in_human_protection_rationale
+      ha de ser exactament "Evidència insuficient".
+    - Actualitza built_in_human_protection_rationale sempre.
+    - Actualitza justification només si enrich_justification=True
+      i el model retorna contingut no buit.
+
+    IMPORTANT:
+    - No canvia status ni review_notes.
+    - No promociona ni aprova res.
+    """
+    if payload is None:
+        payload = SourceCandidateEvaluateRequest()
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            cur.execute(
+                "SELECT * FROM public.source_candidates WHERE id = %s",
+                (candidate_id,)
+            )
+            candidate = cur.fetchone()
+            if not candidate:
+                raise HTTPException(status_code=404, detail="Candidate no trobat")
+
+            prompt_value = get_prompt_value(cur, payload.prompt_key)
+
+            candidate_context = {
+                "name": candidate.get("name"),
+                "url": candidate.get("url"),
+                "domain": candidate.get("domain"),
+                "source_type": candidate.get("source_type"),
+                "country_region": candidate.get("country_region"),
+                "institution_type": candidate.get("institution_type"),
+                "justification": candidate.get("justification"),
+            }
+
+            llm_input = (
+                f"{prompt_value}\n\n"
+                f"CANDIDATE A AVALUAR:\n{json.dumps(candidate_context, ensure_ascii=False)}\n\n"
+                "INSTRUCCIONS DE SORTIDA:\n"
+                "Retorna exclusivament JSON vàlid amb aquesta estructura:\n"
+                "{\n"
+                '  "built_in_human_protection_rationale": string,\n'
+                '  "justification": string o null\n'
+                "}\n"
+                "El camp built_in_human_protection_rationale ha de tractar "
+                "EXCLUSIVAMENT evidència de Protecció Humana (declaració, "
+                "verificabilitat, profunditat d'implementació) sobre aquesta "
+                "font concreta.\n"
+                "Si no pots verificar evidència real i fiable, retorna "
+                "exactament el text \"Evidència insuficient\" en aquest camp. "
+                "No inventis ni infereixis compromisos que la font no declara "
+                "explícitament i de forma verificable.\n"
+                "No escriguis text fora del JSON. No facis servir markdown."
+            ).strip()
+
+            llm_result = call_with_fallback(
+                conn=conn,
+                scope_type="task",
+                scope_key="source_evaluation",
+                prompt=llm_input,
+            )
+            llm_response = llm_result["text"]
+
+            if isinstance(llm_response, dict):
+                parsed = llm_response
+            else:
+                parsed = extract_json_candidate(llm_response)
+
+            if not isinstance(parsed, dict):
+                raise HTTPException(
+                    status_code=500,
+                    detail="La resposta del model no és JSON vàlid"
+                )
+
+            rationale = (parsed.get("built_in_human_protection_rationale") or "").strip()
+            if not rationale:
+                rationale = "Evidència insuficient"
+
+            addendum = (parsed.get("justification_addendum") or "").strip()
+
+            new_justification = candidate.get("justification")
+            if addendum:
+                if new_justification:
+                    new_justification = f"{new_justification}\n\n{addendum}"
+                else:
+                    new_justification = addendum
+
+            cur.execute(
+                """
+                UPDATE public.source_candidates
+                SET built_in_human_protection_rationale = %s,
+                    justification = %s
+                WHERE id = %s
+                RETURNING *
+                """,
+                (rationale, new_justification, candidate_id)
+            )
+            updated = cur.fetchone()
+            conn.commit()
+
+            return {
+                "status": "evaluated",
+                "item": updated,
+                "llm": {
+                    "scope_type": llm_result["scope_type"],
+                    "scope_key": llm_result["scope_key"],
+                    "provider": llm_result["provider"],
+                    "model": llm_result["model"],
+                    "used_fallback": llm_result["used_fallback"],
+                    "attempts": llm_result["attempts"],
+                },
+            }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
     except Exception as e:
         if conn:
             conn.rollback()
