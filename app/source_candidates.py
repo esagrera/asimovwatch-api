@@ -11,7 +11,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db import get_connection
-from app.llm_router import call_with_fallback
 
 
 # =============================================================================
@@ -466,14 +465,14 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
             Si no tens prou dades, retorna exactament {{"items": []}}.
             """.strip()
 
-            llm_result = call_with_fallback(
-                conn=conn,
-                scope_type="task",
-                scope_key="source_discovery",
-                prompt=llm_input,
-            )
+            from app.llm_config import call_llm_for_prompt
 
-            llm_response = llm_result["text"]
+            llm_result = call_llm_for_prompt(
+                conn=conn,
+                prompt_key=payload.prompt_key,
+                prompt_overrides={"{input_text}": effective_input}
+            )
+            llm_response = llm_result["output"]
 
             if isinstance(llm_response, dict):
                 parsed = llm_response
@@ -620,28 +619,6 @@ def evaluate_source_candidate(
     candidate_id: int,
     payload: Optional[SourceCandidateEvaluateRequest] = None
 ):
-    """
-    Executa l'avaluació BIHP d'un candidate existent via prompt dedicat.
-
-    Comportament:
-    - Llegeix el candidate. Ha d'existir.
-    - Llegeix el prompt de public.prompts segons prompt_key.
-    - Crida el model LLM amb scope_key="source_evaluation".
-    - Espera JSON amb forma:
-        {
-          "built_in_human_protection_rationale": string,
-          "justification": string o null
-        }
-    - Si el model no té evidència fiable, built_in_human_protection_rationale
-      ha de ser exactament "Evidència insuficient".
-    - Actualitza built_in_human_protection_rationale sempre.
-    - Actualitza justification només si enrich_justification=True
-      i el model retorna contingut no buit.
-
-    IMPORTANT:
-    - No canvia status ni review_notes.
-    - No promociona ni aprova res.
-    """
     if payload is None:
         payload = SourceCandidateEvaluateRequest()
 
@@ -658,9 +635,7 @@ def evaluate_source_candidate(
             if not candidate:
                 raise HTTPException(status_code=404, detail="Candidate no trobat")
 
-            prompt_value = get_prompt_value(cur, payload.prompt_key)
-
-            candidate_context = {
+            candidate_context_text = json.dumps({
                 "name": candidate.get("name"),
                 "url": candidate.get("url"),
                 "domain": candidate.get("domain"),
@@ -668,35 +643,16 @@ def evaluate_source_candidate(
                 "country_region": candidate.get("country_region"),
                 "institution_type": candidate.get("institution_type"),
                 "justification": candidate.get("justification"),
-            }
+            }, ensure_ascii=False)
 
-            llm_input = (
-                f"{prompt_value}\n\n"
-                f"CANDIDATE A AVALUAR:\n{json.dumps(candidate_context, ensure_ascii=False)}\n\n"
-                "INSTRUCCIONS DE SORTIDA:\n"
-                "Retorna exclusivament JSON vàlid amb aquesta estructura:\n"
-                "{\n"
-                '  "built_in_human_protection_rationale": string,\n'
-                '  "justification": string o null\n'
-                "}\n"
-                "El camp built_in_human_protection_rationale ha de tractar "
-                "EXCLUSIVAMENT evidència de Protecció Humana (declaració, "
-                "verificabilitat, profunditat d'implementació) sobre aquesta "
-                "font concreta.\n"
-                "Si no pots verificar evidència real i fiable, retorna "
-                "exactament el text \"Evidència insuficient\" en aquest camp. "
-                "No inventis ni infereixis compromisos que la font no declara "
-                "explícitament i de forma verificable.\n"
-                "No escriguis text fora del JSON. No facis servir markdown."
-            ).strip()
+            from app.llm_config import call_llm_for_prompt
 
-            llm_result = call_with_fallback(
+            llm_result = call_llm_for_prompt(
                 conn=conn,
-                scope_type="task",
-                scope_key="source_evaluation",
-                prompt=llm_input,
+                prompt_key=payload.prompt_key,
+                prompt_overrides={"{input_text}": candidate_context_text}
             )
-            llm_response = llm_result["text"]
+            llm_response = llm_result["output"]
 
             if isinstance(llm_response, dict):
                 parsed = llm_response
@@ -716,7 +672,7 @@ def evaluate_source_candidate(
             addendum = (parsed.get("justification_addendum") or "").strip()
 
             new_justification = candidate.get("justification")
-            if addendum:
+            if payload.apply_addendum and addendum:
                 if new_justification:
                     new_justification = f"{new_justification}\n\n{addendum}"
                 else:
@@ -739,12 +695,10 @@ def evaluate_source_candidate(
                 "status": "evaluated",
                 "item": updated,
                 "llm": {
-                    "scope_type": llm_result["scope_type"],
-                    "scope_key": llm_result["scope_key"],
-                    "provider": llm_result["provider"],
-                    "model": llm_result["model"],
+                    "prompt_key": payload.prompt_key,
+                    "provider": llm_result["provider_used"],
+                    "model": llm_result["model_used"],
                     "used_fallback": llm_result["used_fallback"],
-                    "attempts": llm_result["attempts"],
                 },
             }
 
