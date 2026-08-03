@@ -582,12 +582,10 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                 "items": inserted,
                 "skipped": skipped_existing,
                 "llm": {
-                    "scope_type": llm_result["scope_type"],
-                    "scope_key": llm_result["scope_key"],
-                    "provider": llm_result["provider"],
-                    "model": llm_result["model"],
+                    "prompt_key": payload.prompt_key,
+                    "provider": llm_result["provider_used"],
+                    "model": llm_result["model_used"],
                     "used_fallback": llm_result["used_fallback"],
-                    "attempts": llm_result["attempts"],
                 }
             }
 
