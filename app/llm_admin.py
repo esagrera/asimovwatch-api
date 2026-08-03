@@ -128,9 +128,15 @@ def get_llm_config():
         grouped = {
             "task": {},
             "phase": {},
+            "prompt": {},
         }
+
         for row in enriched:
-            grouped[row["scope_type"]][row["scope_key"]] = row
+            scope_type = row.get("scope_type")
+            scope_key = row.get("scope_key")
+            if scope_type not in grouped:
+                grouped[scope_type] = {}
+            grouped[scope_type][scope_key] = row
 
         return {
             "status": "ok",
