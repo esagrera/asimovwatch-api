@@ -356,7 +356,6 @@ def _normalize_discovery_items(raw_items):
             "country_region": (item.get("country_region") or "").strip() or None,
             "institution_type": (item.get("institution_type") or "").strip() or None,
             "proposed_phase": item.get("proposed_phase"),
-            "built_in_human_protection_rationale": (item.get("built_in_human_protection_rationale") or "").strip() or None,
             "justification": (item.get("justification") or "").strip() or None,
         })
 
@@ -459,7 +458,6 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                 "country_region": "string o null",
                 "institution_type": "string o null",
                 "proposed_phase": "1|2|3|later|null",
-                "built_in_human_protection_rationale": "string o null",
                 "justification": "string o null"
                 }}
             ]
@@ -548,14 +546,12 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                     """
                     INSERT INTO public.source_candidates
                     (name, url, domain, source_type, country_region,
-                     institution_type, proposed_phase,
-                     built_in_human_protection_rationale, justification,
-                     proposed_by, status, created_at)
+                    institution_type, proposed_phase,
+                    justification, proposed_by, status, created_at)
                     VALUES
                     (%s, %s, %s, %s, %s,
-                     %s, %s,
-                     %s, %s,
-                     %s, 'PENDING', NOW())
+                    %s, %s,
+                    %s, %s, 'PENDING', NOW())
                     RETURNING *
                     """,
                     (
@@ -566,11 +562,11 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                         item["country_region"],
                         item["institution_type"],
                         item["proposed_phase"],
-                        item["built_in_human_protection_rationale"],
                         item["justification"],
                         payload.proposed_by,
                     )
                 )
+                inserted.append(cur.fetchone())
                 inserted.append(cur.fetchone())
 
             if not payload.dry_run:
