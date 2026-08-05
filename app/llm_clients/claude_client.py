@@ -52,13 +52,21 @@ def call_claude_client(
     **kwargs,
 ) -> str:
     client = _get_claude_client()
+
+    request_kwargs = dict(
+        model=model,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            response = client.messages.create(temperature=temperature, **request_kwargs)
+        except anthropic.BadRequestError as e:
+            if "temperature" in str(e) and "deprecated" in str(e).lower():
+                response = client.messages.create(**request_kwargs)
+            else:
+                raise
     except Exception as e:
         raise RuntimeError(f"Claude request failed: {str(e)}") from e
 
