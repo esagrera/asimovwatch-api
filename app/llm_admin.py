@@ -20,7 +20,17 @@ from app.llm_config import (
     get_provider_key_status,
     _build_key_status,
     call_llm_for_prompt,
+    list_llm_provider_registry,
+    get_llm_provider_registry_item,
+    list_llm_provider_models,
+    list_llm_provider_status,
+    get_default_model,
+    get_recommended_models,
+    get_fallback_candidate_models,
+    record_llm_provider_status,
+    classify_llm_error,
 )
+
 
 router_llm_admin = APIRouter(prefix="/admin/llm", tags=["admin-llm"])
 
@@ -103,6 +113,78 @@ def list_llm_providers():
         if conn:
             conn.close()
 
+@router_llm_admin.get("/providers/registry")
+def list_providers_registry():
+    conn = None
+    try:
+        conn = get_connection()
+        registry = list_llm_provider_registry(conn)
+        models = list_llm_provider_models(conn)
+        status = list_llm_provider_status(conn)
+
+        status_map = {(s["provider"], s["model"]): s for s in status}
+
+        result = []
+        for item in registry:
+            provider = item["provider"]
+            provider_models = [m for m in models if m["provider"] == provider]
+            for m in provider_models:
+                s = status_map.get((provider, m["model"]))
+                m["last_checked_at"] = s["last_checked_at"] if s else None
+                m["last_ok_at"] = s["last_ok_at"] if s else None
+                m["last_error_at"] = s["last_error_at"] if s else None
+                m["last_error_type"] = s["last_error_type"] if s else None
+                m["last_error_message"] = s["last_error_message"] if s else None
+
+            item["models"] = provider_models
+            item["default_model"] = get_default_model(conn, provider)
+            item["recommended_models"] = [m["model"] for m in get_recommended_models(conn, provider)]
+            item["fallback_candidate_models"] = [m["model"] for m in get_fallback_candidate_models(conn, provider)]
+            result.append(item)
+
+        return {"status": "ok", "count": len(result), "items": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
+@router_llm_admin.get("/providers/registry/{provider}")
+def get_provider_registry_detail(provider: str):
+    conn = None
+    try:
+        provider = provider.strip().lower()
+        conn = get_connection()
+        item = get_llm_provider_registry_item(conn, provider)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Provider no trobat: {provider}")
+
+        models = list_llm_provider_models(conn, provider)
+        status = list_llm_provider_status(conn, provider)
+        status_map = {s["model"]: s for s in status}
+
+        for m in models:
+            s = status_map.get(m["model"])
+            m["last_checked_at"] = s["last_checked_at"] if s else None
+            m["last_ok_at"] = s["last_ok_at"] if s else None
+            m["last_error_at"] = s["last_error_at"] if s else None
+            m["last_error_type"] = s["last_error_type"] if s else None
+            m["last_error_message"] = s["last_error_message"] if s else None
+
+        item["models"] = models
+        item["default_model"] = get_default_model(conn, provider)
+        item["recommended_models"] = [m["model"] for m in get_recommended_models(conn, provider)]
+        item["fallback_candidate_models"] = [m["model"] for m in get_fallback_candidate_models(conn, provider)]
+
+        return {"status": "ok", "item": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 @router_llm_admin.get("/key-status")
 def get_llm_key_status():
@@ -358,6 +440,9 @@ def get_model_advisor():
 
 @router_llm_admin.post("/test")
 def test_llm_provider(payload: LLMTestRequest):
+    conn = None
+    provider = None
+    model = None
     try:
         provider = _normalize_provider(payload.provider)
         model = (payload.model or "").strip()
@@ -377,6 +462,9 @@ def test_llm_provider(payload: LLMTestRequest):
             timeout_secs=payload.timeout_secs,
         )
 
+        conn = get_connection()
+        record_llm_provider_status(conn, provider, model, ok=True)
+
         return {
             "status": "ok",
             "provider": provider,
@@ -388,4 +476,15 @@ def test_llm_provider(payload: LLMTestRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        if provider and model:
+            error_type = classify_llm_error(e, provider)
+            try:
+                if not conn:
+                    conn = get_connection()
+                record_llm_provider_status(conn, provider, model, ok=False, error_type=error_type, error_message=str(e))
+            except Exception:
+                pass
         raise HTTPException(status_code=503, detail=str(e))
+    finally:
+        if conn:
+            conn.close()

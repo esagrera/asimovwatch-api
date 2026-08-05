@@ -412,6 +412,132 @@ def resolve_phase_llm_config(conn, phase_name: str) -> dict:
     row = get_llm_runtime_item(conn, "phase", phase_key)
     return _resolve_runtime_config(row, "phase", phase_key)
 
+def list_llm_provider_registry(conn) -> list[dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM public.llm_provider_registry ORDER BY provider")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_llm_provider_registry_item(conn, provider: str):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM public.llm_provider_registry WHERE provider = %s",
+            (provider,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def list_llm_provider_models(conn, provider: str = None) -> list[dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if provider:
+            cur.execute(
+                "SELECT * FROM public.llm_provider_models WHERE provider = %s ORDER BY priority",
+                (provider,)
+            )
+        else:
+            cur.execute("SELECT * FROM public.llm_provider_models ORDER BY provider, priority")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def list_llm_provider_status(conn, provider: str = None) -> list[dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if provider:
+            cur.execute(
+                "SELECT * FROM public.llm_provider_status WHERE provider = %s",
+                (provider,)
+            )
+        else:
+            cur.execute("SELECT * FROM public.llm_provider_status")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_llm_provider_status_item(conn, provider: str, model: str):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM public.llm_provider_status WHERE provider = %s AND model = %s",
+            (provider, model)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+PROVIDER_ERROR_SIGNATURES = {
+    "gemini": {
+        "quota_exceeded": ["resource_exhausted", "quota"],
+        "rate_limited": ["429", "rate limit"],
+    },
+    "claude": {
+        "quota_exceeded": ["credit balance", "insufficient", "quota"],
+        "rate_limited": ["429", "rate_limit", "overloaded"],
+    },
+    "openai": {
+        "quota_exceeded": ["insufficient_quota", "exceeded your current quota"],
+        "rate_limited": ["429", "rate_limit_exceeded"],
+    },
+    "perplexity": {
+        "quota_exceeded": ["insufficient credit", "quota"],
+        "rate_limited": ["429", "rate limit"],
+    },
+}
+
+
+def classify_llm_error(exc: Exception, provider: str) -> str:
+    msg = str(exc).lower()
+    signatures = PROVIDER_ERROR_SIGNATURES.get(provider, {})
+    for error_type in ("quota_exceeded", "rate_limited"):
+        for keyword in signatures.get(error_type, []):
+            if keyword in msg:
+                return error_type
+    return "unknown_error"
+
+
+def record_llm_provider_status(conn, provider: str, model: str, ok: bool, error_type: str = None, error_message: str = None):
+    with conn.cursor() as cur:
+        if ok:
+            cur.execute(
+                """
+                INSERT INTO public.llm_provider_status (provider, model, last_checked_at, last_ok_at, updated_at)
+                VALUES (%s, %s, now(), now(), now())
+                ON CONFLICT (provider, model) DO UPDATE SET
+                    last_checked_at = now(),
+                    last_ok_at = now(),
+                    updated_at = now()
+                """,
+                (provider, model)
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO public.llm_provider_status (provider, model, last_checked_at, last_error_type, last_error_message, last_error_at, updated_at)
+                VALUES (%s, %s, now(), %s, %s, now(), now())
+                ON CONFLICT (provider, model) DO UPDATE SET
+                    last_checked_at = now(),
+                    last_error_type = %s,
+                    last_error_message = %s,
+                    last_error_at = now(),
+                    updated_at = now()
+                """,
+                (provider, model, error_type, error_message, error_type, error_message)
+            )
+    conn.commit()
+
+def get_default_model(conn, provider: str) -> str:
+    models = list_llm_provider_models(conn, provider)
+    for m in models:
+        if m["is_default"]:
+            return m["model"]
+    return models[0]["model"] if models else None
+
+
+def get_recommended_models(conn, provider: str) -> list[dict]:
+    models = list_llm_provider_models(conn, provider)
+    return [m for m in models if m["visible_in_dropdown"] and m["enabled"]]
+
+
+def get_fallback_candidate_models(conn, provider: str) -> list[dict]:
+    models = list_llm_provider_models(conn, provider)
+    return [m for m in models if m["is_fallback_candidate"]]        
+
 def call_llm_for_prompt(
     conn,
     prompt_key: str,
@@ -464,6 +590,7 @@ def call_llm_for_prompt(
 
     try:
         output = call_llm(provider=provider, model=model, prompt=prompt_text, **call_kwargs)
+        record_llm_provider_status(conn, provider, model, ok=True)
         return {
             "output": output,
             "provider_used": provider,
@@ -472,6 +599,14 @@ def call_llm_for_prompt(
             "primary_error": None,
         }
     except Exception as primary_error:
+        error_type = classify_llm_error(primary_error, provider)
+        record_llm_provider_status(
+            conn, provider, model,
+            ok=False,
+            error_type=error_type,
+            error_message=str(primary_error),
+        )
+
         if not use_fallback:
             raise
 
@@ -485,11 +620,22 @@ def call_llm_for_prompt(
         fb_provider = fallback_row["provider"]
         fb_model = fallback_row["model"]
 
-        output = call_llm(provider=fb_provider, model=fb_model, prompt=prompt_text, **call_kwargs)
-        return {
-            "output": output,
-            "provider_used": fb_provider,
-            "model_used": fb_model,
-            "used_fallback": True,
-            "primary_error": str(primary_error),
-        }
+        try:
+            output = call_llm(provider=fb_provider, model=fb_model, prompt=prompt_text, **call_kwargs)
+            record_llm_provider_status(conn, fb_provider, fb_model, ok=True)
+            return {
+                "output": output,
+                "provider_used": fb_provider,
+                "model_used": fb_model,
+                "used_fallback": True,
+                "primary_error": str(primary_error),
+            }
+        except Exception as fallback_error:
+            fb_error_type = classify_llm_error(fallback_error, fb_provider)
+            record_llm_provider_status(
+                conn, fb_provider, fb_model,
+                ok=False,
+                error_type=fb_error_type,
+                error_message=str(fallback_error),
+            )
+            raise
