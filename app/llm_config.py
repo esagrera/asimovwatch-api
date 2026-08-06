@@ -1,12 +1,22 @@
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from psycopg2.extras import RealDictCursor
 
-VALID_SCOPE_TYPES = {"task", "phase"}
-VALID_PHASE_KEYS = {"input", "primary", "output", "fallback"}
-VALID_TASK_KEYS = {"source_discovery", "source_evaluation"}
-SUPPORTED_PROVIDERS = ("claude", "gemini", "openai", "perplexity")
+VALID_SCOPE_TYPES = {"phase", "prompt"}
+
+VALID_PHASE_KEYS = {
+    "fallback",
+}
+
+VALID_PROMPT_SCOPE_KEY = "prompt"
+
+SUPPORTED_PROVIDERS = (
+    "claude",
+    "gemini",
+    "openai",
+    "perplexity",
+)
 
 PROVIDER_ENV_MAP = {
     "gemini": "GEMINI_API_KEY",
@@ -34,11 +44,6 @@ DEFAULT_SCOPE_VALUES = {
 }
 
 DEFAULT_PROMPT_KEYS = {
-    ("task", "source_discovery"): "Source candidates discovery",
-    ("task", "source_evaluation"): "Source candidate evaluation",
-    ("phase", "input"): "Input",
-    ("phase", "primary"): "Primary",
-    ("phase", "output"): "Output",
     ("phase", "fallback"): "Fallback",
 }
 
@@ -65,15 +70,28 @@ def _normalize_row(row: dict) -> dict:
 
 
 def _validate_scope(scope_type: str, scope_key: str) -> None:
-    if scope_type not in VALID_SCOPE_TYPES:
-        raise ValueError(f"scope_type invàlid: {scope_type}")
+    normalized_scope_type = (scope_type or "").strip().lower()
+    normalized_scope_key = (scope_key or "").strip().lower()
 
-    if scope_type == "phase" and scope_key not in VALID_PHASE_KEYS:
-        raise ValueError(f"scope_key invàlid per phase: {scope_key}")
+    if normalized_scope_type not in VALID_SCOPE_TYPES:
+        raise ValueError(
+            f"scope_type invàlid: {normalized_scope_type}. "
+            f"Valors permesos: {', '.join(sorted(VALID_SCOPE_TYPES))}"
+        )
 
-    if scope_type == "task" and scope_key not in VALID_TASK_KEYS:
-        raise ValueError(f"scope_key invàlid per task: {scope_key}")
+    if normalized_scope_type == "phase":
+        if normalized_scope_key not in VALID_PHASE_KEYS:
+            raise ValueError(
+                f"scope_key invàlid per phase: {normalized_scope_key}"
+            )
+        return
 
+    if normalized_scope_type == "prompt":
+        if normalized_scope_key != VALID_PROMPT_SCOPE_KEY:
+            raise ValueError(
+                f"scope_key invàlid per prompt: {normalized_scope_key}"
+            )
+        return
 
 def _validate_provider(provider: str) -> None:
     provider = (provider or "").strip().lower()
@@ -124,19 +142,20 @@ def list_llm_runtime_config(conn) -> list[dict]:
             FROM public.llm_runtime_config
             ORDER BY
                 CASE scope_type
-                    WHEN 'task' THEN 1
-                    WHEN 'phase' THEN 2
+                    WHEN 'phase' THEN 1
+                    WHEN 'prompt' THEN 2
                     ELSE 99
                 END,
-                CASE scope_key
-                    WHEN 'source_discovery' THEN 1
-                    WHEN 'source_evaluation' THEN 2
-                    WHEN 'input' THEN 10
-                    WHEN 'primary' THEN 11
-                    WHEN 'output' THEN 12
-                    WHEN 'fallback' THEN 13
+                CASE
+                    WHEN scope_type = 'phase'
+                    AND scope_key = 'fallback'
+                        THEN 1
+                    WHEN scope_type = 'prompt'
+                    AND scope_key = 'prompt'
+                        THEN 2
                     ELSE 99
                 END,
+                prompt_key,
                 id
             """
         )
@@ -187,10 +206,45 @@ def get_llm_runtime_map(conn) -> dict[str, dict]:
 def get_phase_config(conn, phase: str) -> Optional[dict]:
     return get_llm_runtime_item(conn, "phase", phase)
 
+def get_prompt_runtime_config(
+    conn,
+    prompt_key: str,
+) -> Optional[dict]:
+    prompt_key = (prompt_key or "").strip()
 
-def get_task_config(conn, task_name: str) -> Optional[dict]:
-    return get_llm_runtime_item(conn, "task", task_name)
+    if not prompt_key:
+        raise ValueError("prompt_key buit")
 
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                scope_type,
+                scope_key,
+                provider,
+                model,
+                prompt_key,
+                enabled,
+                use_fallback,
+                max_tokens,
+                temperature,
+                timeout_secs,
+                notes,
+                created_at,
+                updated_at
+            FROM public.llm_runtime_config
+            WHERE scope_type = 'prompt'
+              AND scope_key = 'prompt'
+              AND prompt_key = %s
+            LIMIT 1
+            """,
+            (prompt_key,),
+        )
+
+        row = cur.fetchone()
+
+    return _normalize_row(dict(row)) if row else None
 
 def update_llm_runtime_item(
     conn,
@@ -323,51 +377,10 @@ def list_llm_runtime_config_enriched(conn) -> list[dict]:
     return [enrich_config_with_key_status(row) for row in rows]
 
 
-def get_router_runtime_config(conn) -> dict[str, Any]:
-    """
-    Retorna una estructura simple pensada per al futur llm_router.py.
-
-    Exemple de sortida:
-    {
-        "phases": {
-            "input": {...},
-            "primary": {...},
-            "output": {...},
-            "fallback": {...}
-        },
-        "tasks": {
-            "source_discovery": {...},
-            "source_evaluation": {...}
-        }
-    }
-    """
-    rows = list_llm_runtime_config(conn)
-
-    result = {
-        "phases": {},
-        "tasks": {},
-    }
-
-    for row in rows:
-        if row["scope_type"] == "phase":
-            result["phases"][row["scope_key"]] = row
-        elif row["scope_type"] == "task":
-            result["tasks"][row["scope_key"]] = row
-
-    return result
-
-
 def get_effective_llm_for_phase(conn, phase: str) -> dict:
     row = get_phase_config(conn, phase)
     if not row:
         raise ValueError(f"No hi ha configuració per a la fase '{phase}'")
-    return enrich_config_with_key_status(row)
-
-
-def get_effective_llm_for_task(conn, task_name: str) -> dict:
-    row = get_task_config(conn, task_name)
-    if not row:
-        raise ValueError(f"No hi ha configuració per a la task '{task_name}'")
     return enrich_config_with_key_status(row)
 
 def _resolve_runtime_config(row: Optional[dict], scope_type: str, scope_key: str) -> dict:
@@ -393,16 +406,6 @@ def _resolve_runtime_config(row: Optional[dict], scope_type: str, scope_key: str
         "env_var": _build_key_status(row.get("provider") or DEFAULT_SCOPE_VALUES["provider"])["env_var"],
         "key_configured": _build_key_status(row.get("provider") or DEFAULT_SCOPE_VALUES["provider"])["key_configured"],
     }
-
-
-def resolve_task_llm_config(conn, task_name: str) -> dict:
-    task_key = (task_name or "").strip().lower()
-    if not task_key:
-        raise ValueError("task_name buit")
-
-    row = get_llm_runtime_item(conn, "task", task_key)
-    return _resolve_runtime_config(row, "task", task_key)
-
 
 def resolve_phase_llm_config(conn, phase_name: str) -> dict:
     phase_key = (phase_name or "").strip().lower()
@@ -555,20 +558,13 @@ def call_llm_for_prompt(
         if not prompt_row or not prompt_row.get("value"):
             raise ValueError(f"Prompt '{prompt_key}' no trobat")
 
-        cur.execute(
-            """
-            SELECT provider, model, max_tokens, temperature,
-                timeout_secs, use_fallback
-            FROM public.llm_runtime_config
-            WHERE prompt_key = %s
-            LIMIT 1
-            """,
-            (prompt_key,),
-        )
-        config_row = cur.fetchone()
+        config_row = get_prompt_runtime_config(conn, prompt_key)
 
     if not config_row:
-        raise ValueError(f"El prompt '{prompt_key}' no té configuració LLM (llm_runtime_config)")
+        raise ValueError(
+            f"El prompt '{prompt_key}' no té configuració LLM "
+            f"(llm_runtime_config)"
+        )
 
     provider = (config_row.get("provider") or "").strip().lower()
     model = (config_row.get("model") or "").strip()

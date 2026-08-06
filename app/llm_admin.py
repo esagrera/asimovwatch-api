@@ -15,6 +15,7 @@ from app.llm_clients import call_llm, get_supported_providers
 from app.llm_config import (
     list_llm_runtime_config,
     get_llm_runtime_item,
+    get_prompt_runtime_config,
     get_phase_config,
     update_llm_runtime_item,
     get_provider_key_status,
@@ -34,8 +35,8 @@ from app.llm_config import (
 
 router_llm_admin = APIRouter(prefix="/admin/llm", tags=["admin-llm"])
 
-LLMPhase = Literal["input", "primary", "output", "fallback"]
-LLMScopeType = Literal["task", "phase"]
+LLMPhase = Literal["fallback"]
+LLMScopeType = Literal["phase", "prompt"]
 
 
 class LLMPhaseConfigUpdate(BaseModel):
@@ -58,7 +59,7 @@ class LLMTestRequest(BaseModel):
     timeout_secs: int = Field(default=30, ge=1, le=120)
 
 
-VALID_PHASES = {"input", "primary", "output", "fallback"}
+VALID_PHASES = {"fallback"}
 
 
 def _normalize_phase(phase: str) -> str:
@@ -66,10 +67,9 @@ def _normalize_phase(phase: str) -> str:
     if phase_norm not in VALID_PHASES:
         raise HTTPException(
             status_code=400,
-            detail="phase ha de ser input, primary, output o fallback"
+            detail="phase ha de ser fallback"
         )
     return phase_norm
-
 
 def _normalize_provider(provider: Optional[str]) -> Optional[str]:
     if provider is None:
@@ -323,19 +323,58 @@ def patch_llm_phase(phase: LLMPhase, payload: LLMPhaseConfigUpdate):
 
 
 @router_llm_admin.get("/config/{scope_type}/{scope_key}")
-def get_llm_runtime_item_detail(scope_type: LLMScopeType, scope_key: str):
+def get_llm_runtime_item_detail(
+    scope_type: LLMScopeType,
+    scope_key: str,
+    prompt_key: Optional[str] = None,
+):
     conn = None
     try:
         scope_type = (scope_type or "").strip().lower()
         scope_key = (scope_key or "").strip().lower()
 
-        conn = get_connection()
-        row = get_llm_runtime_item(conn, scope_type, scope_key)
+        if scope_type == "phase":
+            if scope_key != "fallback":
+                raise HTTPException(
+                    status_code=400,
+                    detail="La única phase vàlida és fallback",
+                )
+
+            conn = get_connection()
+            row = get_phase_config(conn, "fallback")
+
+        elif scope_type == "prompt":
+            if scope_key != "prompt":
+                raise HTTPException(
+                    status_code=400,
+                    detail="El scope_key d'un prompt ha de ser prompt",
+                )
+
+            clean_prompt_key = (prompt_key or "").strip()
+
+            if not clean_prompt_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="prompt_key és obligatori per consultar un prompt",
+                )
+
+            conn = get_connection()
+            row = get_prompt_runtime_config(conn, clean_prompt_key)
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="scope_type ha de ser phase o prompt",
+            )
 
         if not row:
             raise HTTPException(
                 status_code=404,
-                detail=f"No hi ha configuració per a {scope_type}:{scope_key}"
+                detail=(
+                    f"No hi ha configuració per a "
+                    f"{scope_type}:{scope_key}"
+                    + (f":{prompt_key}" if prompt_key else "")
+                ),
             )
 
         return {
