@@ -25,6 +25,7 @@ from app.llm_config import (
     get_llm_provider_registry_item,
     list_llm_provider_models,
     list_llm_provider_status,
+    replace_provider_models,
     get_default_model,
     get_recommended_models,
     get_fallback_candidate_models,
@@ -57,6 +58,18 @@ class LLMTestRequest(BaseModel):
     max_tokens: int = Field(default=64, ge=1, le=4096)
     temperature: float = Field(default=0.0, ge=0, le=2)
     timeout_secs: int = Field(default=30, ge=1, le=120)
+
+class LLMProviderModelSelection(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+    enabled: bool = True
+    is_default: bool = False
+    is_fallback_candidate: bool = False
+    visible_in_dropdown: bool = True
+    priority: int = Field(default=100, ge=0, le=100000)
+
+
+class LLMProviderModelsReplaceRequest(BaseModel):
+    models: list[LLMProviderModelSelection] = Field(default_factory=list)
 
 
 VALID_PHASES = {"fallback"}
@@ -185,6 +198,67 @@ def get_provider_registry_detail(provider: str):
     finally:
         if conn:
             conn.close()
+
+@router_llm_admin.put("/providers/registry/{provider}/models")
+def replace_provider_models_admin(
+    provider: str,
+    payload: LLMProviderModelsReplaceRequest,
+):
+    conn = None
+
+    try:
+        provider = _normalize_provider(provider)
+
+        conn = get_connection()
+
+        registry_item = get_llm_provider_registry_item(conn, provider)
+        if not registry_item:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Provider no trobat al registry: {provider}",
+            )
+
+        models = [item.dict() for item in payload.models]
+
+        updated_models = replace_provider_models(
+            conn,
+            provider,
+            models,
+        )
+
+        return {
+            "status": "updated",
+            "provider": provider,
+            "count": len(updated_models),
+            "items": updated_models,
+        }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+
+    except ValueError as exc:
+        if conn:
+            conn.rollback()
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
+
+    finally:
+        if conn:
+            conn.close()            
 
 @router_llm_admin.get("/key-status")
 def get_llm_key_status():

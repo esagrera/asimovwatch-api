@@ -635,3 +635,135 @@ def call_llm_for_prompt(
                 error_message=str(fallback_error),
             )
             raise
+
+def replace_provider_models(
+    conn,
+    provider: str,
+    models: list[dict],
+) -> list[dict]:
+    """
+    Substitueix la selecció administrada de models d'un provider.
+    No esborra registres existents: desactiva els que no apareixen
+    al payload per mantenir l'historial i l'estat operatiu.
+    """
+    provider = (provider or "").strip().lower()
+    _validate_provider(provider)
+
+    normalized_models: list[dict] = []
+    seen_models: set[str] = set()
+    default_count = 0
+
+    for index, item in enumerate(models or []):
+        model = (item.get("model") or "").strip()
+
+        if not model:
+            raise ValueError(f"model buit a la posició {index + 1}")
+
+        if model in seen_models:
+            raise ValueError(f"model duplicat: {model}")
+
+        seen_models.add(model)
+
+        enabled = bool(item.get("enabled", True))
+        is_default = bool(item.get("is_default", False))
+        is_fallback_candidate = bool(
+            item.get("is_fallback_candidate", False)
+        )
+        visible_in_dropdown = bool(
+            item.get("visible_in_dropdown", enabled)
+        )
+
+        if is_default:
+            default_count += 1
+
+        if is_default and not enabled:
+            raise ValueError(
+                f"El model per defecte '{model}' ha d'estar activat"
+            )
+
+        if is_fallback_candidate and not enabled:
+            raise ValueError(
+                f"El fallback candidate '{model}' ha d'estar activat"
+            )
+
+        if visible_in_dropdown and not enabled:
+            raise ValueError(
+                f"El model visible '{model}' ha d'estar activat"
+            )
+
+        priority = item.get("priority", (index + 1) * 10)
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"priority invàlid per al model '{model}'"
+            ) from exc
+
+        normalized_models.append(
+            {
+                "model": model,
+                "enabled": enabled,
+                "is_default": is_default,
+                "is_fallback_candidate": is_fallback_candidate,
+                "visible_in_dropdown": visible_in_dropdown,
+                "priority": priority,
+            }
+        )
+
+    if default_count > 1:
+        raise ValueError(
+            f"Només hi pot haver un model per defecte per a {provider}"
+        )
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            UPDATE public.llm_provider_models
+            SET
+                enabled = false,
+                is_default = false,
+                is_fallback_candidate = false,
+                visible_in_dropdown = false,
+                updated_at = now()
+            WHERE provider = %s
+            """,
+            (provider,),
+        )
+
+        for item in normalized_models:
+            cur.execute(
+                """
+                INSERT INTO public.llm_provider_models (
+                    provider,
+                    model,
+                    enabled,
+                    is_default,
+                    is_fallback_candidate,
+                    visible_in_dropdown,
+                    priority,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (provider, model)
+                DO UPDATE SET
+                    enabled = EXCLUDED.enabled,
+                    is_default = EXCLUDED.is_default,
+                    is_fallback_candidate = EXCLUDED.is_fallback_candidate,
+                    visible_in_dropdown = EXCLUDED.visible_in_dropdown,
+                    priority = EXCLUDED.priority,
+                    updated_at = now()
+                """,
+                (
+                    provider,
+                    item["model"],
+                    item["enabled"],
+                    item["is_default"],
+                    item["is_fallback_candidate"],
+                    item["visible_in_dropdown"],
+                    item["priority"],
+                ),
+            )
+
+    conn.commit()
+
+    return list_llm_provider_models(conn, provider)
