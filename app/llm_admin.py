@@ -467,6 +467,23 @@ def get_llm_runtime_item_detail(
         if conn:
             conn.close()
 
+@router_llm_admin.get("/models/advisor/latest")
+def get_latest_model_advisor():
+    conn = None
+    try:
+        conn = get_connection()
+        report = get_latest_model_advisor_report(conn)
+        if not report:
+            raise HTTPException(status_code=404, detail="Encara no s'ha generat cap informe.")
+        return {"status": "ok", "item": report}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
 @router_llm_admin.get("/models/{provider}")
 def list_provider_models(provider: str):
     provider = provider.strip().lower()
