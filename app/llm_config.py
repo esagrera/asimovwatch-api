@@ -528,6 +528,43 @@ def record_llm_provider_status(conn, provider: str, model: str, ok: bool, error_
             )
     conn.commit()
 
+def save_model_advisor_report(
+    conn,
+    content: str,
+    provider_used: Optional[str] = None,
+    model_used: Optional[str] = None,
+    used_fallback: bool = False,
+) -> dict:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO public.llm_model_advisor_report
+                (id, content, provider_used, model_used, used_fallback, generated_at)
+            VALUES (1, %s, %s, %s, %s, now())
+            ON CONFLICT (id) DO UPDATE SET
+                content = EXCLUDED.content,
+                provider_used = EXCLUDED.provider_used,
+                model_used = EXCLUDED.model_used,
+                used_fallback = EXCLUDED.used_fallback,
+                generated_at = now()
+            RETURNING id, content, provider_used, model_used, used_fallback, generated_at
+            """,
+            (content, provider_used, model_used, used_fallback),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row)
+
+
+def get_latest_model_advisor_report(conn) -> Optional[dict]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, content, provider_used, model_used, used_fallback, generated_at "
+            "FROM public.llm_model_advisor_report WHERE id = 1"
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
+
 def get_default_model(conn, provider: str) -> str:
     models = list_llm_provider_models(conn, provider)
     for m in models:

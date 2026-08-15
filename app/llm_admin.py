@@ -31,6 +31,8 @@ from app.llm_config import (
     get_fallback_candidate_models,
     record_llm_provider_status,
     classify_llm_error,
+    save_model_advisor_report,
+    get_latest_model_advisor_report,
 )
 
 
@@ -531,6 +533,14 @@ def get_model_advisor():
             conn,
             "llm_model_advisor",
             prompt_overrides={"{{prompts_config}}": prompts_summary_text},
+        )
+
+        save_model_advisor_report(
+            conn,
+            content=result["output"],
+            provider_used=result["provider_used"],
+            model_used=result["model_used"],
+            used_fallback=result["used_fallback"],
         )
 
         return {
