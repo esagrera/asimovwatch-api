@@ -511,6 +511,25 @@ def get_model_advisor():
     try:
         conn = get_connection()
 
+        # ── NOU: resum de l'estat real dels models segons el registry ──
+        all_models = list_llm_provider_models(conn)
+        all_status = list_llm_provider_status(conn)
+        status_map = {(s["provider"], s["model"]): s for s in all_status}
+
+        registry_summary_lines = []
+        for m in all_models:
+            status = status_map.get((m["provider"], m["model"]), {})
+            state = "HABILITAT" if m.get("enabled") else "DESHABILITAT"
+            stability = "estable" if m.get("stable") else "NO estable"
+            error_info = ""
+            if status.get("last_error_type"):
+                error_info = f", últim error registrat: {status['last_error_type']}"
+            registry_summary_lines.append(
+                f"- {m['provider']}/{m['model']}: {state}, {stability}{error_info}"
+            )
+        registry_summary_text = "\n".join(registry_summary_lines) or "Cap model registrat."
+
+        # ── Consulta existent de prompts (sense cap canvi) ──
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT
@@ -546,10 +565,18 @@ def get_model_advisor():
 
         prompts_summary_text = "\n".join(prompts_summary_lines)
 
+        # ── NOU: combinar totes dues seccions en un únic context ──
+        full_context = (
+            f"ESTAT REAL DELS MODELS SEGONS EL REGISTRY INTERN:\n"
+            f"{registry_summary_text}\n\n"
+            f"CONFIGURACIÓ ACTUAL DELS PROMPTS:\n"
+            f"{prompts_summary_text}"
+        )
+
         result = call_llm_for_prompt(
             conn,
             "llm_model_advisor",
-            prompt_overrides={"{{prompts_config}}": prompts_summary_text},
+            prompt_overrides={"{{prompts_config}}": full_context},
         )
 
         save_model_advisor_report(
@@ -565,7 +592,7 @@ def get_model_advisor():
             "provider": result["provider_used"],
             "model": result["model_used"],
             "used_fallback": result["used_fallback"],
-            "prompts_summary": prompts_summary_text,
+            "prompts_summary": full_context,
             "recommendation": result["output"],
         }
     except HTTPException:
