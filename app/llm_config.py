@@ -466,18 +466,22 @@ def get_llm_provider_status_item(conn, provider: str, model: str):
 
 PROVIDER_ERROR_SIGNATURES = {
     "gemini": {
+        "model_not_found": ["404", "not_found", "no longer available", "is not found for api version"],
         "quota_exceeded": ["resource_exhausted", "quota"],
         "rate_limited": ["429", "rate limit"],
     },
     "claude": {
+        "model_not_found": ["404", "not_found", "no longer available", "model not found"],
         "quota_exceeded": ["credit balance", "insufficient", "quota"],
         "rate_limited": ["429", "rate_limit", "overloaded"],
     },
     "openai": {
+        "model_not_found": ["404", "model_not_found", "does not exist", "no longer available"],
         "quota_exceeded": ["insufficient_quota", "exceeded your current quota"],
         "rate_limited": ["429", "rate_limit_exceeded"],
     },
     "perplexity": {
+        "model_not_found": ["404", "not_found", "no longer available"],
         "quota_exceeded": ["insufficient credit", "quota"],
         "rate_limited": ["429", "rate limit"],
     },
@@ -487,7 +491,7 @@ PROVIDER_ERROR_SIGNATURES = {
 def classify_llm_error(exc: Exception, provider: str) -> str:
     msg = str(exc).lower()
     signatures = PROVIDER_ERROR_SIGNATURES.get(provider, {})
-    for error_type in ("quota_exceeded", "rate_limited"):
+    for error_type in ("model_not_found", "quota_exceeded", "rate_limited"):
         for keyword in signatures.get(error_type, []):
             if keyword in msg:
                 return error_type
