@@ -549,18 +549,24 @@ def get_model_advisor():
             """)
             prompts_rows = cur.fetchall()
 
+        WEB_SEARCH_PROVIDERS = {"perplexity"}  # família Sonar: cerca web nativa
+
         prompts_summary_lines = []
         for row in prompts_rows:
             snippet = (row.get("value") or "").strip().replace("\n", " ")
             if len(snippet) > 220:
                 snippet = snippet[:220] + "..."
 
+            provider = row.get("provider") or ""
+            web_search_capable = "Sí" if provider.lower() in WEB_SEARCH_PROVIDERS else "No"
+
             prompts_summary_lines.append(
                 f"- Prompt: {row['key']} (categoria: {row.get('category') or 'sense categoria'})\n"
                 f"  Extracte del prompt: {snippet}\n"
                 f"  Config actual: provider={row.get('provider') or '-'}, model={row.get('model') or '-'}, "
                 f"max_tokens={row.get('max_tokens') or '-'}, temperature={row.get('temperature') if row.get('temperature') is not None else '-'}, "
-                f"timeout_secs={row.get('timeout_secs') or '-'}, use_fallback={bool(row.get('use_fallback'))}"
+                f"timeout_secs={row.get('timeout_secs') or '-'}, use_fallback={bool(row.get('use_fallback'))}, "
+                f"fa_cerca_web={web_search_capable}"
             )
         prompts_summary_text = "\n".join(prompts_summary_lines)
 
