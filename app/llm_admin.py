@@ -511,7 +511,7 @@ def get_model_advisor():
     try:
         conn = get_connection()
 
-        # ── NOU: resum de l'estat real dels models segons el registry ──
+        # ── Resum de l'estat real dels models segons el registry ──
         all_models = list_llm_provider_models(conn)
         all_status = list_llm_provider_status(conn)
         status_map = {(s["provider"], s["model"]): s for s in all_status}
@@ -562,11 +562,11 @@ def get_model_advisor():
                 f"max_tokens={row.get('max_tokens') or '-'}, temperature={row.get('temperature') if row.get('temperature') is not None else '-'}, "
                 f"timeout_secs={row.get('timeout_secs') or '-'}, use_fallback={bool(row.get('use_fallback'))}"
             )
-
         prompts_summary_text = "\n".join(prompts_summary_lines)
 
+        # ── NOU (1): resum de la configuració actual de fallback global ──
         fallback_config = get_phase_config(conn, "fallback")
-        
+
         if fallback_config:
             fallback_summary_text = (
                 f"- provider={fallback_config.get('provider') or '-'}, "
@@ -581,12 +581,14 @@ def get_model_advisor():
         else:
             fallback_summary_text = "Cap configuració de fallback global trobada."
 
-        # ── NOU: combinar totes dues seccions en un únic context ──
+        # ── Combinar les tres seccions en un únic context ──
         full_context = (
             f"ESTAT REAL DELS MODELS SEGONS EL REGISTRY INTERN:\n"
             f"{registry_summary_text}\n\n"
             f"CONFIGURACIÓ ACTUAL DELS PROMPTS:\n"
-            f"{prompts_summary_text}"
+            f"{prompts_summary_text}\n\n"
+            f"CONFIGURACIÓ ACTUAL DE FALLBACK GLOBAL:\n"
+            f"{fallback_summary_text}"
         )
 
         result = call_llm_for_prompt(
@@ -595,9 +597,21 @@ def get_model_advisor():
             prompt_overrides={"{{prompts_config}}": full_context},
         )
 
+        # ── NOU (2): capçalera automàtica amb provider, model, fallback i data/hora ──
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        header = (
+            f"**Informe generat el {generated_at}**  \n"
+            f"**Provider:** {result['provider_used']} | "
+            f"**Model:** {result['model_used']} | "
+            f"**Fallback utilitzat:** {'Sí' if result['used_fallback'] else 'No'}\n\n"
+            f"---\n\n"
+        )
+
+        final_output = header + result["output"]
+
         save_model_advisor_report(
             conn,
-            content=result["output"],
+            content=final_output,
             provider_used=result["provider_used"],
             model_used=result["model_used"],
             used_fallback=result["used_fallback"],
@@ -608,8 +622,9 @@ def get_model_advisor():
             "provider": result["provider_used"],
             "model": result["model_used"],
             "used_fallback": result["used_fallback"],
+            "generated_at": generated_at,
             "prompts_summary": full_context,
-            "recommendation": result["output"],
+            "recommendation": final_output,
         }
     except HTTPException:
         raise
@@ -620,7 +635,7 @@ def get_model_advisor():
     finally:
         if conn:
             conn.close()
-
+            
 @router_llm_admin.post("/test")
 def test_llm_provider(payload: LLMTestRequest):
     conn = None
