@@ -565,6 +565,22 @@ def get_model_advisor():
 
         prompts_summary_text = "\n".join(prompts_summary_lines)
 
+        fallback_config = get_phase_config(conn, "fallback")
+        
+        if fallback_config:
+            fallback_summary_text = (
+                f"- provider={fallback_config.get('provider') or '-'}, "
+                f"model={fallback_config.get('model') or '-'}, "
+                f"enabled={bool(fallback_config.get('enabled'))}, "
+                f"max_tokens={fallback_config.get('max_tokens') or '-'}, "
+                f"temperature={fallback_config.get('temperature') if fallback_config.get('temperature') is not None else '-'}, "
+                f"timeout_secs={fallback_config.get('timeout_secs') or '-'}"
+            )
+            if fallback_config.get("notes"):
+                fallback_summary_text += f"\n  Notes: {fallback_config['notes']}"
+        else:
+            fallback_summary_text = "Cap configuració de fallback global trobada."
+
         # ── NOU: combinar totes dues seccions en un únic context ──
         full_context = (
             f"ESTAT REAL DELS MODELS SEGONS EL REGISTRY INTERN:\n"
