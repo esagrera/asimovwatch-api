@@ -990,6 +990,13 @@ class ThematicEntrySearchRequest(BaseModel):
     requested_by: Optional[str] = "admin-thematic-search"
     prompt_key: str = "Thematic entry discovery"
 
+class EntryCrawlerConfigUpdate(BaseModel):
+    enabled: bool
+    frequency_minutes: int
+    run_enrichment: bool
+    hours_back: int
+    max_items_per_source: int
+
 # ─── HELPERS CRAWLER OPS ──────────────────────────────────────────────────────
 
 def _parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -1016,6 +1023,37 @@ def _set_config_value(cur, key: str, value: Optional[str]):
         ON CONFLICT (key) DO UPDATE
         SET value = EXCLUDED.value, updated_at = now()
     """, (key, safe_value))
+
+def _validate_entry_crawler_config(
+    frequency_minutes: int,
+    hours_back: int,
+    max_items_per_source: int,
+):
+    if frequency_minutes < 15 or frequency_minutes > 10080:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "frequency_minutes ha d'estar entre 15 i 10080 "
+                "(set dies)"
+            ),
+        )
+
+    if hours_back < 1 or hours_back > 720:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "hours_back ha d'estar entre 1 i 720 "
+                "(trenta dies)"
+            ),
+        )
+
+    if max_items_per_source < 1 or max_items_per_source > 100:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "max_items_per_source ha d'estar entre 1 i 100"
+            ),
+        )
 
 # ─── CRAWLER STATUS ────────────────────────────────────────────────────────────
 
@@ -1240,6 +1278,69 @@ def get_entry_crawler_status():
         ),
     }
 
+@protected_router.put("/crawler/entries/config")
+def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
+    _validate_entry_crawler_config(
+        frequency_minutes=body.frequency_minutes,
+        hours_back=body.hours_back,
+        max_items_per_source=body.max_items_per_source,
+    )
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        _set_config_value(
+            cur,
+            "entry_crawler_enabled",
+            str(body.enabled).lower(),
+        )
+        _set_config_value(
+            cur,
+            "entry_crawler_frequency_minutes",
+            str(body.frequency_minutes),
+        )
+        _set_config_value(
+            cur,
+            "entry_crawler_run_enrichment",
+            str(body.run_enrichment).lower(),
+        )
+        _set_config_value(
+            cur,
+            "entry_crawler_hours_back",
+            str(body.hours_back),
+        )
+        _set_config_value(
+            cur,
+            "entry_crawler_max_items_per_source",
+            str(body.max_items_per_source),
+        )
+
+        conn.commit()
+
+        return {
+            "status": "ok",
+            "crawler": {
+                "enabled": body.enabled,
+                "frequency_minutes": body.frequency_minutes,
+                "run_enrichment": body.run_enrichment,
+                "hours_back": body.hours_back,
+                "max_items_per_source": body.max_items_per_source,
+            },
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"No s'ha pogut desar la configuració del crawler d'entries: {str(e)}",
+        )
+    finally:
+        cur.close()
+        conn.close()
 
 @protected_router.post(
     "/crawler/entries/run",
