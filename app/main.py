@@ -961,11 +961,34 @@ def create_crawler_log(log: CrawlerLogCreate):
 
 # ─── MODELS CRAWLER OPS ───────────────────────────────────────────────────────
 
-class CrawlerRunRequest(BaseModel):
+class SourceCrawlerRunRequest(BaseModel):
     brief: Optional[str] = None
     dry_run: bool = True
     proposed_by: Optional[str] = "admin-run-now"
     prompt_key: str = "Source candidates discovery"
+
+
+class EntryCrawlerRunRequest(BaseModel):
+    source_ids: Optional[list[int]] = None
+    hours_back: int = 24
+    max_items_per_source: int = 20
+    run_enrichment: bool = True
+    retry_errors: bool = False
+    force: bool = False
+    dry_run: bool = True
+    requested_by: Optional[str] = "admin-entry-crawler"
+
+
+class ThematicEntrySearchRequest(BaseModel):
+    brief: str
+    date_range: Optional[str] = "Últim any"
+    source_scope: Optional[str] = "web_and_monitored_sources"
+    source_types: Optional[list[str]] = None
+    max_results: int = 10
+    run_enrichment: bool = True
+    dry_run: bool = True
+    requested_by: Optional[str] = "admin-thematic-search"
+    prompt_key: str = "Thematic entry discovery"
 
 # ─── HELPERS CRAWLER OPS ──────────────────────────────────────────────────────
 
@@ -996,8 +1019,8 @@ def _set_config_value(cur, key: str, value: Optional[str]):
 
 # ─── CRAWLER STATUS ────────────────────────────────────────────────────────────
 
-@protected_router.get("/crawler/status")
-def get_crawler_status():
+@protected_router.get("/crawler/sources/status")
+def get_source_crawler_status():
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
@@ -1042,8 +1065,8 @@ def get_crawler_status():
 
 # ─── CRAWLER RUN NOW ───────────────────────────────────────────────────────────
 
-@protected_router.post("/crawler/run", status_code=status.HTTP_201_CREATED)
-def run_crawler_now(body: CrawlerRunRequest):
+@protected_router.post("/crawler/sources/run", status_code=status.HTTP_201_CREATED)
+def run_source_crawler_now(body: SourceCrawlerRunRequest):
     from app.source_candidates import discover_source_candidates, SourceCandidateDiscoverRequest
 
     started_at = utc_now()
@@ -1154,6 +1177,97 @@ def run_crawler_now(body: CrawlerRunRequest):
             conn.close()
         except Exception:
             pass
+
+# ─── LEGACY SOURCE CRAWLER ROUTES ─────────────────────────────────────────────
+
+@protected_router.get(
+    "/crawler/status",
+    deprecated=True,
+    include_in_schema=False
+)
+def get_legacy_crawler_status():
+    return get_source_crawler_status()
+
+
+@protected_router.post(
+    "/crawler/run",
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+    include_in_schema=False
+)
+def run_legacy_crawler_now(body: SourceCrawlerRunRequest):
+    return run_source_crawler_now(body)
+
+# ─── ENTRY CRAWLER OPS ─────────────────────────────────────────────────────────
+
+@protected_router.get("/crawler/entries/status")
+def get_entry_crawler_status():
+    config_map = get_config_map()
+
+    return {
+        "status": "ok",
+        "crawler": {
+            "enabled": _parse_bool(
+                config_map.get("entry_crawler_enabled"),
+                default=False
+            ),
+            "frequency_minutes": _parse_int(
+                config_map.get("entry_crawler_frequency_minutes"),
+                default=1440
+            ),
+            "run_enrichment": _parse_bool(
+                config_map.get("entry_crawler_run_enrichment"),
+                default=True
+            ),
+            "hours_back": _parse_int(
+                config_map.get("entry_crawler_hours_back"),
+                default=24
+            ),
+            "max_items_per_source": _parse_int(
+                config_map.get("entry_crawler_max_items_per_source"),
+                default=20
+            ),
+            "last_status": config_map.get("entry_crawler_last_status"),
+            "last_run_at": config_map.get("entry_crawler_last_run_at"),
+            "last_duration_seconds": config_map.get(
+                "entry_crawler_last_duration_seconds"
+            ),
+            "last_error": config_map.get("entry_crawler_last_error"),
+        },
+        "message": (
+            "Crawler d'entries preparat. "
+            "La ingestió real encara no està implementada."
+        ),
+    }
+
+
+@protected_router.post(
+    "/crawler/entries/run",
+    status_code=status.HTTP_501_NOT_IMPLEMENTED
+)
+def run_entry_crawler_now(body: EntryCrawlerRunRequest):
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "El crawler d'entries encara no està implementat. "
+            "La fase actual només defineix i separa les rutes."
+        ),
+    )
+
+
+@protected_router.post(
+    "/crawler/entries/search",
+    status_code=status.HTTP_501_NOT_IMPLEMENTED
+)
+def search_thematic_entries(body: ThematicEntrySearchRequest):
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "La cerca temàtica d'entries encara no està implementada. "
+            "El prompt 'Thematic entry discovery' ja està configurat, "
+            "però encara falta connectar-lo al crawler."
+        ),
+    )
 
 # ─── STATS ────────────────────────────────────────────────────────────────────
 
