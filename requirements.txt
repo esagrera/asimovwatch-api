@@ -6,3 +6,6 @@ anthropic
 openai
 pydantic-settings
 reportlab==4.4.3
+feedparser==6.0.12
+requests>=2.28.0
+beautifulsoup4==4.15.0

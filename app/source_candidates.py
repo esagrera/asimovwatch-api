@@ -1139,6 +1139,260 @@ def get_source_detail(candidate_id: int):
             conn.close()
 
 # =============================================================================
+# ENDPOINT DE DETECCIÓ DE FEED — POST /source-candidates/{candidate_id}/discover-feed
+# =============================================================================
+
+@router_candidates.post("/{candidate_id}/discover-feed", status_code=200)
+def discover_feed_candidate(candidate_id: int):
+    """
+    Detecta i valida automàticament un feed RSS/Atom per a un candidate.
+    
+    Aquest endpoint:
+    1. Obté la URL del candidate.
+    2. Prova de detectar un feed RSS/Atom mitjançant:
+       - Content-Type de la URL principal.
+       - Tags <link rel="alternate"> al HTML.
+       - Rutes habituals: /rss.xml, /feed.xml, /atom.xml, /index.xml, /news.xml.
+    3. Valida el feed trobat:
+       - Verifica que és XML/RSS/Atom vàlid.
+       - Compta entrades.
+       - Obté la data de l'última entrada.
+    4. Retorna la proposta sense modificar res a la BD.
+    
+    Resposta:
+    - feed_detected: true/false
+    - feed_url: URL del feed (si detectat)
+    - ingest_method: "rss" o "manual"
+    - content_type: tipus de contingut del feed
+    - entries_found: nombre d'entrades
+    - latest_entry_date: data de l'última entrada
+    - detection_method: com s'ha detectat (link_tag, common_path, content_type, none)
+    - alternatives: llista de feeds alternatius trobats
+    """
+    import re
+    from urllib.parse import urljoin, urlparse
+    from xml.etree import ElementTree as ET
+    
+    import feedparser
+    import requests
+    
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # -- Pas 1: obtenir el candidate --
+            cur.execute(
+                "SELECT id, name, url, domain FROM public.source_candidates WHERE id = %s",
+                (candidate_id,)
+            )
+            candidate = cur.fetchone()
+            
+            if not candidate:
+                raise HTTPException(status_code=404, detail="Candidate no trobat")
+            
+            candidate_url = candidate["url"]
+            if not candidate_url:
+                return {
+                    "status": "ok",
+                    "candidate_id": candidate_id,
+                    "feed_detected": False,
+                    "ingest_method": "manual",
+                    "reason": "Candidate sense URL",
+                }
+            
+            # Constants
+            REQUEST_TIMEOUT = 10
+            USER_AGENT = "Asimovwatch-FeedDetector/1.0"
+            COMMON_FEED_PATHS = ["/rss.xml", "/feed.xml", "/atom.xml", "/index.xml", "/news.xml", "/feed", "/rss"]
+            
+            def is_valid_feed(url: str) -> dict:
+                """Valida si una URL és un feed RSS/Atom vàlid."""
+                try:
+                    response = requests.get(
+                        url,
+                        timeout=REQUEST_TIMEOUT,
+                        headers={"User-Agent": USER_AGENT},
+                        allow_redirects=True
+                    )
+                    response.raise_for_status()
+                    
+                    content_type = (response.headers.get("content-type") or "").lower()
+                    
+                    # Accepta XML, RSS, Atom i text/plain (GitHub raw)
+                    if not any(ct in content_type for ct in ["xml", "rss", "atom", "text/plain"]):
+                        return None
+                    
+                    feed = feedparser.parse(response.content)
+                    
+                    if getattr(feed, "bozo", False) and not feed.entries:
+                        return None
+                    
+                    if not feed.entries:
+                        return None
+                    
+                    # Obté la data de l'última entrada
+                    latest_date = None
+                    for entry in feed.entries[:5]:
+                        published = entry.get("published") or entry.get("updated")
+                        if published:
+                            try:
+                                from email.utils import parsedate_to_datetime
+                                from datetime import timezone
+                                parsed = parsedate_to_datetime(published)
+                                if parsed.tzinfo is None:
+                                    parsed = parsed.replace(tzinfo=timezone.utc)
+                                entry_date = parsed.astimezone(timezone.utc)
+                                if latest_date is None or entry_date > latest_date:
+                                    latest_date = entry_date
+                            except Exception:
+                                continue
+                    
+                    return {
+                        "feed_url": url,
+                        "content_type": content_type,
+                        "entries_found": len(feed.entries),
+                        "latest_entry_date": latest_date.isoformat() if latest_date else None,
+                        "title": feed.feed.get("title", ""),
+                    }
+                except Exception:
+                    return None
+            
+            def extract_feed_links_from_html(html: str, base_url: str) -> list:
+                """Extreu enllaços a feeds RSS/Atom d'un document HTML."""
+                feeds = []
+                try:
+                    # Busca <link rel="alternate" type="application/rss+xml" href="...">
+                    pattern = r'<link[^>]*rel=[\'"]?alternate[\'"]?[^>]*type=[\'"]?(application/(rss|atom)\+xml|text/xml)[\'"]?[^>]*href=[\'"]?([^\'">]+)[\'"]?'
+                    matches = re.findall(pattern, html, re.IGNORECASE)
+                    for match in matches:
+                        href = match[2] if len(match) > 2 else match[0]
+                        feed_url = urljoin(base_url, href)
+                        feeds.append(feed_url)
+                    
+                    # També busca el patró invers (type abans que rel)
+                    pattern2 = r'<link[^>]*type=[\'"]?(application/(rss|atom)\+xml|text/xml)[\'"]?[^>]*rel=[\'"]?alternate[\'"]?[^>]*href=[\'"]?([^\'">]+)[\'"]?'
+                    matches2 = re.findall(pattern2, html, re.IGNORECASE)
+                    for match in matches2:
+                        href = match[2] if len(match) > 2 else match[0]
+                        feed_url = urljoin(base_url, href)
+                        if feed_url not in feeds:
+                            feeds.append(feed_url)
+                except Exception:
+                    pass
+                
+                return feeds
+            
+            # -- Estratègia 1: provar la URL principal --
+            main_feed_result = is_valid_feed(candidate_url)
+            if main_feed_result:
+                return {
+                    "status": "ok",
+                    "candidate_id": candidate_id,
+                    "feed_detected": True,
+                    "feed_url": main_feed_result["feed_url"],
+                    "ingest_method": "rss",
+                    "content_type": main_feed_result["content_type"],
+                    "entries_found": main_feed_result["entries_found"],
+                    "latest_entry_date": main_feed_result["latest_entry_date"],
+                    "detection_method": "content_type",
+                    "alternatives": [],
+                }
+            
+            # -- Estratègia 2: descarregar HTML i buscar link tags --
+            feed_candidates = []
+            try:
+                response = requests.get(
+                    candidate_url,
+                    timeout=REQUEST_TIMEOUT,
+                    headers={"User-Agent": USER_AGENT},
+                    allow_redirects=True
+                )
+                response.raise_for_status()
+                content_type = (response.headers.get("content-type") or "").lower()
+                
+                if "html" in content_type:
+                    link_feeds = extract_feed_links_from_html(response.text, candidate_url)
+                    for feed_url in link_feeds:
+                        result = is_valid_feed(feed_url)
+                        if result:
+                            feed_candidates.append({
+                                "result": result,
+                                "detection_method": "link_tag",
+                            })
+            except Exception:
+                pass
+            
+            # -- Estratègia 3: provar rutes habituals --
+            parsed_url = urlparse(candidate_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            
+            for path in COMMON_FEED_PATHS:
+                feed_url = urljoin(base_url, path)
+                result = is_valid_feed(feed_url)
+                if result:
+                    feed_candidates.append({
+                        "result": result,
+                        "detection_method": "common_path",
+                    })
+            
+            # -- Selecciona el millor feed --
+            if not feed_candidates:
+                return {
+                    "status": "ok",
+                    "candidate_id": candidate_id,
+                    "feed_detected": False,
+                    "ingest_method": "manual",
+                    "reason": "No feed RSS/Atom found after checking common paths and link tags",
+                    "detection_method": "none",
+                    "alternatives": [],
+                }
+            
+            # Ordena per nombre d'entrades i data més recent
+            feed_candidates.sort(
+                key=lambda x: (
+                    x["result"]["entries_found"],
+                    x["result"]["latest_entry_date"] or ""
+                ),
+                reverse=True
+            )
+            
+            best = feed_candidates[0]["result"]
+            alternatives = [
+                {
+                    "feed_url": c["result"]["feed_url"],
+                    "entries_found": c["result"]["entries_found"],
+                    "latest_entry_date": c["result"]["latest_entry_date"],
+                    "detection_method": c["detection_method"],
+                }
+                for c in feed_candidates[1:5]  # màxim 4 alternatius
+            ]
+            
+            return {
+                "status": "ok",
+                "candidate_id": candidate_id,
+                "feed_detected": True,
+                "feed_url": best["feed_url"],
+                "ingest_method": "rss",
+                "content_type": best["content_type"],
+                "entries_found": best["entries_found"],
+                "latest_entry_date": best["latest_entry_date"],
+                "detection_method": feed_candidates[0]["detection_method"],
+                "alternatives": alternatives,
+            }
+    
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+# =============================================================================
 # REGISTRE AL ROUTER PRINCIPAL — afegir al final de main.py
 # =============================================================================
 #
