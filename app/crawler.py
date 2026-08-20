@@ -426,7 +426,6 @@ def run(
                                 continue
 
                             if dry_run:
-                                counters["items_created"] += 1
                                 logger.info(
                                     "DRY RUN: nova entry %s — %s",
                                     source_name,

@@ -23,6 +23,7 @@ from app.db import get_connection
 from app.source_candidates import router_candidates
 from app.llm_admin import router_llm_admin
 from app.llm_clients import get_supported_providers
+from app.crawler import run as run_entries_crawler
 
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -1344,17 +1345,77 @@ def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
 
 @protected_router.post(
     "/crawler/entries/run",
-    status_code=status.HTTP_501_NOT_IMPLEMENTED
+    status_code=status.HTTP_201_CREATED,
 )
 def run_entry_crawler_now(body: EntryCrawlerRunRequest):
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=(
-            "El crawler d'entries encara no està implementat. "
-            "La fase actual només defineix i separa les rutes."
-        ),
-    )
+    """
+    Executa el crawler RSS/Atom d'entries.
 
+    No descobreix fonts ni les promociona. Llegeix només fonts actives
+    amb ingest_method='rss' i feed_url. Les entries creades queden en
+    estat NEW i RAW perquè requereixen revisió humana posterior.
+    """
+    safe_limit = min(max(body.max_items_per_source, 1), 50)
+    source_ids = body.source_ids or [None]
+
+    started_at = utc_now()
+    aggregate = {
+        "sources_checked": 0,
+        "items_found": 0,
+        "items_created": 0,
+        "items_duplicates": 0,
+        "items_skipped": 0,
+        "items_failed": 0,
+    }
+    runs = []
+
+    try:
+        for source_id in source_ids:
+            result = run_entries_crawler(
+                dry_run=body.dry_run,
+                source_id=source_id,
+                limit_per_source=safe_limit,
+            )
+
+            for key in aggregate:
+                aggregate[key] += int(result.get(key, 0) or 0)
+
+            runs.append({
+                "source_id": source_id,
+                "result": result,
+            })
+
+        finished_at = utc_now()
+        duration_seconds = round(
+            (finished_at - started_at).total_seconds(),
+            3,
+        )
+
+        return {
+            "status": "ok",
+            "crawler_type": "entries_rss",
+            "run": {
+                "started_at": started_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "duration_seconds": duration_seconds,
+                "source_ids": body.source_ids,
+                "max_items_per_source": safe_limit,
+                "dry_run": body.dry_run,
+                "requested_by": body.requested_by,
+                "hours_back_ignored": body.hours_back,
+                "run_enrichment_ignored": body.run_enrichment,
+                "retry_errors_ignored": body.retry_errors,
+                "force_ignored": body.force,
+            },
+            "result": aggregate,
+            "runs": runs,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error executant crawler d'entries: {str(e)}",
+        )
 
 @protected_router.post(
     "/crawler/entries/search",
