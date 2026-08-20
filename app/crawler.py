@@ -1,379 +1,539 @@
+import argparse
+import hashlib
+import html
 import json
+import logging
 import os
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import feedparser
+import psycopg2.extras
 import requests
 from bs4 import BeautifulSoup
-from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
 
 from app.db import get_connection
 
 
-USER_AGENT = "AsimovWatch/0.1 (+https://asimovwatch.com)"
-REQUEST_TIMEOUT = 20
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-API_KEY = os.getenv("API_KEY", "")
+load_dotenv()
+
+REQUEST_TIMEOUT_SECONDS = 20
+USER_AGENT = "AsimovWatch-EntriesCrawler/1.0 (+https://asimovwatch.com)"
+MAX_ENTRIES_PER_SOURCE = 30
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("asimovwatch.entries_crawler")
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def normalize_url(value: Optional[str]) -> Optional[str]:
-    if not value:
+def clean_text(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    return value.strip()
+
+    text = html.unescape(str(value)).strip()
+    if not text:
+        return None
+
+    if "<" not in text and ">" not in text:
+        return " ".join(text.split())
+
+    return " ".join(
+        BeautifulSoup(text, "html.parser").get_text(" ").split()
+    )
 
 
-def get_domain(value: Optional[str]) -> str:
-    if not value:
-        return ""
-    return (urlparse(value).netloc or "").lower()
-
-
-def parse_feed_date(entry: Dict[str, Any]) -> Optional[datetime]:
-    value = entry.get("published") or entry.get("updated")
+def parse_date(value: Any) -> Optional[datetime]:
     if not value:
         return None
 
     try:
-        parsed = parsedate_to_datetime(value)
+        parsed = parsedate_to_datetime(str(value))
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
     except Exception:
         return None
 
 
-def get_entry_content(entry: Dict[str, Any]) -> str:
+def parsed_entry_date(entry: Any) -> Optional[datetime]:
+    for field in ("published", "updated", "created"):
+        parsed = parse_date(entry.get(field))
+        if parsed:
+            return parsed
+
+    for field in ("published_parsed", "updated_parsed", "created_parsed"):
+        value = entry.get(field)
+        if value:
+            try:
+                return datetime(*value[:6], tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+    return None
+
+
+def normalize_url(value: Any) -> Optional[str]:
+    if not value:
+        return None
+
+    url = str(value).strip()
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+
+    return url
+
+
+def entry_link(entry: Any) -> Optional[str]:
+    link = normalize_url(entry.get("link"))
+    if link:
+        return link
+
+    for item in entry.get("links", []):
+        href = normalize_url(item.get("href"))
+        if href and item.get("rel", "alternate") == "alternate":
+            return href
+
+    return None
+
+
+def entry_content(entry: Any) -> Optional[str]:
     content_items = entry.get("content") or []
     if content_items:
-        value = content_items[0].get("value")
-        if value:
-            return str(value).strip()
+        text = clean_text(content_items[0].get("value"))
+        if text:
+            return text
 
-    return str(entry.get("summary") or entry.get("description") or "").strip()
-
-
-def html_to_text(html: str) -> str:
-    if not html:
-        return ""
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header", "aside"]):
-        tag.decompose()
-
-    root = soup.find("article") or soup.find("main") or soup.body or soup
-    return root.get_text(" ", strip=True)
+    return clean_text(entry.get("summary") or entry.get("description"))
 
 
-def fetch_article_text(url: str) -> Dict[str, Any]:
+def get_active_rss_sources(
+    source_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    conn = get_connection()
+
+    try:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+            query = """
+                SELECT
+                    id,
+                    name,
+                    url,
+                    domain,
+                    source_type,
+                    country_region,
+                    institution_type,
+                    ingest_method,
+                    feed_url,
+                    language_default,
+                    crawl_frequency_minutes
+                FROM public.sources
+                WHERE COALESCE(status, 'ACTIVE') = 'ACTIVE'
+                  AND ingest_method = 'rss'
+                  AND feed_url IS NOT NULL
+                  AND BTRIM(feed_url) <> ''
+            """
+            params: List[Any] = []
+
+            if source_id is not None:
+                query += " AND id = %s"
+                params.append(source_id)
+
+            query += " ORDER BY id"
+
+            cur.execute(query, params)
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def build_dedup_key(payload: Dict[str, Any]) -> str:
+    base = {
+        "source_url": payload["source_url"],
+        "canonical_url": payload.get("canonical_url"),
+        "source_title": payload["source_title"].strip(),
+        "published_date": payload.get("published_date"),
+        "external_id": payload.get("external_id"),
+        "source_domain": payload["source_domain"].strip().lower(),
+    }
+
+    normalized = json.dumps(base, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def entry_exists(cur: Any, dedup_key: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM public.entries
+        WHERE dedup_key = %s
+        LIMIT 1
+        """,
+        (dedup_key,),
+    )
+    return cur.fetchone() is not None
+
+
+def entry_payload(source: Dict[str, Any], entry: Any) -> Optional[Dict[str, Any]]:
+    canonical_url = entry_link(entry)
+    title = clean_text(entry.get("title"))
+
+    if not canonical_url or not title:
+        return None
+
+    summary = entry_content(entry)
+    external_id = clean_text(entry.get("id") or entry.get("guid"))
+    author = clean_text(entry.get("author"))
+    published_date = parsed_entry_date(entry)
+
+    source_url = normalize_url(source.get("url")) or source["feed_url"]
+    source_domain = (
+        clean_text(source.get("domain"))
+        or urlparse(source_url).netloc.lower()
+    )
+
+    return {
+        "source_url": source_url,
+        "source_domain": source_domain,
+        "source_title": title,
+        "source_type": source.get("source_type") or "rss",
+        "source_language": source.get("language_default"),
+        "ingest_method": "rss",
+        "external_id": external_id,
+        "author_name": author,
+        "canonical_url": canonical_url,
+        "published_date": (
+            published_date.isoformat() if published_date else None
+        ),
+        "detected_at": utc_now().isoformat(),
+        "country_region": source.get("country_region"),
+        "institution_type": source.get("institution_type"),
+        "raw_snippet": summary,
+        "raw_content": summary,
+        "raw_content_format": "text",
+        "raw_payload": {
+            "feed_url": source["feed_url"],
+            "feed_entry": dict(entry),
+        },
+        "review_status": "NEW",
+    }
+
+
+def fetch_feed(feed_url: str) -> Any:
     response = requests.get(
-        url,
-        timeout=REQUEST_TIMEOUT,
+        feed_url,
+        timeout=REQUEST_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
         allow_redirects=True,
     )
     response.raise_for_status()
 
-    content_type = (response.headers.get("content-type") or "").lower()
-    text = html_to_text(response.text) if "html" in content_type else ""
+    parsed = feedparser.parse(response.content)
 
-    return {
-        "url": response.url,
-        "content_type": content_type,
-        "text": text,
-        "status_code": response.status_code,
-    }
+    if getattr(parsed, "bozo", False) and not parsed.entries:
+        raise ValueError(
+            f"Feed invàlid: {getattr(parsed, 'bozo_exception', 'format desconegut')}"
+        )
+
+    return parsed
 
 
-def fetch_rss_sources(source_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-
-    try:
-        query = """
-            SELECT
-                id,
-                name,
-                url,
-                domain,
-                source_type,
-                institution_type,
-                country_region,
-                feed_url,
-                ingest_method,
-                language_default,
-                crawl_frequency_minutes,
-                priority
-            FROM public.sources
-            WHERE status = 'ACTIVE'
-              AND LOWER(COALESCE(ingest_method, '')) = 'rss'
-              AND feed_url IS NOT NULL
-              AND TRIM(feed_url) <> ''
+def update_source_success(cur: Any, source_id: int) -> None:
+    cur.execute(
         """
-        params: List[Any] = []
-
-        if source_ids:
-            query += " AND id = ANY(%s)"
-            params.append(source_ids)
-
-        query += " ORDER BY priority ASC, id ASC"
-
-        cur.execute(query, params)
-        return cur.fetchall()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def update_source_success(source_id: int) -> None:
-    conn = get_connection()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            """
-            UPDATE public.sources
-            SET
-                last_checked_at = now(),
-                last_success_at = now(),
-                last_error_message = NULL,
-                updated_at = now()
-            WHERE id = %s
-            """,
-            (source_id,),
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def update_source_error(source_id: int, message: str) -> None:
-    conn = get_connection()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            """
-            UPDATE public.sources
-            SET
-                last_checked_at = now(),
-                last_error_at = now(),
-                last_error_message = %s,
-                updated_at = now()
-            WHERE id = %s
-            """,
-            (message[:2000], source_id),
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def build_entry_payload(
-    source: Dict[str, Any],
-    entry: Dict[str, Any],
-    article_data: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    link = normalize_url(entry.get("link"))
-    guid = normalize_url(entry.get("id") or entry.get("guid"))
-    canonical_url = (
-        normalize_url(article_data.get("url"))
-        if article_data
-        else guid or link
+        UPDATE public.sources
+        SET last_checked_at = NOW(),
+            last_success_at = NOW(),
+            last_error_at = NULL,
+            last_error_message = NULL,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (source_id,),
     )
 
-    rss_content = get_entry_content(entry)
-    raw_content = (
-        article_data.get("text", "").strip()
-        if article_data and article_data.get("text")
-        else html_to_text(rss_content)
+
+def update_source_error(cur: Any, source_id: int, message: str) -> None:
+    cur.execute(
+        """
+        UPDATE public.sources
+        SET last_checked_at = NOW(),
+            last_error_at = NOW(),
+            last_error_message = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (message[:1000], source_id),
     )
-    raw_snippet = html_to_text(rss_content)[:2000]
-
-    source_url = canonical_url or link or source["url"]
-    source_domain = source.get("domain") or get_domain(source_url)
-
-    published_dt = parse_feed_date(entry)
-
-    payload = {
-        "source_url": source_url,
-        "source_domain": source_domain,
-        "source_title": str(entry.get("title") or source["name"]).strip(),
-        "source_type": source.get("source_type"),
-        "source_language": source.get("language_default"),
-        "ingest_method": "rss",
-        "external_id": guid or link,
-        "canonical_url": canonical_url,
-        "published_date": published_dt.isoformat() if published_dt else None,
-        "detected_at": utc_now().isoformat(),
-        "country_region": source.get("country_region"),
-        "institution_type": source.get("institution_type"),
-        "raw_snippet": raw_snippet or None,
-        "raw_content": raw_content or None,
-        "raw_content_format": "html" if article_data and article_data.get("text") else "rss",
-        "raw_payload": {
-            "source_id": source["id"],
-            "source_name": source["name"],
-            "feed_url": source["feed_url"],
-            "feed_title": entry.get("title"),
-            "feed_link": link,
-            "feed_guid": guid,
-            "feed_categories": [tag.get("term") for tag in (entry.get("tags") or []) if tag.get("term")],
-            "article_fetch": article_data,
-        },
-        "review_status": "NEW",
-    }
-
-    return payload
 
 
-def post_entry(payload: Dict[str, Any], dry_run: bool) -> str:
-    if dry_run:
-        return "dry_run"
-
-    if not API_KEY:
-        raise RuntimeError("API_KEY no configurada per al crawler")
-
-    response = requests.post(
-        f"{API_BASE_URL}/entries",
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-        headers={
-            "User-Agent": USER_AGENT,
-            "X-API-Key": API_KEY,
-            "Content-Type": "application/json",
+def insert_entry(cur: Any, payload: Dict[str, Any], dedup_key: str) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.entries (
+            source_url,
+            source_domain,
+            source_title,
+            source_type,
+            source_language,
+            ingest_method,
+            external_id,
+            author_name,
+            canonical_url,
+            published_date,
+            detected_at,
+            country_region,
+            institution_type,
+            raw_snippet,
+            raw_content,
+            raw_content_format,
+            raw_payload,
+            review_status,
+            dedup_key,
+            ingested_at,
+            updated_at,
+            ingest_status,
+            processing_status
+        ) VALUES (
+            %(source_url)s,
+            %(source_domain)s,
+            %(source_title)s,
+            %(source_type)s,
+            %(source_language)s,
+            %(ingest_method)s,
+            %(external_id)s,
+            %(author_name)s,
+            %(canonical_url)s,
+            %(published_date)s,
+            %(detected_at)s,
+            %(country_region)s,
+            %(institution_type)s,
+            %(raw_snippet)s,
+            %(raw_content)s,
+            %(raw_content_format)s,
+            %(raw_payload)s,
+            %(review_status)s,
+            %(dedup_key)s,
+            NOW(),
+            NOW(),
+            'ingested',
+            'RAW'
+        )
+        """,
+        {
+            **payload,
+            "raw_payload": psycopg2.extras.Json(payload["raw_payload"]),
+            "dedup_key": dedup_key,
         },
     )
 
-    if response.status_code == 409:
-        return "duplicate"
 
-    response.raise_for_status()
-    return "created"
+def record_crawler_log(
+    cur: Any,
+    sources_checked: int,
+    items_found: int,
+    items_relevant: int,
+    items_enriched: int,
+    items_failed: int,
+    duration_seconds: float,
+    notes: str,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.crawler_log (
+            sources_checked,
+            items_found,
+            items_relevant,
+            items_enriched,
+            items_failed,
+            duration_seconds,
+            notes
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            sources_checked,
+            items_found,
+            items_relevant,
+            items_enriched,
+            items_failed,
+            duration_seconds,
+            notes,
+        ),
+    )
 
 
-def run_entry_ingestion(
-    source_ids: Optional[List[int]] = None,
-    hours_back: int = 24,
-    max_items_per_source: int = 20,
-    dry_run: bool = True,
-) -> Dict[str, Any]:
-    since = utc_now() - timedelta(hours=hours_back)
-
-    metrics = {
+def run(
+    dry_run: bool = False,
+    source_id: Optional[int] = None,
+    limit_per_source: int = MAX_ENTRIES_PER_SOURCE,
+) -> Dict[str, int]:
+    started_at = utc_now()
+    counters = {
         "sources_checked": 0,
         "items_found": 0,
-        "items_in_window": 0,
-        "entries_created": 0,
-        "duplicates": 0,
-        "dry_run_items": 0,
+        "items_created": 0,
+        "items_duplicates": 0,
+        "items_skipped": 0,
         "items_failed": 0,
-        "source_errors": 0,
-        "article_fetch_successes": 0,
-        "article_fetch_failures": 0,
-        "errors": [],
     }
 
-    sources = fetch_rss_sources(source_ids=source_ids)
+    sources = get_active_rss_sources(source_id=source_id)
 
-    for source in sources:
-        metrics["sources_checked"] += 1
+    if not sources:
+        logger.warning("No hi ha fonts actives amb ingest_method='rss' i feed_url.")
+        return counters
 
-        try:
-            response = requests.get(
-                source["feed_url"],
-                timeout=REQUEST_TIMEOUT,
-                headers={"User-Agent": USER_AGENT},
-                allow_redirects=True,
-            )
-            response.raise_for_status()
+    conn = get_connection()
 
-            content_type = (response.headers.get("content-type") or "").lower()
-            # Accepta text/plain perquè molts feeds RSS es serveixen així des de GitHub/raw
-            if not any(ct in content_type for ct in ["xml", "rss", "atom", "text/plain"]):
-                raise RuntimeError(
-                    f"Content-Type inesperat per a RSS: {content_type or 'absent'}"
-                )
-
-            feed = feedparser.parse(response.content)
-
-            if getattr(feed, "bozo", False) and not feed.entries:
-                exc = getattr(feed, "bozo_exception", None)
-                raise RuntimeError(f"Feed XML invàlid: {exc or 'sense detall'}")
-
-            if not feed.entries:
-                raise RuntimeError("Feed sense entries; revisar feed_url o estructura")
-
-            for entry in feed.entries[:max_items_per_source]:
-                metrics["items_found"] += 1
-
-                published_date = parse_feed_date(entry)
-                if published_date and published_date < since:
-                    continue
-
-                metrics["items_in_window"] += 1
-                article_data = None
-
-                link = normalize_url(entry.get("link"))
-                if link:
-                    try:
-                        article_data = fetch_article_text(link)
-                        metrics["article_fetch_successes"] += 1
-                    except Exception as article_error:
-                        metrics["article_fetch_failures"] += 1
-                        metrics["errors"].append(
-                            {
-                                "source_id": source["id"],
-                                "url": link,
-                                "stage": "article_fetch",
-                                "error": str(article_error)[:500],
-                            }
-                        )
+    try:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+            for source in sources:
+                counters["sources_checked"] += 1
+                source_name = source.get("name") or f"source:{source['id']}"
 
                 try:
-                    payload = build_entry_payload(source, entry, article_data)
-                    result = post_entry(payload, dry_run=dry_run)
+                    feed = fetch_feed(source["feed_url"])
+                    entries = list(feed.entries)[:max(1, limit_per_source)]
+                    counters["items_found"] += len(entries)
 
-                    if result == "created":
-                        metrics["entries_created"] += 1
-                    elif result == "duplicate":
-                        metrics["duplicates"] += 1
-                    else:
-                        metrics["dry_run_items"] += 1
+                    for entry in entries:
+                        try:
+                            payload = entry_payload(source, entry)
 
-                except Exception as entry_error:
-                    metrics["items_failed"] += 1
-                    metrics["errors"].append(
-                        {
-                            "source_id": source["id"],
-                            "url": link,
-                            "stage": "entry_create",
-                            "error": str(entry_error)[:500],
-                        }
+                            if not payload:
+                                counters["items_skipped"] += 1
+                                continue
+
+                            dedup_key = build_dedup_key(payload)
+
+                            if entry_exists(cur, dedup_key):
+                                counters["items_duplicates"] += 1
+                                continue
+
+                            if dry_run:
+                                counters["items_created"] += 1
+                                logger.info(
+                                    "DRY RUN: nova entry %s — %s",
+                                    source_name,
+                                    payload["source_title"],
+                                )
+                                continue
+
+                            insert_entry(cur, payload, dedup_key)
+                            counters["items_created"] += 1
+
+                        except Exception as exc:
+                            counters["items_failed"] += 1
+                            logger.exception(
+                                "Error processant entry de %s: %s",
+                                source_name,
+                                exc,
+                            )
+
+                    if not dry_run:
+                        update_source_success(cur, source["id"])
+                        conn.commit()
+
+                except Exception as exc:
+                    counters["items_failed"] += 1
+                    logger.exception(
+                        "Error descarregant feed de %s (%s): %s",
+                        source_name,
+                        source["feed_url"],
+                        exc,
                     )
 
-            update_source_success(source["id"])
+                    if not dry_run:
+                        conn.rollback()
+                        update_source_error(cur, source["id"], str(exc))
+                        conn.commit()
 
-        except Exception as source_error:
-            metrics["source_errors"] += 1
-            message = str(source_error)
-            update_source_error(source["id"], message)
-            metrics["errors"].append(
-                {
-                    "source_id": source["id"],
-                    "feed_url": source["feed_url"],
-                    "stage": "feed_fetch",
-                    "error": message[:500],
-                }
+            duration_seconds = round(
+                (utc_now() - started_at).total_seconds(),
+                3,
             )
 
-    return metrics
+            if not dry_run:
+                notes = (
+                    "entries_rss "
+                    f"created={counters['items_created']} "
+                    f"duplicates={counters['items_duplicates']} "
+                    f"skipped={counters['items_skipped']}"
+                )
+                record_crawler_log(
+                    cur=cur,
+                    sources_checked=counters["sources_checked"],
+                    items_found=counters["items_found"],
+                    items_relevant=counters["items_created"],
+                    items_enriched=0,
+                    items_failed=counters["items_failed"],
+                    duration_seconds=duration_seconds,
+                    notes=notes,
+                )
+                conn.commit()
+
+            logger.info(
+                "Crawler finalitzat: %s",
+                json.dumps(counters, ensure_ascii=False),
+            )
+            return counters
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Crawler RSS/Atom d'entries d'AsimovWatch",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="No escriu entries ni actualitza fonts o logs.",
+    )
+    parser.add_argument(
+        "--source-id",
+        type=int,
+        default=None,
+        help="Executa només una source concreta.",
+    )
+    parser.add_argument(
+        "--limit-per-source",
+        type=int,
+        default=MAX_ENTRIES_PER_SOURCE,
+        help=f"Màxim d'entries per source (per defecte {MAX_ENTRIES_PER_SOURCE}).",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    try:
+        result = run(
+            dry_run=args.dry_run,
+            source_id=args.source_id,
+            limit_per_source=max(1, args.limit_per_source),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        logger.exception("El crawler ha fallat: %s", exc)
+        sys.exit(1)
