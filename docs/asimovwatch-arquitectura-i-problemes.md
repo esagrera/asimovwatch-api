@@ -385,3 +385,260 @@ Els endpoints clau d’aquest flux són:
 - `GET /source-candidates/{candidate_id}/source`
 
 Aquesta arquitectura reforça el criteri editorial d’AsimovWatch: el sistema pot proposar, però no pot aprovar ni activar autònomament noves fonts.
+
+## Arquitectura d’ingesta d’entries
+
+AsimovWatch disposa de dos canals principals per crear entries a `public.entries`:
+
+1. Ingesta de fonts monitoritzades mitjançant RSS/Atom.
+2. Cerca temàtica web sota demanda.
+
+Tots dos canals comparteixen el mateix model d’entry, el mateix mecanisme de deduplicació i el mateix punt d’entrada al flux editorial i d’enriquiment.
+
+### Flux RSS/Atom de fonts monitoritzades
+
+El crawler RSS llegeix les fonts actives de `public.sources` que compleixen aquestes condicions:
+
+- `status = 'ACTIVE'` o estat actiu per defecte.
+- `ingest_method = 'rss'`.
+- `feed_url` informat.
+
+Per cada element vàlid del feed, el crawler construeix un payload d’entry amb:
+
+- URL i domini de la font.
+- Títol de l’entry.
+- URL canònica de l’article.
+- Data de publicació, si està disponible.
+- Resum o contingut inicial.
+- Informació de la font i del feed original.
+- `review_status = 'NEW'`.
+- `processing_status = 'RAW'`.
+- `ingest_status = 'ingested'`.
+- `ingest_method = 'rss'`.
+
+Les entries RSS no es consideren enriquides en el moment de la ingesta. Entren al sistema com a informació crua pendent de enriquiment i revisio posterior.
+
+### Flux de cerca temàtica
+
+La cerca temàtica s’executa mitjançant:
+
+```text
+POST /crawler/entries/search
+```
+
+El paràmetre principal és un `brief` editorial. També pot rebre:
+
+- `date_range`.
+- `source_scope`.
+- `source_types`.
+- `max_results`.
+- `prompt_key`.
+- `dry_run`.
+- `run_enrichment`.
+
+El flux actual de cerca temàtica és de descoberta web. No fa una segona cerca independent sobre les fonts monitoritzades, perquè aquestes fonts ja disposen del seu propi flux RSS/Atom i les seves entries ja són a `public.entries`.
+
+La cerca temàtica:
+
+1. Carrega el prompt configurat a `public.prompts`.
+2. Carrega la configuració de runtime de `public.llm_runtime_config`.
+3. Substitueix els placeholders del prompt.
+4. Executa la cerca web amb el provider i el model configurats.
+5. Parseja la resposta JSON.
+6. Valida que cada candidata tingui un títol i una URL HTTP/HTTPS real.
+7. Aplica el mecanisme de deduplicació.
+8. Insereix les noves entries com a `NEW` i `RAW`, si `dry_run = false`.
+
+### Interpolació dels prompts de cerca
+
+El prompt `Thematic entry discovery` es desa a la base de dades amb placeholders de plantilla:
+
+```text
+{{brief}}
+{{date_range}}
+{{source_scope}}
+{{source_types}}
+{{max_results}}
+```
+
+Abans d’enviar el prompt al model, el backend substitueix aquests placeholders pels valors de la petició.
+
+Exemple:
+
+```text
+Brief editorial:
+{{brief}}
+```
+
+es converteix en:
+
+```text
+Brief editorial:
+Incidents de biaix racial en sistemes de diagnòstic mèdic amb IA
+```
+
+La interpolació es fa al backend i el model rep el prompt ja complet. Això evita que el model interpreti els placeholders com a text literal.
+
+### Prompt Thematic entry discovery
+
+Aquest prompt té una funció específica de descoberta. No ha de:
+
+- Redactar l’article final.
+- Fer una avaluació ètica definitiva.
+- Generar una anàlisi BIHP completa.
+- Extreure evidències detallades de la font.
+- Proposar directrius BIHP.
+- Inventar URLs, dates, autors o publicadors.
+
+La sortida obligatòria és JSON i conté:
+
+```json
+{
+  "query_interpretation": "string",
+  "results": [
+    {
+      "title": "string",
+      "url": "string",
+      "publisher": "string o null",
+      "published_date": "YYYY-MM-DD o null",
+      "source_kind": "primary|official|technical|academic|specialist_media|other",
+      "language": "string o null",
+      "why_relevant": "string"
+    }
+  ],
+  "coverage_gaps": ["string"],
+  "warnings": ["string"]
+}
+```
+
+La resposta del model representa una llista de candidates. Encara no representa una entry validada editorialment.
+
+### Capacitat de cerca del provider
+
+La cerca temàtica només pot fer una cerca web oberta si el provider i el model configurats tenen capacitat real de cerca.
+
+El backend ha de validar aquesta capacitat abans d’executar la petició:
+
+- Si el model té capacitat de cerca web, s’executa la cerca.
+- Si el model no té capacitat de cerca web i l’àmbit demana cerca web, la petició no s’ha d’executar.
+- Si no hi ha cap provider/model compatible amb cerca web, el sistema ha de retornar un error explícit i no crear entries.
+
+No s’ha d’interpretar una resposta textual d’un model sense cerca com una cerca web real. Una resposta sense URL verificables no és suficient per crear una entry.
+
+### Payload de les entries temàtiques
+
+Les entries de cerca temàtica segueixen el mateix principi que les entries RSS: entren com a dades crues.
+
+Els camps principals són:
+
+- `source_url`: URL descoberta.
+- `source_domain`: domini extret de la URL.
+- `source_title`: títol retornat pel model.
+- `canonical_url`: URL descoberta, pendent de verificació posterior.
+- `source_type = 'web_search'`.
+- `ingest_method = 'web_search'`.
+- `raw_snippet`: explicació breu de rellevància.
+- `raw_content`: contingut inicial disponible.
+- `raw_payload`: brief, paràmetres de cerca i resultat original.
+- `review_status = 'NEW'`.
+- `processing_status = 'RAW'`.
+- `ingest_status = 'ingested'`.
+
+La cerca temàtica no ha d’omplir prematurament `summary_factual`, `theme_tags`, `affected_principles`, `risk_level` o els camps de Protecció humana. Aquests camps corresponen al pipeline d’enriquiment posterior.
+
+### Deduplicació
+
+La deduplicació es basa en un hash construït a partir de camps de l’entry, entre els quals:
+
+- `source_url`.
+- `canonical_url`.
+- `source_title`.
+- `published_date`.
+- `external_id`, quan existeix.
+- `source_domain`.
+
+Si el `dedup_key` ja existeix, no es crea una nova entry.
+
+En el cas de la cerca temàtica, la resposta informa l’ID de l’entry existent. Es distingeixen:
+
+- `items_duplicates`: IDs d’entries ja existents.
+- `items_duplicates_monitored`: IDs d’entries ja existents que corresponen a dominis de fonts monitoritzades.
+- `warnings`: missatges explicatius sobre els duplicats i les fonts ja cobertes.
+
+Exemple:
+
+```json
+{
+  "items_duplicates": ,
+  "items_duplicates_monitored":,[456][789]
+  "warnings": [
+    "Font ja monitoritzada (example.org): entry existent id=456"
+  ]
+}
+```
+
+La informació dels duplicats permet saber si la cerca temàtica ha trobat informació nova o si ha recuperat contingut que el radar ja cobreix mitjançant RSS/Atom.
+
+### Mode dry_run
+
+Quan `dry_run = true`:
+
+- Es fa la cerca real.
+- Es parsegen i validen els resultats.
+- Es calculen els comptadors.
+- Es detecten duplicats.
+- No s’insereix cap entry.
+- No s’actualitza cap estat persistent del crawler.
+
+Quan `dry_run = false`:
+
+- Les candidates vàlides i no duplicades s’insereixen a `public.entries`.
+- Entren amb `review_status = 'NEW'`.
+- Entren amb `processing_status = 'RAW'`.
+- Queden disponibles per a revisió humana i enriquiment.
+
+### Punt d’entrada al flux editorial
+
+Les entries RSS i les entries de cerca temàtica convergeixen a `public.entries`.
+
+A partir d’aquest moment comparteixen:
+
+```text
+public.entries (RAW)
+      │
+      ▼
+pipeline d'enriquiment (Input → Primary → Output)
+      │
+      ▼
+processing_status = 'ENRICHED' (o 'ERROR')
+      │
+      ▼
+review_status = 'NEW' (pendent de revisió humana)
+      │
+      ▼
+revisió humana amb dades en brut + enriquides
+      │
+      ▼
+review_status = 'APPROVED' o 'REJECTED'
+```
+
+La revisió humana es fa **després** de l'enriquiment automàtic, perquè l'editor pugui consultar simultàniament:
+
+- **dades en brut**: `raw_snippet`, `raw_content`, `raw_payload`;
+- **dades enriquides**: `summary_factual`, `why_it_matters`, `theme_tags`, `affected_principles`, `debate_questions`, `risk_level`;
+- **valoració BIHP**: `human_protection_declared`, `human_protection_verifiable`, `human_protection_depth`, `human_protection_notes`;
+- **provider i model afectat**: `enriched_model` (i `provider` si es desglossa explícitament).
+
+Aquesta separació permet distingir clarament entre:
+
+1. allò que la font original declara;
+2. allò que el pipeline d'enriquiment ha pogut verificar i estructurar;
+3. l'avaluació de Protecció humana incorporada (Marc BIHP);
+4. la decisió editorial final (`APPROVED` o `REJECTED`).
+
+La procedència es conserva mitjançant `ingest_method`:
+
+- `rss` per a entries procedents de feeds monitoritzats.
+- `web_search` per a entries descobertes mitjançant cerca temàtica.
+
+Aquesta separació permet mantenir un únic flux editorial sense perdre la traçabilitat de l’origen.
