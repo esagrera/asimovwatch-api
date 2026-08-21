@@ -3,7 +3,7 @@ uvicorn[standard]
 psycopg2-binary
 google-genai
 anthropic
-openai
+openai>=1.0.0
 pydantic-settings
 reportlab==4.4.3
 feedparser==6.0.12

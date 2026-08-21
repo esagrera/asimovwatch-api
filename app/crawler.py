@@ -174,17 +174,21 @@ def build_dedup_key(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def entry_exists(cur: Any, dedup_key: str) -> bool:
+def entry_exists(cur: Any, dedup_key: str) -> Optional[int]:
+    """
+    Retorna l'id de l'entry existent si el dedup_key ja existeix, None si no.
+    """
     cur.execute(
         """
-        SELECT 1
+        SELECT id
         FROM public.entries
         WHERE dedup_key = %s
         LIMIT 1
         """,
         (dedup_key,),
     )
-    return cur.fetchone() is not None
+    row = cur.fetchone()
+    return row["id"] if row else None
 
 
 def entry_payload(source: Dict[str, Any], entry: Any) -> Optional[Dict[str, Any]]:
@@ -374,6 +378,474 @@ def record_crawler_log(
         ),
     )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# CERCA TEMÀTICA
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def get_prompt_config(prompt_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Carrega la configuració d'un prompt des de la base de dades.
+    
+    Retorna un dict amb:
+    - key: la clau del prompt
+    - value: el text del prompt
+    - provider: el provider (ex: "perplexity")
+    - model: el model (ex: "sonar-pro")
+    - use_fallback, max_tokens, temperature, timeout_secs: configuració
+    """
+    conn = get_connection()
+
+    try:
+        with conn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cur:
+            cur.execute(
+                """
+                SELECT
+                    p.key,
+                    p.value,
+                    c.provider,
+                    c.model,
+                    c.use_fallback,
+                    c.max_tokens,
+                    c.temperature,
+                    c.timeout_secs
+                FROM public.prompts p
+                LEFT JOIN public.llm_runtime_config c
+                ON c.scope_type = 'prompt'
+                AND c.scope_key = 'prompt'
+                AND c.prompt_key = p.key
+                WHERE p.key = %s
+                LIMIT 1
+                """,
+                (prompt_key,),
+            )
+
+            row = cur.fetchone()
+
+            if not row:
+                return None
+
+            return dict(row)
+    finally:
+        conn.close()
+
+
+def call_llm(
+    prompt_text: str,
+    user_message: str,
+    provider: str,
+    model: str,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    timeout_secs: Optional[int] = None,
+) -> str:
+    """
+    Crida un LLM utilitzant la configuració del prompt.
+    
+    Suporta:
+    - Perplexity API
+    - OpenAI API
+    - Altres providers compatibles amb OpenAI SDK
+    """
+    import os
+    from openai import OpenAI
+    
+    # Determinar API key i base_url segons el provider
+    if provider == "perplexity":
+        api_key = os.getenv("PERPLEXITY_API_KEY")
+        base_url = "https://api.perplexity.ai"
+    elif provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = "https://api.openai.com/v1"
+    else:
+        # Provider genèric compatible amb OpenAI SDK
+        api_key = os.getenv(f"{provider.upper()}_API_KEY")
+        base_url = os.getenv(f"{provider.upper()}_BASE_URL")
+    
+    if not api_key:
+        raise ValueError(f"API key no configurada per al provider: {provider}")
+    
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout_secs or 30,
+    )
+    
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": prompt_text},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=max_tokens or 2000,
+        temperature=temperature or 0.3,
+    )
+    
+    return response.choices[0].message.content
+
+def _render_prompt_template(
+    template: str,
+    brief: str,
+    date_range: Optional[str],
+    source_scope: Optional[str],
+    source_types: Optional[list[str]],
+    max_results: int,
+) -> str:
+    """
+    Substitueix els placeholders {{...}} del prompt pel valor real.
+    
+    Suporta:
+    - {{brief}}
+    - {{date_range}}
+    - {{source_scope}}
+    - {{source_types}}
+    - {{max_results}}
+    """
+    rendered = template
+    
+    # {{brief}}
+    rendered = rendered.replace("{{brief}}", brief or "")
+    
+    # {{date_range}}
+    rendered = rendered.replace("{{date_range}}", date_range or "Últim any")
+    
+    # {{source_scope}}
+    rendered = rendered.replace("{{source_scope}}", source_scope or "web_and_monitored_sources")
+    
+    # {{source_types}} (llista → string comma-separated)
+    if source_types:
+        source_types_str = ", ".join(source_types)
+    else:
+        source_types_str = "qualsevol"
+    rendered = rendered.replace("{{source_types}}", source_types_str)
+    
+    # {{max_results}}
+    rendered = rendered.replace("{{max_results}}", str(max_results))
+    
+    return rendered
+
+def _perplexity_search_raw(
+    prompt_text: str,
+    provider: str,
+    model: str,
+    max_tokens: Optional[int],
+    temperature: Optional[float],
+    timeout_secs: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    Fa la cerca web utilitzant el prompt configurat (ja interpolat).
+    
+    Retorna una llista de resultats amb:
+    - title, url, publisher, published_date, source_kind, language, why_relevant
+    """
+    import os
+    from openai import OpenAI
+    
+    api_key = os.getenv("PERPLEXITY_API_KEY")
+    
+    logger.info("Iniciant cerca Perplexity amb prompt interpolat")
+    logger.info("Provider: %s, Model: %s", provider, model)
+    
+    if not api_key:
+        raise ValueError("PERPLEXITY_API_KEY no configurada")
+    
+    # Determinar base_url segons provider
+    if provider == "perplexity":
+        base_url = "https://api.perplexity.ai"
+    elif provider == "openai":
+        base_url = "https://api.openai.com/v1"
+    else:
+        base_url = os.getenv(f"{provider.upper()}_BASE_URL")
+        if not base_url:
+            raise ValueError(f"BASE_URL no configurada per al provider: {provider}")
+    
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout_secs or 30,
+    )
+    
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": prompt_text},
+        ],
+        max_tokens=max_tokens or 4000,
+        temperature=temperature or 0.3,
+    )
+    
+    content = response.choices[0].message.content
+    
+    # Parsejar JSON
+    try:
+        cleaned = content.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        
+        parsed = json.loads(cleaned.strip())
+        
+        # Validar estructura mínima
+        if not isinstance(parsed, dict) or "results" not in parsed:
+            raise ValueError("El JSON no conté la clau 'results'")
+        
+        results = []
+        for item in parsed.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            
+            title = item.get("title")
+            url = item.get("url")
+            
+            # Validar que tinguem almenys title i url
+            if not title or not url:
+                logger.warning("Resultat sense title o url, ignorat: %s", item)
+                continue
+            
+            results.append({
+                "title": title[:250],  # Respectar límit del prompt
+                "url": url,
+                "publisher": item.get("publisher"),
+                "published_date": item.get("published_date"),
+                "source_kind": item.get("source_kind", "other"),
+                "language": item.get("language"),
+                "why_relevant": (item.get("why_relevant") or "")[:280],
+            })
+        
+        logger.info("S'han retornat %d resultats vàlids", len(results))
+        return results
+        
+    except json.JSONDecodeError as exc:
+        logger.error("JSON invàlid retornat per Perplexity: %s", exc)
+        logger.error("Contingut rebut: %s", content[:500])
+        raise ValueError(
+            "El model ha retornat JSON invàlid. Revisa els logs per més detalls."
+        ) from exc
+
+
+def run_thematic_search(
+    brief: str,
+    date_range: Optional[str] = "Últim any",
+    source_scope: Optional[str] = "web_and_monitored_sources",
+    source_types: Optional[list[str]] = None,
+    max_results: int = 10,
+    run_enrichment: bool = True,
+    dry_run: bool = False,
+    requested_by: str = "admin-thematic-search",
+    prompt_key: str = "Thematic entry discovery",
+) -> Dict[str, Any]:
+    """
+    Executa una cerca temàtica web utilitzant el prompt especificat.
+    
+    Retorna un dict amb els comptadors i warnings.
+    """
+    started_at = utc_now()
+    
+    logger.info("Iniciant cerca temàtica per a: %s", brief)
+    logger.info("Prompt key: %s", prompt_key)
+    
+    # Inicialitzar comptadors (amb llistes per duplicats)
+    counters = {
+        "sources_checked": 1,
+        "items_found": 0,
+        "items_created": 0,
+        "items_duplicates": [],  # Llista d'IDs
+        "items_duplicates_monitored": [],  # NOU: IDs de fonts promogudes
+        "items_skipped": 0,
+        "items_failed": 0,
+    }
+    # LOG TEMPORAL PER VALIDAR
+    logger.info("DEBUG: counters inicials = %s", json.dumps(counters, ensure_ascii=False))
+
+    
+    warnings = []  # Per informar duplicats de fonts promogudes
+    
+    try:
+        # 1. Carregar el prompt des de la base de dades
+        prompt_config = get_prompt_config(prompt_key)
+        if not prompt_config:
+            raise ValueError(f"Prompt '{prompt_key}' no trobat a la base de dades")
+        
+        logger.info(
+            "Carregat prompt: key=%s, provider=%s, model=%s",
+            prompt_key,
+            prompt_config["provider"],
+            prompt_config["model"],
+        )
+        
+        # 2. Validar capacitat de cerca web
+        WEBSEARCH_CAPABLE_PROVIDERS = {"perplexity"}
+        wants_web_search = source_scope in ("web_and_monitored_sources", "web_only")
+        
+        if wants_web_search and prompt_config["provider"].lower() not in WEBSEARCH_CAPABLE_PROVIDERS:
+            if source_scope == "web_only":
+                raise ValueError(
+                    f"El provider '{prompt_config['provider']}' no té capacitat de cerca web real. "
+                    "No es pot executar una cerca 'web_only' amb aquest model."
+                )
+            # web_and_monitored_sources: degradar, no fallar
+            logger.warning(
+                "Provider '%s' sense capacitat de cerca web. "
+                "Cerca temàtica limitada (no es farà cerca web oberta).",
+                prompt_config["provider"],
+            )
+            warnings.append("Cerca web omesa: el model configurat no té capacitat de cerca real.")
+            # En aquest cas, no cal continuar - no hi ha res a cercar
+            return {**counters, "warnings": warnings}
+        
+        # 3. Interpolar el prompt amb els valors reals
+        prompt_text = _render_prompt_template(
+            template=prompt_config["value"],
+            brief=brief,
+            date_range=date_range,
+            source_scope=source_scope,
+            source_types=source_types,
+            max_results=max_results,
+        )
+        
+        logger.info("Prompt interpolat preparat (%d caràcters)", len(prompt_text))
+        
+        # 4. Fer la cerca web amb el prompt interpolat
+        search_results = _perplexity_search_raw(
+            prompt_text=prompt_text,
+            provider=prompt_config["provider"],
+            model=prompt_config["model"],
+            max_tokens=int(prompt_config["max_tokens"]) if prompt_config["max_tokens"] else None,
+            temperature=float(prompt_config["temperature"]) if prompt_config["temperature"] else None,
+            timeout_secs=int(prompt_config["timeout_secs"]) if prompt_config["timeout_secs"] else None,
+        )
+        
+        counters["items_found"] = len(search_results)
+        
+        # 5. Processar cada resultat
+        conn = get_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                for result in search_results:
+                    try:
+                        # Construir payload "cru" (sense enriquiment)
+                        payload = {
+                            "source_url": result["url"],
+                            "source_domain": urlparse(result["url"]).netloc.lower(),
+                            "source_title": result["title"],
+                            "source_type": "web_search",
+                            "source_language": result.get("language") or "ca",
+                            "ingest_method": "web_search",
+                            "external_id": None,
+                            "author_name": None,
+                            "canonical_url": result["url"],
+                            "published_date": result.get("published_date"),
+                            "detected_at": utc_now().isoformat(),
+                            "country_region": None,
+                            "institution_type": None,
+                            "raw_snippet": result.get("why_relevant", ""),
+                            "raw_content": result.get("why_relevant", ""),
+                            "raw_content_format": "text",
+                            "raw_payload": {
+                                "search_brief": brief,
+                                "search_date_range": date_range,
+                                "search_result": result,
+                            },
+                            "review_status": "NEW",
+                        }
+                        
+                        # 6. Generar dedup_key
+                        dedup_key = build_dedup_key(payload)
+                        
+                        # 7. Verificar si ja existeix
+                        existing_entry_id = entry_exists(cur, dedup_key)
+                        if existing_entry_id is not None:
+                            # Verificar si és una font promoguda
+                            cur.execute(
+                                """
+                                SELECT s.id, s.name, s.domain
+                                FROM public.sources s
+                                WHERE s.domain = %s
+                                AND s.status = 'ACTIVE'
+                                LIMIT 1
+                                """,
+                                (payload["source_domain"],)
+                            )
+                            monitored_source = cur.fetchone()
+                            
+                            if monitored_source:
+                                counters["items_duplicates_monitored"].append(existing_entry_id)
+                                warnings.append(
+                                    f"Font ja monitoritzada ({monitored_source['domain']}): "
+                                    f"entry existent id={existing_entry_id}"
+                                )
+                            else:
+                                counters["items_duplicates"].append(existing_entry_id)
+                            
+                            continue
+                        
+                        # 8. Validar que la font sigui verificable
+                        source_title = (payload.get("source_title") or "").strip()
+                        source_url = (payload.get("source_url") or "").strip()
+                        
+                        is_placeholder_title = source_title.lower().startswith("resultat de cerca sobre:")
+                        
+                        if (
+                            is_placeholder_title
+                            or not source_url
+                            or not source_url.startswith(("https://", "http://"))
+                        ):
+                            counters["items_skipped"] += 1
+                            logger.warning(
+                                "Entrada descartada: font no verificable o placeholder. "
+                                "title=%r, url=%r",
+                                source_title,
+                                source_url,
+                            )
+                            continue
+                        
+                        # 9. Mode dry_run: validar i comptar, però no inserir
+                        if dry_run:
+                            counters["items_skipped"] += 1
+                            logger.info(
+                                "DRY RUN: entrada temàtica validada, no inserida: %s",
+                                payload["source_title"],
+                            )
+                            continue
+                        
+                        # 10. Inserir entry
+                        insert_entry(cur, payload, dedup_key)
+                        counters["items_created"] += 1
+                        
+                    except Exception as exc:
+                        counters["items_failed"] += 1
+                        logger.exception(
+                            "Error processant resultat de cerca temàtica: %s",
+                            exc,
+                        )
+            
+            if not dry_run:
+                conn.commit()
+        finally:
+            conn.close()
+        
+        logger.info(
+            "Cerca temàtica finalitzada: %s",
+            json.dumps(counters, ensure_ascii=False),
+        )
+        
+        # Afegir warnings al resultat final
+        return {**counters, "warnings": warnings}
+    
+    except Exception as exc:
+        logger.exception("Error en cerca temàtica: %s", exc)
+        counters["items_failed"] += 1
+        return {**counters, "warnings": warnings, "error": str(exc)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CRAWLER RSS
+# ──────────────────────────────────────────────────────────────────────────────
 
 def run(
     dry_run: bool = False,
