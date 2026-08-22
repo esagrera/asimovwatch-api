@@ -1344,6 +1344,81 @@ def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
         conn.close()
 
 @protected_router.post(
+    "/crawler/entries/run",
+    status_code=status.HTTP_201_CREATED,
+)
+def run_entry_crawler_now(body: EntryCrawlerRunRequest):
+    """
+    Executa el crawler RSS/Atom d'entries.
+
+    No descobreix ni promociona fonts. Llegeix només les fonts actives
+    amb ingest_method='rss' i feed_url configurat.
+
+    Les entries creades queden en estat NEW i RAW.
+    """
+    safe_limit = min(max(body.max_items_per_source, 1), 50)
+    source_ids = body.source_ids or [None]
+
+    started_at = utc_now()
+    aggregate = {
+        "sources_checked": 0,
+        "items_found": 0,
+        "items_created": 0,
+        "items_duplicates": 0,
+        "items_skipped": 0,
+        "items_failed": 0,
+    }
+    runs = []
+
+    try:
+        for source_id in source_ids:
+            result = run_entries_crawler(
+                dry_run=body.dry_run,
+                source_id=source_id,
+                limit_per_source=safe_limit,
+            )
+
+            for key in aggregate:
+                aggregate[key] += int(result.get(key, 0) or 0)
+
+            runs.append({
+                "source_id": source_id,
+                "result": result,
+            })
+
+        finished_at = utc_now()
+        duration_seconds = round(
+            (finished_at - started_at).total_seconds(),
+            3,
+        )
+
+        return {
+            "status": "ok",
+            "crawler_type": "entries_rss",
+            "run": {
+                "started_at": started_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "duration_seconds": duration_seconds,
+                "source_ids": body.source_ids,
+                "max_items_per_source": safe_limit,
+                "dry_run": body.dry_run,
+                "requested_by": body.requested_by,
+                "hours_back_ignored": body.hours_back,
+                "run_enrichment_ignored": body.run_enrichment,
+                "retry_errors_ignored": body.retry_errors,
+                "force_ignored": body.force,
+            },
+            "result": aggregate,
+            "runs": runs,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error executant crawler d'entries: {str(exc)}",
+        )
+
+@protected_router.post(
     "/crawler/entries/search",
     status_code=status.HTTP_201_CREATED,
 )
@@ -1395,77 +1470,6 @@ def run_thematic_search_now(body: ThematicEntrySearchRequest):
                 "prompt_key": body.prompt_key,
             },
             "result": result,  # ← Retorna el dict sencer de run_thematic_search()
-        }
-    
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error executant cerca temàtica: {str(exc)}",
-        )
-
-@protected_router.post(
-    "/crawler/entries/search",
-    status_code=status.HTTP_201_CREATED,
-)
-def run_thematic_search_now(body: ThematicEntrySearchRequest):
-    """
-    Executa una cerca temàtica web utilitzant el prompt "Thematic entry discovery".
-    
-    El brief defineix la cerca. Les entries creades queden en estat NEW i RAW.
-    """
-    from app.crawler import run_thematic_search
-    
-    safe_limit = min(max(body.max_results, 1), 50)
-    
-    started_at = utc_now()
-    aggregate = {
-        "sources_checked": 0,
-        "items_found": 0,
-        "items_created": 0,
-        "items_duplicates": 0,
-        "items_skipped": 0,
-        "items_failed": 0,
-    }
-    
-    try:
-        result = run_thematic_search(
-            brief=body.brief,
-            date_range=body.date_range,
-            source_scope=body.source_scope,
-            source_types=body.source_types,
-            max_results=safe_limit,
-            run_enrichment=body.run_enrichment,
-            dry_run=body.dry_run,
-            requested_by=body.requested_by,
-            prompt_key=body.prompt_key,
-        )
-        
-        for key in aggregate:
-            aggregate[key] += int(result.get(key, 0) or 0)
-        
-        finished_at = utc_now()
-        duration_seconds = round(
-            (finished_at - started_at).total_seconds(),
-            3,
-        )
-        
-        return {
-            "status": "ok",
-            "crawler_type": "thematic_search",
-            "run": {
-                "started_at": started_at.isoformat(),
-                "finished_at": finished_at.isoformat(),
-                "duration_seconds": duration_seconds,
-                "brief": body.brief,
-                "date_range": body.date_range,
-                "source_scope": body.source_scope,
-                "max_results": safe_limit,
-                "run_enrichment": body.run_enrichment,
-                "dry_run": body.dry_run,
-                "requested_by": body.requested_by,
-                "prompt_key": body.prompt_key,
-            },
-            "result": aggregate,
         }
     
     except Exception as exc:
