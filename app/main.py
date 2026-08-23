@@ -1247,12 +1247,12 @@ def get_entry_crawler_status():
     return {
         "status": "ok",
         "crawler": {
-            "enabled": parse_bool(config_map.get("entry_crawler_enabled"), default=False),
-            "frequency_minutes": parse_int(config_map.get("entry_crawler_frequency_minutes"), default=1440),
-            "run_enrichment": parse_bool(config_map.get("entry_crawler_run_enrichment"), default=True),
+            "enabled": _parse_bool(config_map.get("entry_crawler_enabled"), default=False),
+            "frequency_minutes": _parse_int(config_map.get("entry_crawler_frequency_minutes"), default=1440),
+            "run_enrichment": _parse_bool(config_map.get("entry_crawler_run_enrichment"), default=True),
             "run_time": config_map.get("entry_crawler_run_time", "08:00"),
             "run_day": config_map.get("entry_crawler_run_day", "friday"),
-            "max_items_per_source": parse_int(config_map.get("entry_crawler_max_items_per_source"), default=20),
+            "max_items_per_source": _parse_int(config_map.get("entry_crawler_max_items_per_source"), default=20),
             "last_status": config_map.get("entry_crawler_last_status"),
             "last_run_at": config_map.get("entry_crawler_last_run_at"),
             "last_duration_seconds": config_map.get("entry_crawler_last_duration_seconds"),
@@ -1348,9 +1348,9 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        set_config_value(cur, "entry_crawler_last_status", "RUNNING")
-        set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
-        set_config_value(cur, "entry_crawler_last_error", None)
+        _set_config_value(cur, "entry_crawler_last_status", "RUNNING")
+        _set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+        _set_config_value(cur, "entry_crawler_last_error", None)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1375,10 +1375,10 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
         conn = get_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
-            set_config_value(cur, "entry_crawler_last_status", "OK")
-            set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
-            set_config_value(cur, "entry_crawler_last_duration_seconds", str(duration_seconds))
-            set_config_value(cur, "entry_crawler_last_error", None)
+            _set_config_value(cur, "entry_crawler_last_status", "OK")
+            _set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+            _set_config_value(cur, "entry_crawler_last_duration_seconds", str(duration_seconds))
+            _set_config_value(cur, "entry_crawler_last_error", None)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1410,9 +1410,9 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
         try:
             conn = get_connection()
             cur = conn.cursor(cursor_factory=RealDictCursor)
-            set_config_value(cur, "entry_crawler_last_status", "ERROR")
-            set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
-            set_config_value(cur, "entry_crawler_last_error", str(exc))
+            _set_config_value(cur, "entry_crawler_last_status", "ERROR")
+            _set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+            _set_config_value(cur, "entry_crawler_last_error", str(exc))
             conn.commit()
         except Exception:
             pass
