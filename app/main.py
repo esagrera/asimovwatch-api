@@ -1247,35 +1247,17 @@ def get_entry_crawler_status():
     return {
         "status": "ok",
         "crawler": {
-            "enabled": _parse_bool(
-                config_map.get("entry_crawler_enabled"),
-                default=False
-            ),
-            "frequency_minutes": _parse_int(
-                config_map.get("entry_crawler_frequency_minutes"),
-                default=1440
-            ),
-            "run_enrichment": _parse_bool(
-                config_map.get("entry_crawler_run_enrichment"),
-                default=True
-            ),
+            "enabled": parse_bool(config_map.get("entry_crawler_enabled"), default=False),
+            "frequency_minutes": parse_int(config_map.get("entry_crawler_frequency_minutes"), default=1440),
+            "run_enrichment": parse_bool(config_map.get("entry_crawler_run_enrichment"), default=True),
             "run_time": config_map.get("entry_crawler_run_time", "08:00"),
             "run_day": config_map.get("entry_crawler_run_day", "friday"),
-            "max_items_per_source": _parse_int(
-                config_map.get("entry_crawler_max_items_per_source"),
-                default=20
-            ),
+            "max_items_per_source": parse_int(config_map.get("entry_crawler_max_items_per_source"), default=20),
             "last_status": config_map.get("entry_crawler_last_status"),
             "last_run_at": config_map.get("entry_crawler_last_run_at"),
-            "last_duration_seconds": config_map.get(
-                "entry_crawler_last_duration_seconds"
-            ),
+            "last_duration_seconds": config_map.get("entry_crawler_last_duration_seconds"),
             "last_error": config_map.get("entry_crawler_last_error"),
         },
-        "message": (
-            "Crawler d'entries preparat. "
-            "La ingestió real encara no està implementada."
-        ),
     }
 
 @protected_router.put("/crawler/entries/config")
@@ -1340,18 +1322,14 @@ def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
         cur.close()
         conn.close()
 
-@protected_router.post(
-    "/crawler/entries/run",
-    status_code=status.HTTP_201_CREATED,
-)
+@protected_router.post("/crawler/entries/run", status_code=status.HTTP_201_CREATED)
 def run_entry_crawler_now(body: EntryCrawlerRunRequest):
     """
     Executa el crawler RSS/Atom d'entries.
 
-    No descobreix ni promociona fonts. Llegeix només les fonts actives
-    amb ingest_method='rss' i feed_url configurat.
-
-    Les entries creades queden en estat NEW i RAW.
+    No descobreix fonts ni les promociona. Llegeix només fonts actives
+    amb ingest_method='rss' i feed_url. Les entries creades queden en
+    estat NEW i RAW perquè requereixen revisió humana posterior.
     """
     safe_limit = min(max(body.max_items_per_source, 1), 50)
     source_ids = body.source_ids or [None]
@@ -1367,6 +1345,19 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
     }
     runs = []
 
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        set_config_value(cur, "entry_crawler_last_status", "RUNNING")
+        set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+        set_config_value(cur, "entry_crawler_last_error", None)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
     try:
         for source_id in source_ids:
             result = run_entries_crawler(
@@ -1374,20 +1365,26 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
                 source_id=source_id,
                 limit_per_source=safe_limit,
             )
-
             for key in aggregate:
                 aggregate[key] += int(result.get(key, 0) or 0)
-
-            runs.append({
-                "source_id": source_id,
-                "result": result,
-            })
+            runs.append({"source_id": source_id, "result": result})
 
         finished_at = utc_now()
-        duration_seconds = round(
-            (finished_at - started_at).total_seconds(),
-            3,
-        )
+        duration_seconds = round((finished_at - started_at).total_seconds(), 3)
+
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            set_config_value(cur, "entry_crawler_last_status", "OK")
+            set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+            set_config_value(cur, "entry_crawler_last_duration_seconds", str(duration_seconds))
+            set_config_value(cur, "entry_crawler_last_error", None)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
 
         return {
             "status": "ok",
@@ -1410,6 +1407,22 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
         }
 
     except Exception as exc:
+        try:
+            conn = get_connection()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            set_config_value(cur, "entry_crawler_last_status", "ERROR")
+            set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+            set_config_value(cur, "entry_crawler_last_error", str(exc))
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            try:
+                cur.close()
+                conn.close()
+            except Exception:
+                pass
+
         raise HTTPException(
             status_code=500,
             detail=f"Error executant crawler d'entries: {str(exc)}",
