@@ -995,7 +995,8 @@ class EntryCrawlerConfigUpdate(BaseModel):
     enabled: bool
     frequency_minutes: int
     run_enrichment: bool
-    hours_back: int
+    run_time: str = "08:00"
+    run_day: str = "friday"
     max_items_per_source: int
 
 # ─── HELPERS CRAWLER OPS ──────────────────────────────────────────────────────
@@ -1258,10 +1259,8 @@ def get_entry_crawler_status():
                 config_map.get("entry_crawler_run_enrichment"),
                 default=True
             ),
-            "hours_back": _parse_int(
-                config_map.get("entry_crawler_hours_back"),
-                default=24
-            ),
+            "run_time": config_map.get("entry_crawler_run_time", "08:00"),
+            "run_day": config_map.get("entry_crawler_run_day", "friday"),
             "max_items_per_source": _parse_int(
                 config_map.get("entry_crawler_max_items_per_source"),
                 default=20
@@ -1283,7 +1282,7 @@ def get_entry_crawler_status():
 def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
     _validate_entry_crawler_config(
         frequency_minutes=body.frequency_minutes,
-        hours_back=body.hours_back,
+        hours_back=24,
         max_items_per_source=body.max_items_per_source,
     )
 
@@ -1306,11 +1305,8 @@ def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
             "entry_crawler_run_enrichment",
             str(body.run_enrichment).lower(),
         )
-        _set_config_value(
-            cur,
-            "entry_crawler_hours_back",
-            str(body.hours_back),
-        )
+        _set_config_value(cur, "entry_crawler_run_time", body.run_time)
+        _set_config_value(cur, "entry_crawler_run_day", body.run_day)
         _set_config_value(
             cur,
             "entry_crawler_max_items_per_source",
@@ -1325,7 +1321,8 @@ def update_entry_crawler_config(body: EntryCrawlerConfigUpdate):
                 "enabled": body.enabled,
                 "frequency_minutes": body.frequency_minutes,
                 "run_enrichment": body.run_enrichment,
-                "hours_back": body.hours_back,
+                "run_time": body.run_time,
+                "run_day": body.run_day,
                 "max_items_per_source": body.max_items_per_source,
             },
         }
