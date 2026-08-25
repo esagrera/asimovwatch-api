@@ -639,9 +639,9 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                     user_message=user_message,
                     provider=input_prompt_config["provider"],
                     model=input_prompt_config["model"],
-                    max_tokens=input_prompt_config.get("max_tokens"),
-                    temperature=input_prompt_config.get("temperature"),
-                    timeout_secs=input_prompt_config.get("timeout_secs"),
+                    max_tokens=int(input_prompt_config["max_tokens"]) if input_prompt_config.get("max_tokens") is not None else None,
+                    temperature=float(input_prompt_config["temperature"]) if input_prompt_config.get("temperature") is not None else None,
+                    timeout_secs=int(input_prompt_config["timeout_secs"]) if input_prompt_config.get("timeout_secs") is not None else None,
                 )
                 input_result = _parse_json_output(raw_output)
 
@@ -708,9 +708,9 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                 user_message=primary_user_message,
                 provider=primary_prompt_config["provider"],
                 model=primary_prompt_config["model"],
-                max_tokens=primary_prompt_config.get("max_tokens"),
-                temperature=primary_prompt_config.get("temperature"),
-                timeout_secs=primary_prompt_config.get("timeout_secs"),
+                max_tokens=int(primary_prompt_config["max_tokens"]) if primary_prompt_config.get("max_tokens") is not None else None,
+                temperature=float(primary_prompt_config["temperature"]) if primary_prompt_config.get("temperature") is not None else None,
+                timeout_secs=int(primary_prompt_config["timeout_secs"]) if primary_prompt_config.get("timeout_secs") is not None else None,
             )
             primary_result = _parse_json_output(raw_primary_output)
 
