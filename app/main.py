@@ -248,6 +248,8 @@ def list_entries(
     reviewer: Optional[str] = None,
     processing_status: Optional[str] = None,
     relevance_score: Optional[str] = None,
+    entry_category: Optional[str] = None,
+    analyzed_provider: Optional[str] = None,
     q: Optional[str] = None,
 ):
     conn = get_connection()
@@ -287,6 +289,14 @@ def list_entries(
         if relevance_score:
             filters.append("relevance_score = %s")
             params.append(relevance_score.lower())
+
+        if entry_category:
+            filters.append("entry_category = %s")
+            params.append(entry_category)
+
+        if analyzed_provider:
+            filters.append("LOWER(analyzed_provider) = LOWER(%s)")
+            params.append(analyzed_provider)   
 
         if q:
             filters.append("""
