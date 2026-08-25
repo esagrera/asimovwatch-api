@@ -376,21 +376,22 @@ def get_entry(entry_id: int):
 
     try:
         cur.execute("""
-            SELECT
-                id, source_url, source_domain, source_title, source_type,
-                source_language, ingest_method, external_id, author_name,
-                canonical_url, published_date, detected_at, country_region,
-                institution_type, raw_snippet, raw_snippet_original, raw_content,
-                raw_content_format, raw_payload, summary_factual, why_it_matters,
-                theme_tags, affected_principles, risk_level, debate_questions,
-                confidence_notes, human_protection_declared,
-                human_protection_verifiable, human_protection_depth,
-                human_protection_notes, review_status, reviewer, reviewed_at,
-                editor_notes, validation_notes, dedup_key, ingest_status,
-                ingested_at, updated_at, processing_status, processing_error,
-                processing_retries, relevance_score, relevance_reason, enriched_at,
-                enriched_model, translated_summary_ca, translated_whyitmatters_ca,
-                translated_debatequestions_ca
+            SELECT  id, source_url, source_domain, source_title, source_type, source_language,
+                    ingest_method, external_id, author_name, canonical_url, published_date,
+                    detected_at, country_region, institution_type, raw_snippet,
+                    raw_snippet_original, raw_content, raw_content_format, raw_payload,
+                    summary_factual, why_it_matters, theme_tags, affected_principles,
+                    risk_level, debate_questions, confidence_notes,
+                    human_protection_declared, human_protection_verifiable,
+                    human_protection_depth, human_protection_notes,
+                    input_relevance, input_relevance_reason, ready_for_primary,
+                    clean_input_text, input_summary, input_quality, input_quality_notes,
+                    entry_category, analyzed_provider, analyzed_model, bihp_directives,
+                    review_status, reviewer, reviewed_at, editor_notes, validation_notes,
+                    dedup_key, ingest_status, ingested_at, updated_at,
+                    processing_status, processing_error, processing_retries,
+                    relevance_score, relevance_reason, enriched_at, enriched_model,
+                    translated_summary_ca, translated_whyitmatters_ca, translated_debatequestions_ca
             FROM public.entries
             WHERE id = %s
         """, (entry_id,))
