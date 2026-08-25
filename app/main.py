@@ -169,6 +169,22 @@ class EntryEnrich(BaseModel):
     theme_tags: Optional[list] = None
     affected_principles: Optional[list] = None
     risk_level: Optional[str] = None
+    human_protection_declared: Optional[str] = None
+    human_protection_verifiable: Optional[str] = None
+    human_protection_depth: Optional[str] = None
+    human_protection_notes: Optional[str] = None
+    confidence_notes: Optional[str] = None
+    input_relevance: Optional[str] = None
+    input_relevance_reason: Optional[str] = None
+    ready_for_primary: Optional[str] = None
+    clean_input_text: Optional[str] = None
+    input_summary: Optional[str] = None
+    input_quality: Optional[str] = None
+    input_quality_notes: Optional[str] = None
+    entry_category: Optional[str] = None
+    analyzed_provider: Optional[str] = None
+    analyzed_model: Optional[str] = None
+    bihp_directives: Optional[list] = None
 
 class ConfigUpdate(BaseModel):
     value: str
@@ -552,12 +568,31 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
             "theme_tags": enrich.theme_tags,
             "affected_principles": enrich.affected_principles,
             "risk_level": enrich.risk_level,
+            "human_protection_declared": enrich.human_protection_declared,
+            "human_protection_verifiable": enrich.human_protection_verifiable,
+            "human_protection_depth": enrich.human_protection_depth,
+            "human_protection_notes": enrich.human_protection_notes,
+            "confidence_notes": enrich.confidence_notes,
+            "input_relevance": enrich.input_relevance,
+            "input_relevance_reason": enrich.input_relevance_reason,
+            "ready_for_primary": enrich.ready_for_primary,
+            "clean_input_text": enrich.clean_input_text,
+            "input_summary": enrich.input_summary,
+            "input_quality": enrich.input_quality,
+            "input_quality_notes": enrich.input_quality_notes,
+            "entry_category": enrich.entry_category,
+            "analyzed_provider": enrich.analyzed_provider,
+            "analyzed_model": enrich.analyzed_model,
         }
 
         for col, val in field_map.items():
             if val is not None:
                 fields.append(f"{col} = %s")
                 values.append(val)
+
+        if enrich.bihp_directives is not None:
+            fields.append("bihp_directives = %s")
+            values.append(Json(enrich.bihp_directives))        
 
         if not fields:
             raise HTTPException(status_code=400, detail="No fields to update")
