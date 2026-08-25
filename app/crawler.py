@@ -284,7 +284,7 @@ def update_source_error(cur: Any, source_id: int, message: str) -> None:
     )
 
 
-def insert_entry(cur: Any, payload: Dict[str, Any], dedup_key: str) -> None:
+def insert_entry(cur: Any, payload: Dict[str, Any], dedup_key: str) -> int:
     cur.execute(
         """
         INSERT INTO public.entries (
@@ -336,6 +336,7 @@ def insert_entry(cur: Any, payload: Dict[str, Any], dedup_key: str) -> None:
             'ingested',
             'RAW'
         )
+        RETURNING id
         """,
         {
             **payload,
@@ -343,7 +344,8 @@ def insert_entry(cur: Any, payload: Dict[str, Any], dedup_key: str) -> None:
             "dedup_key": dedup_key,
         },
     )
-
+    row = cur.fetchone()
+    return row["id"] if isinstance(row, dict) else row[0]
 
 def record_crawler_log(
     cur: Any,
@@ -484,6 +486,300 @@ def call_llm(
     )
     
     return response.choices[0].message.content
+
+# =========================================================================
+# TITLE: Funcions auxiliars del pipeline d'enriquiment (Input -> Primary -> Output)
+# =========================================================================
+
+VALID_ENTRY_CATEGORIES = {
+    "ai_ethics",
+    "regulation_frameworks",
+    "safety_control_oversight",
+    "digital_rights",
+    "human_protection_bihp",
+    "incidents",
+    "other",
+}
+
+VALID_BIHP_LABELS = {"green", "yellow", "red", "unknown"}
+
+
+def _build_input_user_message(entry: Dict[str, Any]) -> str:
+    """
+    Construeix el user_message per al prompt Input a partir d'una entry RAW.
+    Fa servir raw_content si existeix; sinó, cau a raw_snippet.
+    """
+    content = entry.get("raw_content") or entry.get("raw_snippet") or ""
+
+    return f"""Metadades de la peça:
+source_url: {entry.get('source_url', '')}
+source_domain: {entry.get('source_domain', '')}
+source_title: {entry.get('source_title', '')}
+source_type: {entry.get('source_type') or 'desconegut'}
+country_region: {entry.get('country_region') or 'desconegut'}
+institution_type: {entry.get('institution_type') or 'desconegut'}
+published_date: {entry.get('published_date') or 'desconeguda'}
+
+Contingut rebut:
+{content}
+"""
+
+
+def _build_primary_user_message(entry: Dict[str, Any], input_result: Optional[Dict[str, Any]]) -> str:
+    """
+    Construeix el user_message per al prompt Primary.
+    - Si input_result no és None (via RSS + Input): usa clean_input_text/input_summary.
+    - Si input_result és None (via cerca temàtica): usa raw_snippet/why_relevant + search_brief.
+    """
+    if input_result is not None:
+        clean_text = input_result.get("clean_input_text") or entry.get("raw_content") or entry.get("raw_snippet") or ""
+        summary = input_result.get("input_summary") or ""
+        source_note = "Origen: ingesta RSS/Atom, processada prèviament per la fase Input."
+    else:
+        raw_payload = entry.get("raw_payload") or {}
+        search_result = raw_payload.get("search_result") or {}
+        why_relevant = search_result.get("why_relevant") or entry.get("raw_snippet") or ""
+        search_brief = raw_payload.get("search_brief") or ""
+        clean_text = why_relevant
+        summary = f"Cerca temàtica motivada pel brief: {search_brief}" if search_brief else ""
+        source_note = "Origen: cerca temàtica (web_search), sense pas previ per la fase Input."
+
+    return f"""Metadades de la peça:
+source_url: {entry.get('source_url', '')}
+source_domain: {entry.get('source_domain', '')}
+source_title: {entry.get('source_title', '')}
+source_type: {entry.get('source_type') or 'desconegut'}
+country_region: {entry.get('country_region') or 'desconegut'}
+institution_type: {entry.get('institution_type') or 'desconegut'}
+published_date: {entry.get('published_date') or 'desconeguda'}
+
+{source_note}
+
+Resum previ (si existeix):
+{summary}
+
+Contingut per analitzar:
+{clean_text}
+"""
+
+
+def _parse_json_output(raw_text: str) -> Dict[str, Any]:
+    """
+    Neteja i parseja la sortida JSON d'un LLM, seguint el mateix patró
+    ja usat a _perplexity_search_raw() per retirar embolcalls ```json.
+    """
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    try:
+        return json.loads(cleaned.strip())
+    except json.JSONDecodeError as exc:
+        logger.error(f"JSON invàlid retornat pel LLM: {exc}")
+        logger.error(f"Contingut rebut: {cleaned[:500]}")
+        raise ValueError("El model ha retornat JSON invàlid. Revisa els logs per més detalls.") from exc
+
+
+def _validate_and_normalize_primary_output(primary_result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Valida i normalitza la sortida de Primary abans de persistir-la.
+    - entry_category ha de ser un dels 7 valors vàlids; si no, es força 'other'.
+    - human_protection_declared/verifiable/depth han de ser green/yellow/red/unknown
+      (constraint SQL real); si no, es força 'unknown'.
+    """
+    result = dict(primary_result)
+    notes = result.get("confidence_notes") or ""
+
+    category = result.get("entry_category")
+    if category not in VALID_ENTRY_CATEGORIES:
+        notes += f" [Avís: entry_category '{category}' no vàlid, forçat a 'other'.]"
+        result["entry_category"] = "other"
+
+    for field in ("human_protection_declared", "human_protection_verifiable", "human_protection_depth"):
+        value = result.get(field)
+        if value is not None and value not in VALID_BIHP_LABELS:
+            notes += f" [Avís: {field}='{value}' no vàlid, forçat a 'unknown'.]"
+            result[field] = "unknown"
+
+    result["confidence_notes"] = notes.strip() or None
+    return result
+
+
+def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, Any]:
+    """
+    Servei únic d'enriquiment per a qualsevol entry, independentment de l'origen.
+
+    skip_input=False -> aplica el gate Input abans de Primary (ús: crawler RSS)
+    skip_input=True  -> salta Input, va directe a Primary (ús: cerca temàtica)
+
+    Retorna: {"status": "enriched" | "discarded" | "error", "entry_id": ..., "detail": ...}
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM public.entries WHERE id = %s", (entry_id,))
+            entry = cur.fetchone()
+            if not entry:
+                return {"status": "error", "entry_id": entry_id, "detail": "Entry not found"}
+
+            input_result = None
+
+            if not skip_input:
+                input_prompt_config = get_prompt_config("Input")
+                if not input_prompt_config:
+                    raise ValueError("Prompt 'Input' no trobat a la base de dades")
+
+                user_message = _build_input_user_message(entry)
+                raw_output = call_llm(
+                    prompt_text=input_prompt_config["value"],
+                    user_message=user_message,
+                    provider=input_prompt_config["provider"],
+                    model=input_prompt_config["model"],
+                    max_tokens=input_prompt_config.get("max_tokens"),
+                    temperature=input_prompt_config.get("temperature"),
+                    timeout_secs=input_prompt_config.get("timeout_secs"),
+                )
+                input_result = _parse_json_output(raw_output)
+
+                ready = input_result.get("ready_for_primary")
+
+                if ready == "no":
+                    cur.execute("""
+                        UPDATE public.entries SET
+                            processing_status = 'DISCARDED',
+                            input_relevance = %s,
+                            input_relevance_reason = %s,
+                            ready_for_primary = %s,
+                            input_quality = %s,
+                            input_quality_notes = %s,
+                            raw_content = NULL,
+                            raw_payload = NULL,
+                            updated_at = NOW()
+                        WHERE id = %s
+                    """, (
+                        input_result.get("input_relevance"),
+                        input_result.get("input_relevance_reason"),
+                        ready,
+                        input_result.get("input_quality"),
+                        input_result.get("input_quality_notes"),
+                        entry_id,
+                    ))
+                    conn.commit()
+                    return {"status": "discarded", "entry_id": entry_id, "detail": input_result}
+
+                # yes / unclear -> guardar resultat d'Input i continuar
+                cur.execute("""
+                    UPDATE public.entries SET
+                        input_relevance = %s,
+                        input_relevance_reason = %s,
+                        ready_for_primary = %s,
+                        clean_input_text = %s,
+                        input_summary = %s,
+                        input_quality = %s,
+                        input_quality_notes = %s,
+                        source_language = COALESCE(%s, source_language),
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (
+                    input_result.get("input_relevance"),
+                    input_result.get("input_relevance_reason"),
+                    ready,
+                    input_result.get("clean_input_text"),
+                    input_result.get("input_summary"),
+                    input_result.get("input_quality"),
+                    input_result.get("input_quality_notes"),
+                    input_result.get("source_language"),
+                    entry_id,
+                ))
+                conn.commit()
+
+            # Fase Primary (per a totes les entries que arriben aquí)
+            primary_prompt_config = get_prompt_config("Primary")
+            if not primary_prompt_config:
+                raise ValueError("Prompt 'Primary' no trobat a la base de dades")
+
+            primary_user_message = _build_primary_user_message(entry, input_result)
+            raw_primary_output = call_llm(
+                prompt_text=primary_prompt_config["value"],
+                user_message=primary_user_message,
+                provider=primary_prompt_config["provider"],
+                model=primary_prompt_config["model"],
+                max_tokens=primary_prompt_config.get("max_tokens"),
+                temperature=primary_prompt_config.get("temperature"),
+                timeout_secs=primary_prompt_config.get("timeout_secs"),
+            )
+            primary_result = _parse_json_output(raw_primary_output)
+
+            # Fase Output: validació/normalització mínima abans de persistir
+            output_result = _validate_and_normalize_primary_output(primary_result)
+
+            cur.execute("""
+                UPDATE public.entries SET
+                    processing_status = 'ENRICHED',
+                    summary_factual = %s,
+                    why_it_matters = %s,
+                    theme_tags = %s,
+                    affected_principles = %s,
+                    risk_level = %s,
+                    debate_questions = %s,
+                    confidence_notes = %s,
+                    human_protection_declared = %s,
+                    human_protection_verifiable = %s,
+                    human_protection_depth = %s,
+                    human_protection_notes = %s,
+                    entry_category = %s,
+                    analyzed_provider = %s,
+                    analyzed_model = %s,
+                    bihp_directives = %s,
+                    enriched_model = %s,
+                    enriched_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+            """, (
+                output_result.get("summary_factual"),
+                output_result.get("why_it_matters"),
+                output_result.get("theme_tags"),
+                output_result.get("affected_principles"),
+                output_result.get("risk_level"),
+                output_result.get("debate_questions"),
+                output_result.get("confidence_notes"),
+                output_result.get("human_protection_declared"),
+                output_result.get("human_protection_verifiable"),
+                output_result.get("human_protection_depth"),
+                output_result.get("human_protection_notes"),
+                output_result.get("entry_category"),
+                output_result.get("analyzed_provider"),
+                output_result.get("analyzed_model"),
+                psycopg2.extras.Json(output_result.get("bihp_directives") or []),
+                primary_prompt_config["model"],
+                entry_id,
+            ))
+            conn.commit()
+            return {"status": "enriched", "entry_id": entry_id, "detail": output_result}
+
+    except Exception as exc:
+        conn.rollback()
+        try:
+            with conn.cursor() as cur2:
+                cur2.execute("""
+                    UPDATE public.entries SET
+                        processing_status = 'ERROR',
+                        processing_error = %s,
+                        processing_retries = COALESCE(processing_retries, 0) + 1,
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (str(exc), entry_id))
+                conn.commit()
+        except Exception:
+            conn.rollback()
+        logger.exception(f"Error enriquint entry {entry_id}: {exc}")
+        return {"status": "error", "entry_id": entry_id, "detail": str(exc)}
+    finally:
+        conn.close()
 
 def _render_prompt_template(
     template: str,
@@ -807,15 +1103,15 @@ def run_thematic_search(
                         # 9. Mode dry_run: validar i comptar, però no inserir
                         if dry_run:
                             counters["items_skipped"] += 1
-                            logger.info(
-                                "DRY RUN: entrada temàtica validada, no inserida: %s",
-                                payload["source_title"],
-                            )
                             continue
-                        
-                        # 10. Inserir entry
-                        insert_entry(cur, payload, dedup_key)
+
+                        new_entry_id = insert_entry(cur, payload, dedup_key)
                         counters["items_created"] += 1
+                        conn.commit()
+
+                        enrichment_result = run_entry_enrichment(entry_id=new_entry_id, skip_input=True)
+                        if enrichment_result["status"] == "error":
+                            counters["items_failed"] += 1
                         
                     except Exception as exc:
                         counters["items_failed"] += 1
@@ -858,6 +1154,7 @@ def run(
         "items_found": 0,
         "items_created": 0,
         "items_duplicates": 0,
+        "items_discarded_by_relevance": 0,
         "items_skipped": 0,
         "items_failed": 0,
     }
@@ -898,15 +1195,18 @@ def run(
                                 continue
 
                             if dry_run:
-                                logger.info(
-                                    "DRY RUN: nova entry %s — %s",
-                                    source_name,
-                                    payload["source_title"],
-                                )
+                                logger.info(f"DRY RUN nova entry {source_name} {payload['source_title']}")
                                 continue
 
-                            insert_entry(cur, payload, dedup_key)
+                            new_entry_id = insert_entry(cur, payload, dedup_key)  # cal que retorni l'id (veure nota)
                             counters["items_created"] += 1
+                            conn.commit()  # cal fer commit abans de cridar l'enriquiment perquè la fila existeixi
+
+                            enrichment_result = run_entry_enrichment(entry_id=new_entry_id, skip_input=False)
+                            if enrichment_result["status"] == "discarded":
+                                counters["items_discarded_by_relevance"] = counters.get("items_discarded_by_relevance", 0) + 1
+                            elif enrichment_result["status"] == "error":
+                                counters["items_failed"] += 1
 
                         except Exception as exc:
                             counters["items_failed"] += 1
