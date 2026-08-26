@@ -3,7 +3,6 @@ import hashlib
 import html
 import json
 import logging
-import os
 import sys
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -17,7 +16,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from app.db import get_connection
-
+from app.llm_config import call_llm_for_prompt
 
 load_dotenv()
 
@@ -187,6 +186,7 @@ def entry_exists(cur: Any, dedup_key: str) -> Optional[int]:
         """,
         (dedup_key,),
     )
+
     row = cur.fetchone()
     return row["id"] if row else None
 
@@ -243,6 +243,7 @@ def fetch_feed(feed_url: str) -> Any:
         headers={"User-Agent": USER_AGENT},
         allow_redirects=True,
     )
+
     response.raise_for_status()
 
     parsed = feedparser.parse(response.content)
@@ -344,8 +345,10 @@ def insert_entry(cur: Any, payload: Dict[str, Any], dedup_key: str) -> int:
             "dedup_key": dedup_key,
         },
     )
+
     row = cur.fetchone()
     return row["id"] if isinstance(row, dict) else row[0]
+
 
 def record_crawler_log(
     cur: Any,
@@ -380,115 +383,33 @@ def record_crawler_log(
         ),
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CERCA TEMÀTICA
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def get_prompt_config(prompt_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Carrega la configuració d'un prompt des de la base de dades.
-    
-    Retorna un dict amb:
-    - key: la clau del prompt
-    - value: el text del prompt
-    - provider: el provider (ex: "perplexity")
-    - model: el model (ex: "sonar-pro")
-    - use_fallback, max_tokens, temperature, timeout_secs: configuració
-    """
-    conn = get_connection()
-
-    try:
-        with conn.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT
-                    p.key,
-                    p.value,
-                    c.provider,
-                    c.model,
-                    c.use_fallback,
-                    c.max_tokens,
-                    c.temperature,
-                    c.timeout_secs
-                FROM public.prompts p
-                LEFT JOIN public.llm_runtime_config c
-                ON c.scope_type = 'prompt'
-                AND c.scope_key = 'prompt'
-                AND c.prompt_key = p.key
-                WHERE p.key = %s
-                LIMIT 1
-                """,
-                (prompt_key,),
-            )
-
-            row = cur.fetchone()
-
-            if not row:
-                return None
-
-            return dict(row)
-    finally:
-        conn.close()
-
-
-def call_llm(
-    prompt_text: str,
-    user_message: str,
-    provider: str,
-    model: str,
-    max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-    timeout_secs: Optional[int] = None,
-) -> str:
-    """
-    Crida un LLM utilitzant la configuració del prompt.
-    
-    Suporta:
-    - Perplexity API
-    - OpenAI API
-    - Altres providers compatibles amb OpenAI SDK
-    """
-    import os
-    from openai import OpenAI
-    
-    # Determinar API key i base_url segons el provider
-    if provider == "perplexity":
-        api_key = os.getenv("PERPLEXITY_API_KEY")
-        base_url = "https://api.perplexity.ai"
-    elif provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = "https://api.openai.com/v1"
-    else:
-        # Provider genèric compatible amb OpenAI SDK
-        api_key = os.getenv(f"{provider.upper()}_API_KEY")
-        base_url = os.getenv(f"{provider.upper()}_BASE_URL")
-    
-    if not api_key:
-        raise ValueError(f"API key no configurada per al provider: {provider}")
-    
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=timeout_secs or 30,
-    )
-    
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": prompt_text},
-            {"role": "user", "content": user_message},
-        ],
-        max_tokens=max_tokens or 2000,
-        temperature=temperature or 0.3,
-    )
-    
-    return response.choices[0].message.content
 
 # =========================================================================
 # TITLE: Funcions auxiliars del pipeline d'enriquiment (Input -> Primary -> Output)
+#
+# IMPORTANT - Convenció de placeholders (verificada contra els prompts reals
+# guardats a public.prompts, no inferida):
+#
+# - "Input"   usa claudàtor SIMPLE: {source_url} {source_domain} {source_title}
+#   {source_type} {country_region} {institution_type} {published_date}
+#   {input_text}
+# - "Primary" usa claudàtor SIMPLE: {input_text}  (únic placeholder)
+# - "Output"  usa claudàtor SIMPLE: {input_text}  (únic placeholder; rep el
+#   JSON complet retornat per Primary, no el contingut original de la notícia)
+# - "Thematic entry discovery" usa claudàtor DOBLE: {{brief}} {{date_range}}
+#   {{source_scope}} {{source_types}} {{max_results}}
+#
+# call_llm_for_prompt() fa un replace() literal de cada clau del
+# prompt_overrides contra el text del prompt guardat a la BD. Per això cada
+# prompt requereix el format exacte de claudàtor que ja té escrit, no un
+# format unificat inventat.
+#
+# Totes les crides LLM d'aquest pipeline (Input, Primary, Output, Thematic
+# entry discovery) passen per call_llm_for_prompt() (app.llm_config), que
+# centralitza provider/model/fallback/registre d'errors per a qualsevol
+# provider suportat (perplexity, openai, gemini, claude). Aquest fitxer no
+# conté cap crida directa a SDKs de proveïdors ni cap lògica pròpia
+# d'API key / base_url per provider.
 # =========================================================================
 
 VALID_ENTRY_CATEGORIES = {
@@ -504,30 +425,31 @@ VALID_ENTRY_CATEGORIES = {
 VALID_BIHP_LABELS = {"green", "yellow", "red", "unknown"}
 
 
-def _build_input_user_message(entry: Dict[str, Any]) -> str:
+def _build_input_overrides(entry: Dict[str, Any]) -> Dict[str, str]:
     """
-    Construeix el user_message per al prompt Input a partir d'una entry RAW.
-    Fa servir raw_content si existeix; sinó, cau a raw_snippet.
+    Prepara els prompt_overrides per al prompt "Input", que espera 8
+    placeholders individuals de claudàtor simple (no un bloc de text únic).
+
+    {input_text} és el contingut cru: raw_content si existeix, sinó raw_snippet.
     """
     content = entry.get("raw_content") or entry.get("raw_snippet") or ""
 
-    return f"""Metadades de la peça:
-source_url: {entry.get('source_url', '')}
-source_domain: {entry.get('source_domain', '')}
-source_title: {entry.get('source_title', '')}
-source_type: {entry.get('source_type') or 'desconegut'}
-country_region: {entry.get('country_region') or 'desconegut'}
-institution_type: {entry.get('institution_type') or 'desconegut'}
-published_date: {entry.get('published_date') or 'desconeguda'}
-
-Contingut rebut:
-{content}
-"""
+    return {
+        "{source_url}": entry.get("source_url") or "",
+        "{source_domain}": entry.get("source_domain") or "",
+        "{source_title}": entry.get("source_title") or "",
+        "{source_type}": entry.get("source_type") or "desconegut",
+        "{country_region}": entry.get("country_region") or "desconegut",
+        "{institution_type}": entry.get("institution_type") or "desconegut",
+        "{published_date}": str(entry.get("published_date") or "desconeguda"),
+        "{input_text}": content,
+    }
 
 
-def _build_primary_user_message(entry: Dict[str, Any], input_result: Optional[Dict[str, Any]]) -> str:
+def _build_primary_input_text(entry: Dict[str, Any], input_result: Optional[Dict[str, Any]]) -> str:
     """
-    Construeix el user_message per al prompt Primary.
+    Construeix el text que substitueix l'únic placeholder {input_text} del
+    prompt "Primary".
     - Si input_result no és None (via RSS + Input): usa clean_input_text/input_summary.
     - Si input_result és None (via cerca temàtica): usa raw_snippet/why_relevant + search_brief.
     """
@@ -559,14 +481,13 @@ Resum previ (si existeix):
 {summary}
 
 Contingut per analitzar:
-{clean_text}
-"""
+{clean_text}"""
 
 
 def _parse_json_output(raw_text: str) -> Dict[str, Any]:
     """
     Neteja i parseja la sortida JSON d'un LLM, seguint el mateix patró
-    ja usat a _perplexity_search_raw() per retirar embolcalls ```json.
+    ja usat a _parse_search_results() per retirar embolcalls ```json.
     """
     cleaned = raw_text.strip()
     if cleaned.startswith("```json"):
@@ -584,14 +505,29 @@ def _parse_json_output(raw_text: str) -> Dict[str, Any]:
         raise ValueError("El model ha retornat JSON invàlid. Revisa els logs per més detalls.") from exc
 
 
-def _validate_and_normalize_primary_output(primary_result: Dict[str, Any]) -> Dict[str, Any]:
+def _validate_and_normalize_final_output(
+    primary_result: Dict[str, Any],
+    output_result: Dict[str, Any],
+) -> Dict[str, Any]:
     """
-    Valida i normalitza la sortida de Primary abans de persistir-la.
-    - entry_category ha de ser un dels 7 valors vàlids; si no, es força 'other'.
-    - human_protection_declared/verifiable/depth han de ser green/yellow/red/unknown
-      (constraint SQL real); si no, es força 'unknown'.
+    Combina i valida el resultat final a persistir:
+    - Els camps textuals/traduïts venen d'output_result (fase Output: neteja
+      editorial + traducció al català).
+    - entry_category, analyzed_provider, analyzed_model i bihp_directives
+      només existeixen a primary_result (Output no els reemet segons el seu
+      esquema), així que es prenen d'aquí.
+    - Es valida entry_category i els 3 semàfors BIHP contra els valors
+      permesos (constraint SQL real); si no són vàlids, es força a
+      'other'/'unknown' i es deixa constància a confidence_notes.
     """
-    result = dict(primary_result)
+    result = dict(output_result)
+
+    # Camps exclusius de Primary, que Output no reemet
+    result["entry_category"] = primary_result.get("entry_category")
+    result["analyzed_provider"] = primary_result.get("analyzed_provider")
+    result["analyzed_model"] = primary_result.get("analyzed_model")
+    result["bihp_directives"] = primary_result.get("bihp_directives") or []
+
     notes = result.get("confidence_notes") or ""
 
     category = result.get("entry_category")
@@ -616,6 +552,14 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
     skip_input=False -> aplica el gate Input abans de Primary (ús: crawler RSS)
     skip_input=True  -> salta Input, va directe a Primary (ús: cerca temàtica)
 
+    Pipeline complet: Input (opcional) -> Primary -> Output.
+    Totes les crides LLM passen per call_llm_for_prompt(), exactament igual
+    que la resta de prompts del sistema (llm_model_advisor, Source
+    candidates discovery, Source candidate evaluation, Thematic entry
+    discovery). Això garanteix provider/model correctes, fallback automàtic
+    i registre d'errors uniformes, independentment del provider configurat
+    a public.llm_runtime_config per a cada prompt.
+
     Retorna: {"status": "enriched" | "discarded" | "error", "entry_id": ..., "detail": ...}
     """
     conn = get_connection()
@@ -629,21 +573,13 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
             input_result = None
 
             if not skip_input:
-                input_prompt_config = get_prompt_config("Input")
-                if not input_prompt_config:
-                    raise ValueError("Prompt 'Input' no trobat a la base de dades")
-
-                user_message = _build_input_user_message(entry)
-                raw_output = call_llm(
-                    prompt_text=input_prompt_config["value"],
-                    user_message=user_message,
-                    provider=input_prompt_config["provider"],
-                    model=input_prompt_config["model"],
-                    max_tokens=int(input_prompt_config["max_tokens"]) if input_prompt_config.get("max_tokens") is not None else None,
-                    temperature=float(input_prompt_config["temperature"]) if input_prompt_config.get("temperature") is not None else None,
-                    timeout_secs=int(input_prompt_config["timeout_secs"]) if input_prompt_config.get("timeout_secs") is not None else None,
+                input_overrides = _build_input_overrides(entry)
+                llm_result = call_llm_for_prompt(
+                    conn,
+                    "Input",
+                    prompt_overrides=input_overrides,
                 )
-                input_result = _parse_json_output(raw_output)
+                input_result = _parse_json_output(llm_result["output"])
 
                 ready = input_result.get("ready_for_primary")
 
@@ -698,24 +634,27 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                 conn.commit()
 
             # Fase Primary (per a totes les entries que arriben aquí)
-            primary_prompt_config = get_prompt_config("Primary")
-            if not primary_prompt_config:
-                raise ValueError("Prompt 'Primary' no trobat a la base de dades")
-
-            primary_user_message = _build_primary_user_message(entry, input_result)
-            raw_primary_output = call_llm(
-                prompt_text=primary_prompt_config["value"],
-                user_message=primary_user_message,
-                provider=primary_prompt_config["provider"],
-                model=primary_prompt_config["model"],
-                max_tokens=int(primary_prompt_config["max_tokens"]) if primary_prompt_config.get("max_tokens") is not None else None,
-                temperature=float(primary_prompt_config["temperature"]) if primary_prompt_config.get("temperature") is not None else None,
-                timeout_secs=int(primary_prompt_config["timeout_secs"]) if primary_prompt_config.get("timeout_secs") is not None else None,
+            primary_input_text = _build_primary_input_text(entry, input_result)
+            primary_llm_result = call_llm_for_prompt(
+                conn,
+                "Primary",
+                prompt_overrides={"{input_text}": primary_input_text},
             )
-            primary_result = _parse_json_output(raw_primary_output)
+            primary_result = _parse_json_output(primary_llm_result["output"])
 
-            # Fase Output: validació/normalització mínima abans de persistir
-            output_result = _validate_and_normalize_primary_output(primary_result)
+            # Fase Output: crida LLM pròpia (traducció ca + neteja editorial).
+            # Rep el JSON complet de Primary, no el contingut original.
+            output_llm_result = call_llm_for_prompt(
+                conn,
+                "Output",
+                prompt_overrides={"{input_text}": json.dumps(primary_result, ensure_ascii=False)},
+            )
+            output_result_raw = _parse_json_output(output_llm_result["output"])
+
+            # Combinar Output (camps traduïts/nets) + Primary (camps exclusius:
+            # entry_category, analyzed_provider, analyzed_model, bihp_directives)
+            # i validar contra els enums SQL abans de persistir.
+            final_result = _validate_and_normalize_final_output(primary_result, output_result_raw)
 
             cur.execute("""
                 UPDATE public.entries SET
@@ -735,31 +674,37 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                     analyzed_provider = %s,
                     analyzed_model = %s,
                     bihp_directives = %s,
+                    translated_summary_ca = %s,
+                    translated_whyitmatters_ca = %s,
+                    translated_debatequestions_ca = %s,
                     enriched_model = %s,
                     enriched_at = NOW(),
                     updated_at = NOW()
                 WHERE id = %s
             """, (
-                output_result.get("summary_factual"),
-                output_result.get("why_it_matters"),
-                output_result.get("theme_tags"),
-                output_result.get("affected_principles"),
-                output_result.get("risk_level"),
-                output_result.get("debate_questions"),
-                output_result.get("confidence_notes"),
-                output_result.get("human_protection_declared"),
-                output_result.get("human_protection_verifiable"),
-                output_result.get("human_protection_depth"),
-                output_result.get("human_protection_notes"),
-                output_result.get("entry_category"),
-                output_result.get("analyzed_provider"),
-                output_result.get("analyzed_model"),
-                psycopg2.extras.Json(output_result.get("bihp_directives") or []),
-                primary_prompt_config["model"],
+                final_result.get("summary_factual"),
+                final_result.get("why_it_matters"),
+                final_result.get("theme_tags"),
+                final_result.get("affected_principles"),
+                final_result.get("risk_level"),
+                final_result.get("debate_questions"),
+                final_result.get("confidence_notes"),
+                final_result.get("human_protection_declared"),
+                final_result.get("human_protection_verifiable"),
+                final_result.get("human_protection_depth"),
+                final_result.get("human_protection_notes"),
+                final_result.get("entry_category"),
+                final_result.get("analyzed_provider"),
+                final_result.get("analyzed_model"),
+                psycopg2.extras.Json(final_result.get("bihp_directives") or []),
+                final_result.get("translated_summary_ca"),
+                final_result.get("translated_whyitmatters_ca"),
+                final_result.get("translated_debatequestions_ca"),
+                output_llm_result["model_used"],
                 entry_id,
             ))
             conn.commit()
-            return {"status": "enriched", "entry_id": entry_id, "detail": output_result}
+            return {"status": "enriched", "entry_id": entry_id, "detail": final_result}
 
     except Exception as exc:
         conn.rollback()
@@ -773,7 +718,7 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                         updated_at = NOW()
                     WHERE id = %s
                 """, (str(exc), entry_id))
-                conn.commit()
+            conn.commit()
         except Exception:
             conn.rollback()
         logger.exception(f"Error enriquint entry {entry_id}: {exc}")
@@ -781,17 +726,18 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
     finally:
         conn.close()
 
-def _render_prompt_template(
-    template: str,
+
+def _build_thematic_search_overrides(
     brief: str,
     date_range: Optional[str],
     source_scope: Optional[str],
-    source_types: Optional[list[str]],
+    source_types: Optional[list],
     max_results: int,
-) -> str:
+) -> Dict[str, str]:
     """
-    Substitueix els placeholders {{...}} del prompt pel valor real.
-    
+    Prepara els prompt_overrides per al prompt "Thematic entry discovery",
+    que usa claudàtor DOBLE {{...}}.
+
     Suporta:
     - {{brief}}
     - {{date_range}}
@@ -799,136 +745,79 @@ def _render_prompt_template(
     - {{source_types}}
     - {{max_results}}
     """
-    rendered = template
-    
-    # {{brief}}
-    rendered = rendered.replace("{{brief}}", brief or "")
-    
-    # {{date_range}}
-    rendered = rendered.replace("{{date_range}}", date_range or "Últim any")
-    
-    # {{source_scope}}
-    rendered = rendered.replace("{{source_scope}}", source_scope or "web_and_monitored_sources")
-    
-    # {{source_types}} (llista → string comma-separated)
     if source_types:
         source_types_str = ", ".join(source_types)
     else:
         source_types_str = "qualsevol"
-    rendered = rendered.replace("{{source_types}}", source_types_str)
-    
-    # {{max_results}}
-    rendered = rendered.replace("{{max_results}}", str(max_results))
-    
-    return rendered
 
-def _perplexity_search_raw(
-    prompt_text: str,
-    provider: str,
-    model: str,
-    max_tokens: Optional[int],
-    temperature: Optional[float],
-    timeout_secs: Optional[int],
-) -> List[Dict[str, Any]]:
+    return {
+        "{{brief}}": brief or "",
+        "{{date_range}}": date_range or "Últim any",
+        "{{source_scope}}": source_scope or "web_and_monitored_sources",
+        "{{source_types}}": source_types_str,
+        "{{max_results}}": str(max_results),
+    }
+
+
+def _parse_search_results(raw_text: str) -> List[Dict[str, Any]]:
     """
-    Fa la cerca web utilitzant el prompt configurat (ja interpolat).
-    
+    Parseja la sortida JSON d'una cerca temàtica (prompt 'Thematic entry
+    discovery'), independentment del provider que l'hagi generat.
+
     Retorna una llista de resultats amb:
     - title, url, publisher, published_date, source_kind, language, why_relevant
     """
-    import os
-    from openai import OpenAI
-    
-    api_key = os.getenv("PERPLEXITY_API_KEY")
-    
-    logger.info("Iniciant cerca Perplexity amb prompt interpolat")
-    logger.info("Provider: %s, Model: %s", provider, model)
-    
-    if not api_key:
-        raise ValueError("PERPLEXITY_API_KEY no configurada")
-    
-    # Determinar base_url segons provider
-    if provider == "perplexity":
-        base_url = "https://api.perplexity.ai"
-    elif provider == "openai":
-        base_url = "https://api.openai.com/v1"
-    else:
-        base_url = os.getenv(f"{provider.upper()}_BASE_URL")
-        if not base_url:
-            raise ValueError(f"BASE_URL no configurada per al provider: {provider}")
-    
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        timeout=timeout_secs or 30,
-    )
-    
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": prompt_text},
-        ],
-        max_tokens=max_tokens or 4000,
-        temperature=temperature or 0.3,
-    )
-    
-    content = response.choices[0].message.content
-    
-    # Parsejar JSON
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
     try:
-        cleaned = content.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        elif cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        
         parsed = json.loads(cleaned.strip())
-        
-        # Validar estructura mínima
-        if not isinstance(parsed, dict) or "results" not in parsed:
-            raise ValueError("El JSON no conté la clau 'results'")
-        
-        results = []
-        for item in parsed.get("results", []):
-            if not isinstance(item, dict):
-                continue
-            
-            title = item.get("title")
-            url = item.get("url")
-            
-            # Validar que tinguem almenys title i url
-            if not title or not url:
-                logger.warning("Resultat sense title o url, ignorat: %s", item)
-                continue
-            
-            results.append({
-                "title": title[:250],  # Respectar límit del prompt
-                "url": url,
-                "publisher": item.get("publisher"),
-                "published_date": item.get("published_date"),
-                "source_kind": item.get("source_kind", "other"),
-                "language": item.get("language"),
-                "why_relevant": (item.get("why_relevant") or "")[:280],
-            })
-        
-        logger.info("S'han retornat %d resultats vàlids", len(results))
-        return results
-        
     except json.JSONDecodeError as exc:
-        logger.error("JSON invàlid retornat per Perplexity: %s", exc)
-        logger.error("Contingut rebut: %s", content[:500])
+        logger.error("JSON invàlid retornat per la cerca temàtica: %s", exc)
+        logger.error("Contingut rebut: %s", cleaned[:500])
         raise ValueError(
             "El model ha retornat JSON invàlid. Revisa els logs per més detalls."
         ) from exc
+
+    if not isinstance(parsed, dict) or "results" not in parsed:
+        raise ValueError("El JSON no conté la clau 'results'")
+
+    results = []
+    for item in parsed.get("results", []):
+        if not isinstance(item, dict):
+            continue
+
+        title = item.get("title")
+        url = item.get("url")
+
+        if not title or not url:
+            logger.warning("Resultat sense title o url, ignorat: %s", item)
+            continue
+
+        results.append({
+            "title": title[:250],  # Respectar límit del prompt
+            "url": url,
+            "publisher": item.get("publisher"),
+            "published_date": item.get("published_date"),
+            "source_kind": item.get("source_kind", "other"),
+            "language": item.get("language"),
+            "why_relevant": (item.get("why_relevant") or "")[:280],
+        })
+
+    logger.info("S'han retornat %d resultats vàlids", len(results))
+    return results
 
 
 def run_thematic_search(
     brief: str,
     date_range: Optional[str] = "Últim any",
     source_scope: Optional[str] = "web_and_monitored_sources",
-    source_types: Optional[list[str]] = None,
+    source_types: Optional[list] = None,
     max_results: int = 10,
     run_enrichment: bool = True,
     dry_run: bool = False,
@@ -937,206 +826,207 @@ def run_thematic_search(
 ) -> Dict[str, Any]:
     """
     Executa una cerca temàtica web utilitzant el prompt especificat.
-    
+
+    Fa servir call_llm_for_prompt(), igual que la resta del sistema
+    (llm_model_advisor, Source candidates discovery, Source candidate
+    evaluation, Input, Primary, Output). Si el provider configurat per a
+    aquest prompt no té capacitat de cerca web real, es degrada
+    (web_and_monitored_sources) o falla explícitament (web_only).
+
     Retorna un dict amb els comptadors i warnings.
     """
     started_at = utc_now()
-    
+
     logger.info("Iniciant cerca temàtica per a: %s", brief)
     logger.info("Prompt key: %s", prompt_key)
-    
-    # Inicialitzar comptadors (amb llistes per duplicats)
+
     counters = {
         "sources_checked": 1,
         "items_found": 0,
         "items_created": 0,
         "items_duplicates": [],  # Llista d'IDs
-        "items_duplicates_monitored": [],  # NOU: IDs de fonts promogudes
+        "items_duplicates_monitored": [],  # IDs de fonts promogudes
         "items_skipped": 0,
         "items_failed": 0,
     }
-    # LOG TEMPORAL PER VALIDAR
-    logger.info("DEBUG: counters inicials = %s", json.dumps(counters, ensure_ascii=False))
 
-    
-    warnings = []  # Per informar duplicats de fonts promogudes
-    
+    warnings: List[str] = []
+
+    conn = get_connection()
+
     try:
-        # 1. Carregar el prompt des de la base de dades
-        prompt_config = get_prompt_config(prompt_key)
-        if not prompt_config:
+        # 1. Comprovar provider configurat per a aquest prompt (per a la
+        #    validació de capacitat de cerca web, abans de gastar la crida)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT c.provider
+                FROM public.prompts p
+                LEFT JOIN public.llm_runtime_config c
+                    ON c.scope_type = 'prompt'
+                    AND c.scope_key = 'prompt'
+                    AND c.prompt_key = p.key
+                WHERE p.key = %s
+                LIMIT 1
+                """,
+                (prompt_key,),
+            )
+            prompt_row = cur.fetchone()
+
+        if not prompt_row:
             raise ValueError(f"Prompt '{prompt_key}' no trobat a la base de dades")
-        
-        logger.info(
-            "Carregat prompt: key=%s, provider=%s, model=%s",
-            prompt_key,
-            prompt_config["provider"],
-            prompt_config["model"],
-        )
-        
+
+        configured_provider = (prompt_row.get("provider") or "").strip().lower()
+
+        logger.info("Carregat prompt: key=%s, provider=%s", prompt_key, configured_provider)
+
         # 2. Validar capacitat de cerca web
         WEBSEARCH_CAPABLE_PROVIDERS = {"perplexity"}
         wants_web_search = source_scope in ("web_and_monitored_sources", "web_only")
-        
-        if wants_web_search and prompt_config["provider"].lower() not in WEBSEARCH_CAPABLE_PROVIDERS:
+
+        if wants_web_search and configured_provider not in WEBSEARCH_CAPABLE_PROVIDERS:
             if source_scope == "web_only":
                 raise ValueError(
-                    f"El provider '{prompt_config['provider']}' no té capacitat de cerca web real. "
+                    f"El provider '{configured_provider}' no té capacitat de cerca web real. "
                     "No es pot executar una cerca 'web_only' amb aquest model."
                 )
-            # web_and_monitored_sources: degradar, no fallar
+
             logger.warning(
                 "Provider '%s' sense capacitat de cerca web. "
                 "Cerca temàtica limitada (no es farà cerca web oberta).",
-                prompt_config["provider"],
+                configured_provider,
             )
             warnings.append("Cerca web omesa: el model configurat no té capacitat de cerca real.")
-            # En aquest cas, no cal continuar - no hi ha res a cercar
             return {**counters, "warnings": warnings}
-        
-        # 3. Interpolar el prompt amb els valors reals
-        prompt_text = _render_prompt_template(
-            template=prompt_config["value"],
+
+        # 3. Preparar els overrides del prompt (placeholders {{...}})
+        prompt_overrides = _build_thematic_search_overrides(
             brief=brief,
             date_range=date_range,
             source_scope=source_scope,
             source_types=source_types,
             max_results=max_results,
         )
-        
-        logger.info("Prompt interpolat preparat (%d caràcters)", len(prompt_text))
-        
-        # 4. Fer la cerca web amb el prompt interpolat
-        search_results = _perplexity_search_raw(
-            prompt_text=prompt_text,
-            provider=prompt_config["provider"],
-            model=prompt_config["model"],
-            max_tokens=int(prompt_config["max_tokens"]) if prompt_config["max_tokens"] else None,
-            temperature=float(prompt_config["temperature"]) if prompt_config["temperature"] else None,
-            timeout_secs=int(prompt_config["timeout_secs"]) if prompt_config["timeout_secs"] else None,
+
+        # 4. Fer la cerca amb call_llm_for_prompt() (mateix camí que la resta del sistema)
+        llm_result = call_llm_for_prompt(
+            conn,
+            prompt_key,
+            prompt_overrides=prompt_overrides,
         )
-        
+        search_results = _parse_search_results(llm_result["output"])
         counters["items_found"] = len(search_results)
-        
+
         # 5. Processar cada resultat
-        conn = get_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                for result in search_results:
-                    try:
-                        # Construir payload "cru" (sense enriquiment)
-                        payload = {
-                            "source_url": result["url"],
-                            "source_domain": urlparse(result["url"]).netloc.lower(),
-                            "source_title": result["title"],
-                            "source_type": "web_search",
-                            "source_language": result.get("language") or "ca",
-                            "ingest_method": "web_search",
-                            "external_id": None,
-                            "author_name": None,
-                            "canonical_url": result["url"],
-                            "published_date": result.get("published_date"),
-                            "detected_at": utc_now().isoformat(),
-                            "country_region": None,
-                            "institution_type": None,
-                            "raw_snippet": result.get("why_relevant", ""),
-                            "raw_content": result.get("why_relevant", ""),
-                            "raw_content_format": "text",
-                            "raw_payload": {
-                                "search_brief": brief,
-                                "search_date_range": date_range,
-                                "search_result": result,
-                            },
-                            "review_status": "NEW",
-                        }
-                        
-                        # 6. Generar dedup_key
-                        dedup_key = build_dedup_key(payload)
-                        
-                        # 7. Verificar si ja existeix
-                        existing_entry_id = entry_exists(cur, dedup_key)
-                        if existing_entry_id is not None:
-                            # Verificar si és una font promoguda
-                            cur.execute(
-                                """
-                                SELECT s.id, s.name, s.domain
-                                FROM public.sources s
-                                WHERE s.domain = %s
-                                AND s.status = 'ACTIVE'
-                                LIMIT 1
-                                """,
-                                (payload["source_domain"],)
-                            )
-                            monitored_source = cur.fetchone()
-                            
-                            if monitored_source:
-                                counters["items_duplicates_monitored"].append(existing_entry_id)
-                                warnings.append(
-                                    f"Font ja monitoritzada ({monitored_source['domain']}): "
-                                    f"entry existent id={existing_entry_id}"
-                                )
-                            else:
-                                counters["items_duplicates"].append(existing_entry_id)
-                            
-                            continue
-                        
-                        # 8. Validar que la font sigui verificable
-                        source_title = (payload.get("source_title") or "").strip()
-                        source_url = (payload.get("source_url") or "").strip()
-                        
-                        is_placeholder_title = source_title.lower().startswith("resultat de cerca sobre:")
-                        
-                        if (
-                            is_placeholder_title
-                            or not source_url
-                            or not source_url.startswith(("https://", "http://"))
-                        ):
-                            counters["items_skipped"] += 1
-                            logger.warning(
-                                "Entrada descartada: font no verificable o placeholder. "
-                                "title=%r, url=%r",
-                                source_title,
-                                source_url,
-                            )
-                            continue
-                        
-                        # 9. Mode dry_run: validar i comptar, però no inserir
-                        if dry_run:
-                            counters["items_skipped"] += 1
-                            continue
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            for result in search_results:
+                try:
+                    payload = {
+                        "source_url": result["url"],
+                        "source_domain": urlparse(result["url"]).netloc.lower(),
+                        "source_title": result["title"],
+                        "source_type": "web_search",
+                        "source_language": result.get("language") or "ca",
+                        "ingest_method": "web_search",
+                        "external_id": None,
+                        "author_name": None,
+                        "canonical_url": result["url"],
+                        "published_date": result.get("published_date"),
+                        "detected_at": utc_now().isoformat(),
+                        "country_region": None,
+                        "institution_type": None,
+                        "raw_snippet": result.get("why_relevant", ""),
+                        "raw_content": result.get("why_relevant", ""),
+                        "raw_content_format": "text",
+                        "raw_payload": {
+                            "search_brief": brief,
+                            "search_date_range": date_range,
+                            "search_result": result,
+                        },
+                        "review_status": "NEW",
+                    }
 
-                        new_entry_id = insert_entry(cur, payload, dedup_key)
-                        counters["items_created"] += 1
-                        conn.commit()
+                    dedup_key = build_dedup_key(payload)
 
-                        enrichment_result = run_entry_enrichment(entry_id=new_entry_id, skip_input=True)
-                        if enrichment_result["status"] == "error":
-                            counters["items_failed"] += 1
-                        
-                    except Exception as exc:
-                        counters["items_failed"] += 1
-                        logger.exception(
-                            "Error processant resultat de cerca temàtica: %s",
-                            exc,
+                    existing_entry_id = entry_exists(cur, dedup_key)
+                    if existing_entry_id is not None:
+                        cur.execute(
+                            """
+                            SELECT s.id, s.name, s.domain
+                            FROM public.sources s
+                            WHERE s.domain = %s
+                              AND s.status = 'ACTIVE'
+                            LIMIT 1
+                            """,
+                            (payload["source_domain"],)
                         )
-            
+                        monitored_source = cur.fetchone()
+
+                        if monitored_source:
+                            counters["items_duplicates_monitored"].append(existing_entry_id)
+                            warnings.append(
+                                f"Font ja monitoritzada ({monitored_source['domain']}): "
+                                f"entry existent id={existing_entry_id}"
+                            )
+                        else:
+                            counters["items_duplicates"].append(existing_entry_id)
+
+                        continue
+
+                    source_title = (payload.get("source_title") or "").strip()
+                    source_url = (payload.get("source_url") or "").strip()
+
+                    is_placeholder_title = source_title.lower().startswith("resultat de cerca sobre:")
+
+                    if (
+                        is_placeholder_title
+                        or not source_url
+                        or not source_url.startswith(("https://", "http://"))
+                    ):
+                        counters["items_skipped"] += 1
+                        logger.warning(
+                            "Entrada descartada: font no verificable o placeholder. "
+                            "title=%r, url=%r",
+                            source_title,
+                            source_url,
+                        )
+                        continue
+
+                    if dry_run:
+                        counters["items_skipped"] += 1
+                        continue
+
+                    new_entry_id = insert_entry(cur, payload, dedup_key)
+                    counters["items_created"] += 1
+                    conn.commit()
+
+                    enrichment_result = run_entry_enrichment(entry_id=new_entry_id, skip_input=True)
+                    if enrichment_result["status"] == "error":
+                        counters["items_failed"] += 1
+
+                except Exception as exc:
+                    counters["items_failed"] += 1
+                    logger.exception(
+                        "Error processant resultat de cerca temàtica: %s",
+                        exc,
+                    )
+
             if not dry_run:
                 conn.commit()
-        finally:
-            conn.close()
-        
+
         logger.info(
             "Cerca temàtica finalitzada: %s",
             json.dumps(counters, ensure_ascii=False),
         )
-        
-        # Afegir warnings al resultat final
+
         return {**counters, "warnings": warnings}
-    
+
     except Exception as exc:
         logger.exception("Error en cerca temàtica: %s", exc)
         counters["items_failed"] += 1
         return {**counters, "warnings": warnings, "error": str(exc)}
+    finally:
+        conn.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1198,9 +1088,9 @@ def run(
                                 logger.info(f"DRY RUN nova entry {source_name} {payload['source_title']}")
                                 continue
 
-                            new_entry_id = insert_entry(cur, payload, dedup_key)  # cal que retorni l'id (veure nota)
+                            new_entry_id = insert_entry(cur, payload, dedup_key)
                             counters["items_created"] += 1
-                            conn.commit()  # cal fer commit abans de cridar l'enriquiment perquè la fila existeixi
+                            conn.commit()
 
                             enrichment_result = run_entry_enrichment(entry_id=new_entry_id, skip_input=False)
                             if enrichment_result["status"] == "discarded":
@@ -1228,7 +1118,6 @@ def run(
                         source["feed_url"],
                         exc,
                     )
-
                     if not dry_run:
                         conn.rollback()
                         update_source_error(cur, source["id"], str(exc))
@@ -1262,6 +1151,7 @@ def run(
                 "Crawler finalitzat: %s",
                 json.dumps(counters, ensure_ascii=False),
             )
+
             return counters
 
     except Exception:
