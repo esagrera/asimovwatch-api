@@ -1,9 +1,12 @@
+import logging
 import os
 import time
 from functools import lru_cache
 from typing import Optional
 
 import anthropic
+
+logger = logging.getLogger("asimovwatch.llm.claude")
 
 FALLBACK_MODELS = [
     {"name": "claude-3.5-sonnet", "stable": True},
@@ -61,12 +64,25 @@ def call_claude_client(
 
     try:
         try:
-            response = client.messages.create(temperature=temperature, **request_kwargs)
-        except anthropic.BadRequestError as e:
-            if "temperature" in str(e) and "deprecated" in str(e).lower():
+            response = client.messages.create(
+                temperature=temperature,
+                **request_kwargs,
+            )
+        except (TypeError, anthropic.BadRequestError) as e:
+            error_text = str(e).lower()
+
+            if "temperature" in error_text and (
+                "unexpected keyword argument" in error_text
+                or "deprecated" in error_text
+            ):
+                logger.warning(
+                    "L'SDK Anthropic no accepta temperature; "
+                    "es fa la crida a Claude sense aquest paràmetre."
+                )
                 response = client.messages.create(**request_kwargs)
             else:
                 raise
+
     except Exception as e:
         raise RuntimeError(f"Claude request failed: {str(e)}") from e
 
