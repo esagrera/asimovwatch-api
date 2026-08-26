@@ -545,22 +545,46 @@ def _validate_and_normalize_final_output(
     return result
 
 
-def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, Any]:
+def run_entry_enrichment(
+    entry_id: int,
+    skip_input: bool = False,
+    run_input: bool = True,
+    run_primary: bool = True,
+    run_output: bool = True,
+) -> Dict[str, Any]:
     """
     Servei únic d'enriquiment per a qualsevol entry, independentment de l'origen.
 
     skip_input=False -> aplica el gate Input abans de Primary (ús: crawler RSS)
     skip_input=True  -> salta Input, va directe a Primary (ús: cerca temàtica)
 
-    Pipeline complet: Input (opcional) -> Primary -> Output.
-    Totes les crides LLM passen per call_llm_for_prompt(), exactament igual
-    que la resta de prompts del sistema (llm_model_advisor, Source
-    candidates discovery, Source candidate evaluation, Thematic entry
-    discovery). Això garanteix provider/model correctes, fallback automàtic
-    i registre d'errors uniformes, independentment del provider configurat
-    a public.llm_runtime_config per a cada prompt.
+    run_input / run_primary / run_output permeten executar només un subconjunt
+    de fases (ús: endpoint de prova /entries/{id}/reenrich). Per defecte les
+    tres són True i el comportament és idèntic al pipeline complet habitual.
 
-    Retorna: {"status": "enriched" | "discarded" | "error", "entry_id": ..., "detail": ...}
+    Notes sobre l'ús combinat de skip_input i run_input:
+    - skip_input=True té prioritat: mai s'executa Input encara que
+      run_input=True, igual que en el comportament original (cerca temàtica).
+    - Si run_input=False i skip_input=False, tampoc s'executa Input, però
+      NO es tracta com "cerca temàtica": simplement no s'aplica el gate de
+      relevància per a aquesta crida de prova. En aquest cas input_result
+      queda None i Primary construeix el seu input_text amb el fallback de
+      raw_content/raw_snippet.
+    - Si run_primary=False, el pipeline s'atura després d'Input (útil per
+      inspeccionar només el resultat d'Input sense gastar Primary/Output).
+    - Si run_output=False, el pipeline s'atura després de Primary i persisteix
+      directament el resultat de Primary (sense traduccions ni neteja
+      editorial), útil per depurar Primary de manera aïllada.
+
+    Totes les crides LLM (Input, Primary, Output) passen per
+    call_llm_for_prompt(), exactament igual que la resta de prompts del
+    sistema (llm_model_advisor, Source candidates discovery, Source
+    candidate evaluation, Thematic entry discovery). Això garanteix
+    provider/model correctes, fallback automàtic i registre d'errors
+    uniformes, independentment del provider configurat a
+    public.llm_runtime_config per a cada prompt.
+
+    Retorna: {"status": "enriched" | "discarded" | "stopped" | "error", "entry_id": ..., "detail": ...}
     """
     conn = get_connection()
     try:
@@ -571,8 +595,9 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                 return {"status": "error", "entry_id": entry_id, "detail": "Entry not found"}
 
             input_result = None
+            should_run_input = run_input and not skip_input
 
-            if not skip_input:
+            if should_run_input:
                 input_overrides = _build_input_overrides(entry)
                 llm_result = call_llm_for_prompt(
                     conn,
@@ -633,7 +658,17 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                 ))
                 conn.commit()
 
-            # Fase Primary (per a totes les entries que arriben aquí)
+            if not run_primary:
+                return {
+                    "status": "stopped",
+                    "entry_id": entry_id,
+                    "detail": {
+                        "stopped_after": "input" if should_run_input else "none",
+                        "input_result": input_result,
+                    },
+                }
+
+            # Fase Primary
             primary_input_text = _build_primary_input_text(entry, input_result)
             primary_llm_result = call_llm_for_prompt(
                 conn,
@@ -641,6 +676,58 @@ def run_entry_enrichment(entry_id: int, skip_input: bool = False) -> Dict[str, A
                 prompt_overrides={"{input_text}": primary_input_text},
             )
             primary_result = _parse_json_output(primary_llm_result["output"])
+
+            if not run_output:
+                # Persisteix directament el resultat de Primary, sense
+                # traduccions ni neteja editorial (Output no s'executa).
+                interim_result = _validate_and_normalize_final_output(primary_result, dict(primary_result))
+                cur.execute("""
+                    UPDATE public.entries SET
+                        processing_status = 'ENRICHED',
+                        summary_factual = %s,
+                        why_it_matters = %s,
+                        theme_tags = %s,
+                        affected_principles = %s,
+                        risk_level = %s,
+                        debate_questions = %s,
+                        confidence_notes = %s,
+                        human_protection_declared = %s,
+                        human_protection_verifiable = %s,
+                        human_protection_depth = %s,
+                        human_protection_notes = %s,
+                        entry_category = %s,
+                        analyzed_provider = %s,
+                        analyzed_model = %s,
+                        bihp_directives = %s,
+                        enriched_model = %s,
+                        enriched_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (
+                    interim_result.get("summary_factual"),
+                    interim_result.get("why_it_matters"),
+                    interim_result.get("theme_tags"),
+                    interim_result.get("affected_principles"),
+                    interim_result.get("risk_level"),
+                    interim_result.get("debate_questions"),
+                    interim_result.get("confidence_notes"),
+                    interim_result.get("human_protection_declared"),
+                    interim_result.get("human_protection_verifiable"),
+                    interim_result.get("human_protection_depth"),
+                    interim_result.get("human_protection_notes"),
+                    interim_result.get("entry_category"),
+                    interim_result.get("analyzed_provider"),
+                    interim_result.get("analyzed_model"),
+                    psycopg2.extras.Json(interim_result.get("bihp_directives") or []),
+                    primary_llm_result["model_used"],
+                    entry_id,
+                ))
+                conn.commit()
+                return {
+                    "status": "stopped",
+                    "entry_id": entry_id,
+                    "detail": {"stopped_after": "primary", "primary_result": primary_result},
+                }
 
             # Fase Output: crida LLM pròpia (traducció ca + neteja editorial).
             # Rep el JSON complet de Primary, no el contingut original.
