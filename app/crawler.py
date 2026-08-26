@@ -412,14 +412,37 @@ def record_crawler_log(
 # d'API key / base_url per provider.
 # =========================================================================
 
-VALID_ENTRY_CATEGORIES = {
-    "ai_ethics",
-    "regulation_frameworks",
-    "safety_control_oversight",
-    "digital_rights",
-    "human_protection_bihp",
-    "incidents",
-    "other",
+ENTRY_CATEGORY_ALIASES = {
+    "ai ethics": "ai_ethics",
+    "ai-ethics": "ai_ethics",
+    "ai_ethics": "ai_ethics",
+
+    "regulation": "regulation_frameworks",
+    "regulatory frameworks": "regulation_frameworks",
+    "regulatory_frameworks": "regulation_frameworks",
+    "regulation-frameworks": "regulation_frameworks",
+    "regulation_frameworks": "regulation_frameworks",
+
+    "safety": "safety_control_oversight",
+    "safety control": "safety_control_oversight",
+    "safety oversight": "safety_control_oversight",
+    "safety-control-oversight": "safety_control_oversight",
+    "safety control oversight": "safety_control_oversight",
+    "safety_control_oversight": "safety_control_oversight",
+
+    "digital rights": "digital_rights",
+    "digital-rights": "digital_rights",
+    "digital_rights": "digital_rights",
+
+    "bihp": "human_protection_bihp",
+    "human protection": "human_protection_bihp",
+    "human-protection-bihp": "human_protection_bihp",
+    "human_protection_bihp": "human_protection_bihp",
+
+    "incident": "incidents",
+    "incidents": "incidents",
+
+    "other": "other",
 }
 
 VALID_BIHP_LABELS = {"green", "yellow", "red", "unknown"}
@@ -484,25 +507,57 @@ Contingut per analitzar:
 {clean_text}"""
 
 
-def _parse_json_output(raw_text: str) -> Dict[str, Any]:
-    """
-    Neteja i parseja la sortida JSON d'un LLM, seguint el mateix patró
-    ja usat a _parse_search_results() per retirar embolcalls ```json.
-    """
+def _parse_json_output(raw_text: str, phase: str = "unknown") -> Dict[str, Any]:
+    if not raw_text or not raw_text.strip():
+        raise ValueError(f"La fase {phase} ha retornat una resposta buida.")
+
     cleaned = raw_text.strip()
+
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
     elif cleaned.startswith("```"):
         cleaned = cleaned[3:]
+
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
 
+    cleaned = cleaned.strip()
+
     try:
-        return json.loads(cleaned.strip())
-    except json.JSONDecodeError as exc:
-        logger.error(f"JSON invàlid retornat pel LLM: {exc}")
-        logger.error(f"Contingut rebut: {cleaned[:500]}")
-        raise ValueError("El model ha retornat JSON invàlid. Revisa els logs per més detalls.") from exc
+        return json.loads(cleaned)
+    except json.JSONDecodeError as first_exc:
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+
+        if first_brace != -1 and last_brace > first_brace:
+            candidate = cleaned[first_brace:last_brace + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+        logger.error(
+            "JSON invàlid retornat a la fase %s: %s; chars=%s",
+            phase,
+            first_exc,
+            len(cleaned),
+        )
+        logger.error("Contingut rebut a %s: %s", phase, cleaned[:1000])
+
+        likely_truncated = (
+            cleaned.count("{") > cleaned.count("}")
+            or "unterminated string" in str(first_exc).lower()
+        )
+
+        if likely_truncated:
+            raise ValueError(
+                f"La resposta de la fase {phase} sembla truncada o ha superat max_tokens. "
+                "Augmenta max_tokens o redueix la mida de la sortida requerida."
+            ) from first_exc
+
+        raise ValueError(
+            f"La fase {phase} ha retornat JSON invàlid. Revisa els logs per més detalls."
+        ) from first_exc
 
 
 def _validate_and_normalize_final_output(
@@ -530,10 +585,17 @@ def _validate_and_normalize_final_output(
 
     notes = result.get("confidence_notes") or ""
 
-    category = result.get("entry_category")
-    if category not in VALID_ENTRY_CATEGORIES:
-        notes += f" [Avís: entry_category '{category}' no vàlid, forçat a 'other'.]"
+    raw_category = str(result.get("entry_category") or "").strip().lower()
+    normalized_category = ENTRY_CATEGORY_ALIASES.get(raw_category, raw_category)
+
+    if normalized_category not in VALID_ENTRY_CATEGORIES:
+        notes += (
+            f" [Avís: entry_category '{raw_category}' no vàlid, "
+            "forçat a 'other'.]"
+        )
         result["entry_category"] = "other"
+    else:
+        result["entry_category"] = normalized_category
 
     for field in ("human_protection_declared", "human_protection_verifiable", "human_protection_depth"):
         value = result.get(field)
@@ -617,8 +679,6 @@ def run_entry_enrichment(
                             ready_for_primary = %s,
                             input_quality = %s,
                             input_quality_notes = %s,
-                            raw_content = NULL,
-                            raw_payload = NULL,
                             updated_at = NOW()
                         WHERE id = %s
                     """, (
@@ -633,11 +693,18 @@ def run_entry_enrichment(
                     return {"status": "discarded", "entry_id": entry_id, "detail": input_result}
 
                 # yes / unclear -> guardar resultat d'Input i continuar
+                raw_snippet_original = (
+                    entry.get("raw_snippet_original")
+                    or entry.get("raw_snippet")
+                    or entry.get("raw_content")
+                )
+                
                 cur.execute("""
                     UPDATE public.entries SET
                         input_relevance = %s,
                         input_relevance_reason = %s,
                         ready_for_primary = %s,
+                        raw_snippet_original = COALESCE(raw_snippet_original, %s),
                         clean_input_text = %s,
                         input_summary = %s,
                         input_quality = %s,
@@ -649,6 +716,7 @@ def run_entry_enrichment(
                     input_result.get("input_relevance"),
                     input_result.get("input_relevance_reason"),
                     ready,
+                    raw_snippet_original,
                     input_result.get("clean_input_text"),
                     input_result.get("input_summary"),
                     input_result.get("input_quality"),
@@ -684,6 +752,7 @@ def run_entry_enrichment(
                 cur.execute("""
                     UPDATE public.entries SET
                         processing_status = 'ENRICHED',
+                        processing_error = NULL,
                         summary_factual = %s,
                         why_it_matters = %s,
                         theme_tags = %s,
@@ -746,6 +815,7 @@ def run_entry_enrichment(
             cur.execute("""
                 UPDATE public.entries SET
                     processing_status = 'ENRICHED',
+                    processing_error = NULL,
                     summary_factual = %s,
                     why_it_matters = %s,
                     theme_tags = %s,
