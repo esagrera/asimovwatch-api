@@ -412,6 +412,18 @@ def record_crawler_log(
 # d'API key / base_url per provider.
 # =========================================================================
 
+VALID_ENTRY_CATEGORIES = {
+    "ai_ethics",
+    "regulation_frameworks",
+    "safety_control_oversight",
+    "digital_rights",
+    "human_protection_bihp",
+    "incidents",
+    "other",
+}
+
+VALID_BIHP_LABELS = {"green", "yellow", "red", "unknown"}
+
 ENTRY_CATEGORY_ALIASES = {
     "ai ethics": "ai_ethics",
     "ai-ethics": "ai_ethics",
@@ -445,9 +457,6 @@ ENTRY_CATEGORY_ALIASES = {
     "other": "other",
 }
 
-VALID_BIHP_LABELS = {"green", "yellow", "red", "unknown"}
-
-
 def _build_input_overrides(entry: Dict[str, Any]) -> Dict[str, str]:
     """
     Prepara els prompt_overrides per al prompt "Input", que espera 8
@@ -480,14 +489,31 @@ def _build_primary_input_text(entry: Dict[str, Any], input_result: Optional[Dict
         clean_text = input_result.get("clean_input_text") or entry.get("raw_content") or entry.get("raw_snippet") or ""
         summary = input_result.get("input_summary") or ""
         source_note = "Origen: ingesta RSS/Atom, processada prèviament per la fase Input."
-    else:
-        raw_payload = entry.get("raw_payload") or {}
-        search_result = raw_payload.get("search_result") or {}
-        why_relevant = search_result.get("why_relevant") or entry.get("raw_snippet") or ""
-        search_brief = raw_payload.get("search_brief") or ""
-        clean_text = why_relevant
-        summary = f"Cerca temàtica motivada pel brief: {search_brief}" if search_brief else ""
-        source_note = "Origen: cerca temàtica (web_search), sense pas previ per la fase Input."
+        else:
+            raw_payload = entry.get("raw_payload") or {}
+            search_result = raw_payload.get("search_result") or {}
+
+            clean_text = (
+                search_result.get("why_relevant")
+                or entry.get("raw_content")
+                or entry.get("raw_snippet")
+                or ""
+            )
+
+            search_brief = raw_payload.get("search_brief") or ""
+
+            if entry.get("ingest_method") == "web_search":
+                summary = (
+                    f"Cerca temàtica motivada pel brief: {search_brief}"
+                    if search_brief
+                    else ""
+                )
+                source_note = (
+                    "Origen: cerca temàtica (web_search), sense pas previ per la fase Input."
+                )
+            else:
+                summary = ""
+                source_note = "Origen: entrada processada sense executar la fase Input."
 
     return f"""Metadades de la peça:
 source_url: {entry.get('source_url', '')}
