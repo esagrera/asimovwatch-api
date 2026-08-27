@@ -187,10 +187,18 @@ class EntryEnrich(BaseModel):
     bihp_directives: Optional[list] = None
 
 class EntryReenrichRequest(BaseModel):
+    """
+    Control de fases per a POST /entries/{entry_id}/reenrich.
+
+    persist=True (defecte): mode operatiu; escriu el resultat a public.entries.
+    persist=False: mode de prova; no modifica l'entry ni en cas d'èxit ni en
+    cas d'error, i retorna les sortides de les fases executades.
+    """
     skip_input: bool = False
     run_input: bool = True
     run_primary: bool = True
     run_output: bool = True
+    persist: bool = True
 
 class ConfigUpdate(BaseModel):
     value: str
@@ -643,27 +651,20 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
 # ─── REENRICH ENTRY TEST ──────────────────────────────────────────────────────────────
 
 @protected_router.post("/entries/{entry_id}/reenrich")
-def reenrich_entry(entry_id: int, body: EntryReenrichRequest = EntryReenrichRequest()):
+def reenrich_entry(entry_id: int, body: EntryReenrichRequest):
     """
-    Endpoint de prova/depuració per re-executar el pipeline d'enriquiment
-    (Input -> Primary -> Output) sobre una entry ja existent, sense passar
-    pel crawler RSS ni per la cerca temàtica.
+    Re-executa el pipeline d'enriquiment (Input -> Primary -> Output) sobre
+    una entry existent, sense passar pel crawler RSS ni per la cerca temàtica.
 
-    Permet triar quines fases s'executen:
-    - skip_input=True: salta Input completament (com fa la cerca temàtica).
-    - run_input=False: no executa Input, però sense el significat de
-      "cerca temàtica" (input_result queda None per a la resta del pipeline).
-    - run_primary=False: s'atura després d'Input (o abans, si tampoc s'executa
-      Input). Útil per inspeccionar només el resultat d'Input.
-    - run_output=False: s'atura després de Primary, persistint el resultat
-      de Primary sense traduccions ni neteja editorial. Útil per depurar
-      Primary de manera aïllada.
+    Permet executar fases individualment o en combinació:
+    - run_input=False: no executa Input.
+    - run_primary=False: s'atura després d'Input.
+    - run_output=False: s'atura després de Primary.
+    - skip_input=True: equival al comportament de cerca temàtica; salta Input.
 
-    Útil per a proves puntuals de qualsevol fase i per a futures
-    verificacions quan es canviïn prompts, providers o models.
-
-    Retorna el mateix dict que run_entry_enrichment():
-    {"status": "enriched" | "discarded" | "stopped" | "error", "entry_id": ..., "detail": ...}
+    persist=False és segur per a proves de prompts, providers, models, parsers
+    i classificacions: no actualitza public.entries, no canvia processing_status,
+    no escriu processing_error i no incrementa processing_retries.
     """
     from app.crawler import run_entry_enrichment
 
@@ -673,6 +674,7 @@ def reenrich_entry(entry_id: int, body: EntryReenrichRequest = EntryReenrichRequ
         run_input=body.run_input,
         run_primary=body.run_primary,
         run_output=body.run_output,
+        persist=body.persist,
     )
 
     if result.get("status") == "error" and result.get("detail") == "Entry not found":

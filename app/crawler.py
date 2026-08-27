@@ -613,42 +613,21 @@ def run_entry_enrichment(
     run_input: bool = True,
     run_primary: bool = True,
     run_output: bool = True,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     """
-    Servei únic d'enriquiment per a qualsevol entry, independentment de l'origen.
+    Executa Input -> Primary -> Output per a una entry.
 
-    skip_input=False -> aplica el gate Input abans de Primary (ús: crawler RSS)
-    skip_input=True  -> salta Input, va directe a Primary (ús: cerca temàtica)
+    persist=True (defecte): comportament operatiu; persisteix estats, resultats
+    i errors a public.entries.
 
-    run_input / run_primary / run_output permeten executar només un subconjunt
-    de fases (ús: endpoint de prova /entries/{id}/reenrich). Per defecte les
-    tres són True i el comportament és idèntic al pipeline complet habitual.
-
-    Notes sobre l'ús combinat de skip_input i run_input:
-    - skip_input=True té prioritat: mai s'executa Input encara que
-      run_input=True, igual que en el comportament original (cerca temàtica).
-    - Si run_input=False i skip_input=False, tampoc s'executa Input, però
-      NO es tracta com "cerca temàtica": simplement no s'aplica el gate de
-      relevància per a aquesta crida de prova. En aquest cas input_result
-      queda None i Primary construeix el seu input_text amb el fallback de
-      raw_content/raw_snippet.
-    - Si run_primary=False, el pipeline s'atura després d'Input (útil per
-      inspeccionar només el resultat d'Input sense gastar Primary/Output).
-    - Si run_output=False, el pipeline s'atura després de Primary i persisteix
-      directament el resultat de Primary (sense traduccions ni neteja
-      editorial), útil per depurar Primary de manera aïllada.
-
-    Totes les crides LLM (Input, Primary, Output) passen per
-    call_llm_for_prompt(), exactament igual que la resta de prompts del
-    sistema (llm_model_advisor, Source candidates discovery, Source
-    candidate evaluation, Thematic entry discovery). Això garanteix
-    provider/model correctes, fallback automàtic i registre d'errors
-    uniformes, independentment del provider configurat a
-    public.llm_runtime_config per a cada prompt.
-
-    Retorna: {"status": "enriched" | "discarded" | "stopped" | "error", "entry_id": ..., "detail": ...}
+    persist=False: mode de prova. No modifica cap camp de public.entries, no
+    incrementa processing_retries i retorna les sortides de les fases per
+    inspecció. És segur per provar canvis de prompt, provider, model i parser.
     """
     conn = get_connection()
+    phase_results: Dict[str, Any] = {}
+
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM public.entries WHERE id = %s", (entry_id,))
@@ -660,95 +639,180 @@ def run_entry_enrichment(
             should_run_input = run_input and not skip_input
 
             if should_run_input:
-                input_overrides = _build_input_overrides(entry)
-                llm_result = call_llm_for_prompt(
+                input_llm_result = call_llm_for_prompt(
                     conn,
                     "Input",
-                    prompt_overrides=input_overrides,
+                    prompt_overrides=_build_input_overrides(entry),
                 )
-                input_result = _parse_json_output(llm_result["output"])
+                input_result = _parse_json_output(input_llm_result["output"], phase="Input")
+                phase_results["input"] = {
+                    "provider_used": input_llm_result["provider_used"],
+                    "model_used": input_llm_result["model_used"],
+                    "used_fallback": input_llm_result["used_fallback"],
+                    "result": input_result,
+                }
 
                 ready = input_result.get("ready_for_primary")
-
                 if ready == "no":
+                    if persist:
+                        cur.execute("""
+                            UPDATE public.entries SET
+                                processing_status = 'DISCARDED',
+                                processing_error = NULL,
+                                input_relevance = %s,
+                                input_relevance_reason = %s,
+                                ready_for_primary = %s,
+                                raw_snippet_original = COALESCE(raw_snippet_original, %s),
+                                input_quality = %s,
+                                input_quality_notes = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                        """, (
+                            input_result.get("input_relevance"),
+                            input_result.get("input_relevance_reason"),
+                            ready,
+                            entry.get("raw_snippet_original") or entry.get("raw_snippet") or entry.get("raw_content"),
+                            input_result.get("input_quality"),
+                            input_result.get("input_quality_notes"),
+                            entry_id,
+                        ))
+                        conn.commit()
+
+                    return {
+                        "status": "discarded",
+                        "entry_id": entry_id,
+                        "persisted": persist,
+                        "detail": phase_results,
+                    }
+
+                if persist:
                     cur.execute("""
                         UPDATE public.entries SET
-                            processing_status = 'DISCARDED',
                             input_relevance = %s,
                             input_relevance_reason = %s,
                             ready_for_primary = %s,
+                            raw_snippet_original = COALESCE(raw_snippet_original, %s),
+                            clean_input_text = %s,
+                            input_summary = %s,
                             input_quality = %s,
                             input_quality_notes = %s,
+                            source_language = COALESCE(%s, source_language),
                             updated_at = NOW()
                         WHERE id = %s
                     """, (
                         input_result.get("input_relevance"),
                         input_result.get("input_relevance_reason"),
                         ready,
+                        entry.get("raw_snippet_original") or entry.get("raw_snippet") or entry.get("raw_content"),
+                        input_result.get("clean_input_text"),
+                        input_result.get("input_summary"),
                         input_result.get("input_quality"),
                         input_result.get("input_quality_notes"),
+                        input_result.get("source_language"),
                         entry_id,
                     ))
                     conn.commit()
-                    return {"status": "discarded", "entry_id": entry_id, "detail": input_result}
-
-                # yes / unclear -> guardar resultat d'Input i continuar
-                raw_snippet_original = (
-                    entry.get("raw_snippet_original")
-                    or entry.get("raw_snippet")
-                    or entry.get("raw_content")
-                )
-                
-                cur.execute("""
-                    UPDATE public.entries SET
-                        input_relevance = %s,
-                        input_relevance_reason = %s,
-                        ready_for_primary = %s,
-                        raw_snippet_original = COALESCE(raw_snippet_original, %s),
-                        clean_input_text = %s,
-                        input_summary = %s,
-                        input_quality = %s,
-                        input_quality_notes = %s,
-                        source_language = COALESCE(%s, source_language),
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (
-                    input_result.get("input_relevance"),
-                    input_result.get("input_relevance_reason"),
-                    ready,
-                    raw_snippet_original,
-                    input_result.get("clean_input_text"),
-                    input_result.get("input_summary"),
-                    input_result.get("input_quality"),
-                    input_result.get("input_quality_notes"),
-                    input_result.get("source_language"),
-                    entry_id,
-                ))
-                conn.commit()
 
             if not run_primary:
                 return {
                     "status": "stopped",
                     "entry_id": entry_id,
+                    "persisted": persist,
                     "detail": {
                         "stopped_after": "input" if should_run_input else "none",
-                        "input_result": input_result,
+                        "phases": phase_results,
                     },
                 }
 
-            # Fase Primary
             primary_input_text = _build_primary_input_text(entry, input_result)
             primary_llm_result = call_llm_for_prompt(
                 conn,
                 "Primary",
                 prompt_overrides={"{input_text}": primary_input_text},
             )
-            primary_result = _parse_json_output(primary_llm_result["output"])
+            primary_result = _parse_json_output(primary_llm_result["output"], phase="Primary")
+            phase_results["primary"] = {
+                "provider_used": primary_llm_result["provider_used"],
+                "model_used": primary_llm_result["model_used"],
+                "used_fallback": primary_llm_result["used_fallback"],
+                "result": primary_result,
+            }
 
             if not run_output:
-                # Persisteix directament el resultat de Primary, sense
-                # traduccions ni neteja editorial (Output no s'executa).
                 interim_result = _validate_and_normalize_final_output(primary_result, dict(primary_result))
+
+                if persist:
+                    cur.execute("""
+                        UPDATE public.entries SET
+                            processing_status = 'ENRICHED',
+                            processing_error = NULL,
+                            summary_factual = %s,
+                            why_it_matters = %s,
+                            theme_tags = %s,
+                            affected_principles = %s,
+                            risk_level = %s,
+                            debate_questions = %s,
+                            confidence_notes = %s,
+                            human_protection_declared = %s,
+                            human_protection_verifiable = %s,
+                            human_protection_depth = %s,
+                            human_protection_notes = %s,
+                            entry_category = %s,
+                            analyzed_provider = %s,
+                            analyzed_model = %s,
+                            bihp_directives = %s,
+                            enriched_model = %s,
+                            enriched_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = %s
+                    """, (
+                        interim_result.get("summary_factual"),
+                        interim_result.get("why_it_matters"),
+                        interim_result.get("theme_tags"),
+                        interim_result.get("affected_principles"),
+                        interim_result.get("risk_level"),
+                        interim_result.get("debate_questions"),
+                        interim_result.get("confidence_notes"),
+                        interim_result.get("human_protection_declared"),
+                        interim_result.get("human_protection_verifiable"),
+                        interim_result.get("human_protection_depth"),
+                        interim_result.get("human_protection_notes"),
+                        interim_result.get("entry_category"),
+                        interim_result.get("analyzed_provider"),
+                        interim_result.get("analyzed_model"),
+                        psycopg2.extras.Json(interim_result.get("bihp_directives") or []),
+                        primary_llm_result["model_used"],
+                        entry_id,
+                    ))
+                    conn.commit()
+
+                return {
+                    "status": "stopped",
+                    "entry_id": entry_id,
+                    "persisted": persist,
+                    "detail": {
+                        "stopped_after": "primary",
+                        "phases": phase_results,
+                        "normalized_result": interim_result,
+                    },
+                }
+
+            output_llm_result = call_llm_for_prompt(
+                conn,
+                "Output",
+                prompt_overrides={"{input_text}": json.dumps(primary_result, ensure_ascii=False)},
+            )
+            output_result_raw = _parse_json_output(output_llm_result["output"], phase="Output")
+            phase_results["output"] = {
+                "provider_used": output_llm_result["provider_used"],
+                "model_used": output_llm_result["model_used"],
+                "used_fallback": output_llm_result["used_fallback"],
+                "result": output_result_raw,
+            }
+
+            final_result = _validate_and_normalize_final_output(primary_result, output_result_raw)
+
+            if persist:
                 cur.execute("""
                     UPDATE public.entries SET
                         processing_status = 'ENRICHED',
@@ -768,118 +832,72 @@ def run_entry_enrichment(
                         analyzed_provider = %s,
                         analyzed_model = %s,
                         bihp_directives = %s,
+                        translated_summary_ca = %s,
+                        translated_whyitmatters_ca = %s,
+                        translated_debatequestions_ca = %s,
                         enriched_model = %s,
                         enriched_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
                 """, (
-                    interim_result.get("summary_factual"),
-                    interim_result.get("why_it_matters"),
-                    interim_result.get("theme_tags"),
-                    interim_result.get("affected_principles"),
-                    interim_result.get("risk_level"),
-                    interim_result.get("debate_questions"),
-                    interim_result.get("confidence_notes"),
-                    interim_result.get("human_protection_declared"),
-                    interim_result.get("human_protection_verifiable"),
-                    interim_result.get("human_protection_depth"),
-                    interim_result.get("human_protection_notes"),
-                    interim_result.get("entry_category"),
-                    interim_result.get("analyzed_provider"),
-                    interim_result.get("analyzed_model"),
-                    psycopg2.extras.Json(interim_result.get("bihp_directives") or []),
-                    primary_llm_result["model_used"],
+                    final_result.get("summary_factual"),
+                    final_result.get("why_it_matters"),
+                    final_result.get("theme_tags"),
+                    final_result.get("affected_principles"),
+                    final_result.get("risk_level"),
+                    final_result.get("debate_questions"),
+                    final_result.get("confidence_notes"),
+                    final_result.get("human_protection_declared"),
+                    final_result.get("human_protection_verifiable"),
+                    final_result.get("human_protection_depth"),
+                    final_result.get("human_protection_notes"),
+                    final_result.get("entry_category"),
+                    final_result.get("analyzed_provider"),
+                    final_result.get("analyzed_model"),
+                    psycopg2.extras.Json(final_result.get("bihp_directives") or []),
+                    final_result.get("translated_summary_ca"),
+                    final_result.get("translated_whyitmatters_ca"),
+                    final_result.get("translated_debatequestions_ca"),
+                    output_llm_result["model_used"],
                     entry_id,
                 ))
                 conn.commit()
-                return {
-                    "status": "stopped",
-                    "entry_id": entry_id,
-                    "detail": {"stopped_after": "primary", "primary_result": primary_result},
-                }
 
-            # Fase Output: crida LLM pròpia (traducció ca + neteja editorial).
-            # Rep el JSON complet de Primary, no el contingut original.
-            output_llm_result = call_llm_for_prompt(
-                conn,
-                "Output",
-                prompt_overrides={"{input_text}": json.dumps(primary_result, ensure_ascii=False)},
-            )
-            output_result_raw = _parse_json_output(output_llm_result["output"])
-
-            # Combinar Output (camps traduïts/nets) + Primary (camps exclusius:
-            # entry_category, analyzed_provider, analyzed_model, bihp_directives)
-            # i validar contra els enums SQL abans de persistir.
-            final_result = _validate_and_normalize_final_output(primary_result, output_result_raw)
-
-            cur.execute("""
-                UPDATE public.entries SET
-                    processing_status = 'ENRICHED',
-                    processing_error = NULL,
-                    summary_factual = %s,
-                    why_it_matters = %s,
-                    theme_tags = %s,
-                    affected_principles = %s,
-                    risk_level = %s,
-                    debate_questions = %s,
-                    confidence_notes = %s,
-                    human_protection_declared = %s,
-                    human_protection_verifiable = %s,
-                    human_protection_depth = %s,
-                    human_protection_notes = %s,
-                    entry_category = %s,
-                    analyzed_provider = %s,
-                    analyzed_model = %s,
-                    bihp_directives = %s,
-                    translated_summary_ca = %s,
-                    translated_whyitmatters_ca = %s,
-                    translated_debatequestions_ca = %s,
-                    enriched_model = %s,
-                    enriched_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = %s
-            """, (
-                final_result.get("summary_factual"),
-                final_result.get("why_it_matters"),
-                final_result.get("theme_tags"),
-                final_result.get("affected_principles"),
-                final_result.get("risk_level"),
-                final_result.get("debate_questions"),
-                final_result.get("confidence_notes"),
-                final_result.get("human_protection_declared"),
-                final_result.get("human_protection_verifiable"),
-                final_result.get("human_protection_depth"),
-                final_result.get("human_protection_notes"),
-                final_result.get("entry_category"),
-                final_result.get("analyzed_provider"),
-                final_result.get("analyzed_model"),
-                psycopg2.extras.Json(final_result.get("bihp_directives") or []),
-                final_result.get("translated_summary_ca"),
-                final_result.get("translated_whyitmatters_ca"),
-                final_result.get("translated_debatequestions_ca"),
-                output_llm_result["model_used"],
-                entry_id,
-            ))
-            conn.commit()
-            return {"status": "enriched", "entry_id": entry_id, "detail": final_result}
+            return {
+                "status": "enriched",
+                "entry_id": entry_id,
+                "persisted": persist,
+                "detail": {
+                    "phases": phase_results,
+                    "final_result": final_result,
+                },
+            }
 
     except Exception as exc:
         conn.rollback()
-        try:
-            with conn.cursor() as cur2:
-                cur2.execute("""
-                    UPDATE public.entries SET
-                        processing_status = 'ERROR',
-                        processing_error = %s,
-                        processing_retries = COALESCE(processing_retries, 0) + 1,
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (str(exc), entry_id))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        logger.exception(f"Error enriquint entry {entry_id}: {exc}")
-        return {"status": "error", "entry_id": entry_id, "detail": str(exc)}
+        if persist:
+            try:
+                with conn.cursor() as cur2:
+                    cur2.execute("""
+                        UPDATE public.entries SET
+                            processing_status = 'ERROR',
+                            processing_error = %s,
+                            processing_retries = COALESCE(processing_retries, 0) + 1,
+                            updated_at = NOW()
+                        WHERE id = %s
+                    """, (str(exc), entry_id))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        logger.exception("Error enriquint entry %s (persist=%s): %s", entry_id, persist, exc)
+        return {
+            "status": "error",
+            "entry_id": entry_id,
+            "persisted": persist,
+            "detail": str(exc),
+            "phases_completed": phase_results,
+        }
     finally:
         conn.close()
 
