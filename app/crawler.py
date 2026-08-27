@@ -478,42 +478,52 @@ def _build_input_overrides(entry: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-def _build_primary_input_text(entry: Dict[str, Any], input_result: Optional[Dict[str, Any]]) -> str:
+def _build_primary_input_text(
+    entry: Dict[str, Any],
+    input_result: Optional[Dict[str, Any]],
+) -> str:
     """
     Construeix el text que substitueix l'únic placeholder {input_text} del
     prompt "Primary".
     - Si input_result no és None (via RSS + Input): usa clean_input_text/input_summary.
-    - Si input_result és None (via cerca temàtica): usa raw_snippet/why_relevant + search_brief.
+    - Si input_result és None: usa el contingut disponible directament.
     """
     if input_result is not None:
-        clean_text = input_result.get("clean_input_text") or entry.get("raw_content") or entry.get("raw_snippet") or ""
+        clean_text = (
+            input_result.get("clean_input_text")
+            or entry.get("raw_content")
+            or entry.get("raw_snippet")
+            or ""
+        )
         summary = input_result.get("input_summary") or ""
-        source_note = "Origen: ingesta RSS/Atom, processada prèviament per la fase Input."
-        else:
-            raw_payload = entry.get("raw_payload") or {}
-            search_result = raw_payload.get("search_result") or {}
+        source_note = (
+            "Origen: ingesta RSS/Atom, processada prèviament per la fase Input."
+        )
+    else:
+        raw_payload = entry.get("raw_payload") or {}
+        search_result = raw_payload.get("search_result") or {}
 
-            clean_text = (
-                search_result.get("why_relevant")
-                or entry.get("raw_content")
-                or entry.get("raw_snippet")
-                or ""
+        clean_text = (
+            search_result.get("why_relevant")
+            or entry.get("raw_content")
+            or entry.get("raw_snippet")
+            or ""
+        )
+
+        search_brief = raw_payload.get("search_brief") or ""
+
+        if entry.get("ingest_method") == "web_search":
+            summary = (
+                f"Cerca temàtica motivada pel brief: {search_brief}"
+                if search_brief
+                else ""
             )
-
-            search_brief = raw_payload.get("search_brief") or ""
-
-            if entry.get("ingest_method") == "web_search":
-                summary = (
-                    f"Cerca temàtica motivada pel brief: {search_brief}"
-                    if search_brief
-                    else ""
-                )
-                source_note = (
-                    "Origen: cerca temàtica (web_search), sense pas previ per la fase Input."
-                )
-            else:
-                summary = ""
-                source_note = "Origen: entrada processada sense executar la fase Input."
+            source_note = (
+                "Origen: cerca temàtica (web_search), sense pas previ per la fase Input."
+            )
+        else:
+            summary = ""
+            source_note = "Origen: entrada processada sense executar la fase Input."
 
     return f"""Metadades de la peça:
 source_url: {entry.get('source_url', '')}
