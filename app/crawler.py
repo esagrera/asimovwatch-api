@@ -50,6 +50,69 @@ def clean_text(value: Any) -> Optional[str]:
         BeautifulSoup(text, "html.parser").get_text(" ").split()
     )
 
+def entry_declared_language(entry: Any) -> Optional[str]:
+    """
+    Retorna el llenguatge declarat al feed per a una entry concreta.
+    Mira:
+    - entry.language
+    - entry.content[0].language
+    - entry.summary_detail.language
+    """
+    direct_language = entry.get("language")
+    if direct_language:
+        return str(direct_language).strip().lower()[:10]
+
+    content_items = entry.get("content") or []
+    for item in content_items:
+        language = item.get("language")
+        if language:
+            return str(language).strip().lower()[:10]
+
+    summary_detail = entry.get("summary_detail") or {}
+    language = summary_detail.get("language")
+    if language:
+        return str(language).strip().lower()[:10]
+
+    return None
+
+def detect_language_fallback(text: Optional[str]) -> Optional[str]:
+    """
+    Detecció conservadora per a feeds sense language declarat.
+    No substitueix una detecció lingüística completa.
+    """
+    if not text:
+        return None
+
+    lowered = text.lower()
+
+    catalan_markers = (
+        " el ", " la ", " els ", " les ", " una ", " amb ",
+        " per ", " que ", " dels ", " sobre ",
+    )
+    spanish_markers = (
+        " el ", " la ", " los ", " las ", " una ", " con ",
+        " para ", " que ", " del ", " sobre ",
+    )
+
+    catalan_score = sum(lowered.count(marker) for marker in catalan_markers)
+    spanish_score = sum(lowered.count(marker) for marker in spanish_markers)
+
+    if catalan_score > spanish_score and catalan_score >= 2:
+        return "ca"
+
+    if spanish_score > catalan_score and spanish_score >= 2:
+        return "es"
+
+    english_markers = (
+        " the ", " and ", " of ", " to ", " with ",
+        " for ", " from ", " ai ", " research ",
+    )
+    english_score = sum(lowered.count(marker) for marker in english_markers)
+
+    if english_score >= 2:
+        return "en"
+
+    return None
 
 def parse_date(value: Any) -> Optional[datetime]:
     if not value:
@@ -214,7 +277,11 @@ def entry_payload(source: Dict[str, Any], entry: Any) -> Optional[Dict[str, Any]
         "source_domain": source_domain,
         "source_title": title,
         "source_type": source.get("source_type") or "rss",
-        "source_language": source.get("language_default"),
+        "source_language": (
+            source.get("language_default")
+            or entry_declared_language(entry)
+            or detect_language_fallback(summary)
+        ),
         "ingest_method": "rss",
         "external_id": external_id,
         "author_name": author,
@@ -721,7 +788,18 @@ def run_entry_enrichment(
                         "detail": phase_results,
                     }
 
-                if persist:
+                # Càlcul de detected_language per a source_language
+                detected_language = (
+                    input_result.get("source_language")
+                    or entry.get("source_language")
+                    or detect_language_fallback(
+                        input_result.get("clean_input_text")
+                        or entry.get("raw_content")
+                        or entry.get("raw_snippet")
+                    )
+                )
+
+                if persist:    
                     cur.execute("""
                         UPDATE public.entries SET
                             input_relevance = %s,
@@ -744,7 +822,7 @@ def run_entry_enrichment(
                         input_result.get("input_summary"),
                         input_result.get("input_quality"),
                         input_result.get("input_quality_notes"),
-                        input_result.get("source_language"),
+                        detected_language,
                         entry_id,
                     ))
                     conn.commit()
@@ -1248,7 +1326,7 @@ def run(
     dry_run: bool = False,
     source_id: Optional[int] = None,
     limit_per_source: int = MAX_ENTRIES_PER_SOURCE,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     started_at = utc_now()
     counters = {
         "sources_checked": 0,
@@ -1258,6 +1336,8 @@ def run(
         "items_discarded_by_relevance": 0,
         "items_skipped": 0,
         "items_failed": 0,
+        "items_enriched": 0,
+        "items_left_raw": 0,
     }
 
     sources = get_active_rss_sources(source_id=source_id)
@@ -1303,11 +1383,26 @@ def run(
                             counters["items_created"] += 1
                             conn.commit()
 
-                            enrichment_result = run_entry_enrichment(entry_id=new_entry_id, skip_input=False)
-                            if enrichment_result["status"] == "discarded":
-                                counters["items_discarded_by_relevance"] = counters.get("items_discarded_by_relevance", 0) + 1
-                            elif enrichment_result["status"] == "error":
+                            enrichment_result = run_entry_enrichment(
+                                entry_id=new_entry_id,
+                                skip_input=False,
+                            )
+
+                            enrichment_status = enrichment_result.get("status")
+
+                            if enrichment_status == "enriched":
+                                counters["items_enriched"] = counters.get("items_enriched", 0) + 1
+                            elif enrichment_status == "discarded":
+                                counters["items_discarded_by_relevance"] += 1
+                            elif enrichment_status == "error":
                                 counters["items_failed"] += 1
+                            else:
+                                counters["items_left_raw"] = counters.get("items_left_raw", 0) + 1
+                                logger.error(
+                                    "Entry %s ha acabat amb estat inesperat després de l'enriquiment: %s",
+                                    new_entry_id,
+                                    enrichment_status,
+                                )
 
                         except Exception as exc:
                             counters["items_failed"] += 1
