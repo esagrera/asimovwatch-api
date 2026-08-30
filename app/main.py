@@ -398,11 +398,11 @@ def get_entry_diagnostics(
     source_domain: Optional[str] = None,
 ):
     """
-    Diagnòstic d'entries penjades o incompletes al pipeline
+    Diagnò···stic d'entries penjades o incompletes al pipeline
     (RAW, ERROR, o ENRICHED amb camps clau buits).
 
-    No modifica cap dada; només informa. Pensat per al procés
-    de validació humana i per decidir si cal reprocessar amb
+    No modifica cap dada; nomé··s informa. Pensat per al procé··s
+    de validació··· humana i per decidir si cal reprocessar amb
     POST /entries/{entry_id}/reenrich.
     """
     conn = get_connection()
@@ -450,6 +450,10 @@ def get_entry_diagnostics(
             "THEN 'invalid_llm_json_output' "
             "WHEN processing_status = 'ERROR' "
             "THEN 'pipeline_error_other' "
+            "WHEN processing_status = 'ENRICHED' "
+            "AND summary_factual IS NOT NULL "
+            "AND why_it_matters IS NOT NULL "
+            "THEN 'enrichment_complete' "
             "WHEN processing_status = 'ENRICHED' "
             "AND (summary_factual IS NULL OR why_it_matters IS NULL) "
             "THEN 'incomplete_enrichment' "
