@@ -422,56 +422,52 @@ def get_entry_diagnostics(
             filters.append("LOWER(source_domain) = LOWER(%s)")
             params.append(source_domain)
 
-        where_clause = "WHERE " + " AND ".join(filters)
+        where_sql = " AND ".join(filters)
 
-        query = f"""
-            SELECT
-                id,
-                source_title,
-                source_domain,
-                ingested_at,
-                updated_at,
-                processing_status,
-                processing_error,
-                processing_retries,
-                input_relevance,
-                ready_for_primary,
-                entry_category,
-                enriched_model,
-                enriched_at,
-                CASE
-                    WHEN processing_status = 'RAW'
-                         AND input_relevance IS NULL
-                         AND ready_for_primary IS NULL
-                        THEN 'no_input_executed'
-                    WHEN processing_status = 'RAW'
-                         AND input_relevance IS NOT NULL
-                         AND ready_for_primary IN ('yes', 'unclear')
-                        THEN 'stalled_after_input_before_primary'
-                    WHEN processing_status = 'ERROR'
-                         AND processing_error ILIKE '%%ANTHROPIC%%'
-                        THEN 'missing_provider_credentials'
-                    WHEN processing_status = 'ERROR'
-                         AND processing_error ILIKE '%%timeout%%'
-                        THEN 'llm_timeout'
-                    WHEN processing_status = 'ERROR'
-                         AND processing_error ILIKE '%%JSON%%'
-                        THEN 'invalid_llm_json_output'
-                    WHEN processing_status = 'ERROR'
-                        THEN 'pipeline_error_other'
-                    WHEN processing_status = 'ENRICHED'
-                         AND (summary_factual IS NULL OR why_it_matters IS NULL)
-                        THEN 'incomplete_enrichment'
-                    ELSE 'unknown'
-                END AS diagnosis
-            FROM public.entries
-            {where_clause}
-            ORDER BY ingested_at DESC NULLS LAST, id DESC
-            LIMIT %s
-        """
-        params.append(safe_limit)
+        base_query = (
+            "SELECT "
+            "id, source_title, source_domain, ingested_at, updated_at, "
+            "processing_status, processing_error, processing_retries, "
+            "input_relevance, ready_for_primary, entry_category, "
+            "enriched_model, enriched_at, "
+            "CASE "
+            "WHEN processing_status = 'RAW' "
+            "AND input_relevance IS NULL "
+            "AND ready_for_primary IS NULL "
+            "THEN 'no_input_executed' "
+            "WHEN processing_status = 'RAW' "
+            "AND input_relevance IS NOT NULL "
+            "AND ready_for_primary IN ('yes', 'unclear') "
+            "THEN 'stalled_after_input_before_primary' "
+            "WHEN processing_status = 'ERROR' "
+            "AND processing_error ILIKE %s "
+            "THEN 'missing_provider_credentials' "
+            "WHEN processing_status = 'ERROR' "
+            "AND processing_error ILIKE %s "
+            "THEN 'llm_timeout' "
+            "WHEN processing_status = 'ERROR' "
+            "AND processing_error ILIKE %s "
+            "THEN 'invalid_llm_json_output' "
+            "WHEN processing_status = 'ERROR' "
+            "THEN 'pipeline_error_other' "
+            "WHEN processing_status = 'ENRICHED' "
+            "AND (summary_factual IS NULL OR why_it_matters IS NULL) "
+            "THEN 'incomplete_enrichment' "
+            "ELSE 'unknown' "
+            "END AS diagnosis "
+            "FROM public.entries "
+            "WHERE " + where_sql + " "
+            "ORDER BY ingested_at DESC NULLS LAST, id DESC "
+            "LIMIT %s"
+        )
 
-        cur.execute(query, params)
+        like_anthropic = "%ANTHROPIC%"
+        like_timeout = "%timeout%"
+        like_json = "%JSON%"
+
+        full_params = [like_anthropic, like_timeout, like_json] + params + [safe_limit]
+
+        cur.execute(base_query, full_params)
         rows = cur.fetchall()
 
         summary: dict = {}
