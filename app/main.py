@@ -391,6 +391,105 @@ def list_pending_enrichment(limit: int = 50):
         cur.close()
         conn.close()
 
+@protected_router.get("/entries/diagnostics")
+def get_entry_diagnostics(
+    status: Optional[str] = None,
+    limit: int = 50,
+    source_domain: Optional[str] = None,
+):
+    """
+    Diagnòstic d'entries penjades o incompletes al pipeline
+    (RAW, ERROR, o ENRICHED amb camps clau buits).
+
+    No modifica cap dada; només informa. Pensat per al procés
+    de validació humana i per decidir si cal reprocessar amb
+    POST /entries/{entry_id}/reenrich.
+    """
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        safe_limit = min(max(limit, 1), 200)
+        filters = []
+        params: list = []
+
+        if status:
+            filters.append("processing_status = %s")
+            params.append(status.upper())
+        else:
+            filters.append("processing_status IN ('RAW', 'ERROR', 'ENRICHED')")
+
+        if source_domain:
+            filters.append("LOWER(source_domain) = LOWER(%s)")
+            params.append(source_domain)
+
+        where_clause = "WHERE " + " AND ".join(filters)
+
+        query = f"""
+            SELECT
+                id,
+                source_title,
+                source_domain,
+                ingested_at,
+                updated_at,
+                processing_status,
+                processing_error,
+                processing_retries,
+                input_relevance,
+                ready_for_primary,
+                entry_category,
+                enriched_model,
+                enriched_at,
+                CASE
+                    WHEN processing_status = 'RAW'
+                         AND input_relevance IS NULL
+                         AND ready_for_primary IS NULL
+                        THEN 'no_input_executed'
+                    WHEN processing_status = 'RAW'
+                         AND input_relevance IS NOT NULL
+                         AND ready_for_primary IN ('yes', 'unclear')
+                        THEN 'stalled_after_input_before_primary'
+                    WHEN processing_status = 'ERROR'
+                         AND processing_error ILIKE '%%ANTHROPIC%%'
+                        THEN 'missing_provider_credentials'
+                    WHEN processing_status = 'ERROR'
+                         AND processing_error ILIKE '%%timeout%%'
+                        THEN 'llm_timeout'
+                    WHEN processing_status = 'ERROR'
+                         AND processing_error ILIKE '%%JSON%%'
+                        THEN 'invalid_llm_json_output'
+                    WHEN processing_status = 'ERROR'
+                        THEN 'pipeline_error_other'
+                    WHEN processing_status = 'ENRICHED'
+                         AND (summary_factual IS NULL OR why_it_matters IS NULL)
+                        THEN 'incomplete_enrichment'
+                    ELSE 'unknown'
+                END AS diagnosis
+            FROM public.entries
+            {where_clause}
+            ORDER BY ingested_at DESC NULLS LAST, id DESC
+            LIMIT %s
+        """
+        params.append(safe_limit)
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+        summary: dict = {}
+        for row in rows:
+            key = row["diagnosis"]
+            summary[key] = summary.get(key, 0) + 1
+
+        return {
+            "count": len(rows),
+            "summary": summary,
+            "items": rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 # ─── ENTRY DETAIL ─────────────────────────────────────────────────────────────
 
 @protected_router.get("/entries/{entry_id}")
