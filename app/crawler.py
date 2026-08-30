@@ -677,8 +677,22 @@ def _validate_and_normalize_final_output(
     - Es valida entry_category i els 3 semàfors BIHP contra els valors
       permesos (constraint SQL real); si no són vàlids, es força a
       'other'/'unknown' i es deixa constància a confidence_notes.
-    """
-    result = dict(output_result)
+     """
+    result = dict(primary_result)
+
+    # Output només pot sobreescriure els camps de traducció i les seves notes.
+    # Si Output retorna null (contingut ja en català), es respecta el null.
+    translatable_fields = (
+        "translated_summary_ca",
+        "translated_whyitmatters_ca",
+        "translated_debatequestions_ca",
+    )
+    for field in translatable_fields:
+        if field in output_result:
+            result[field] = output_result.get(field)
+
+    if output_result.get("postprocess_notes"):
+        result["postprocess_notes"] = output_result["postprocess_notes"]
 
     # Camps exclusius de Primary, que Output no reemet
     result["entry_category"] = primary_result.get("entry_category")
