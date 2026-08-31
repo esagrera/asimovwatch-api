@@ -6,6 +6,9 @@ import hashlib
 import json
 import os
 import secrets
+import threading
+import time
+import uuid
 from functools import lru_cache
 
 import psycopg2
@@ -15,15 +18,15 @@ from fastapi import FastAPI, HTTPException, status, Security, Depends, Request, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, AnyUrl
-from typing import Optional
+from pydantic import BaseModel, AnyUrl, Field
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
 from app.db import get_connection
 from app.source_candidates import router_candidates
 from app.llm_admin import router_llm_admin
 from app.llm_clients import get_supported_providers
-from app.crawler import run as run_entries_crawler
+from app.crawler import run_entry_enrichment
 
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -186,6 +189,80 @@ class EntryEnrich(BaseModel):
     analyzed_model: Optional[str] = None
     bihp_directives: Optional[list] = None
 
+class EntryReenrichRequest(BaseModel):
+    """
+    Control de fases per a POST /entries/{entry_id}/reenrich.
+
+    persist=True (defecte): mode operatiu; escriu el resultat a public.entries.
+    persist=False: mode de prova; no modifica l'entry ni en cas d'èxit ni en
+    cas d'error, i retorna les sortides de les fases executades.
+    """
+    skip_input: bool = False
+    run_input: bool = True
+    run_primary: bool = True
+    run_output: bool = True
+    persist: bool = True
+
+class ConfigUpdate(BaseModel):
+    value: str
+
+class CrawlerLogCreate(BaseModel):
+    sources_checked: int = 0
+    items_found: int = 0
+    items_relevant: int = 0
+    items_enriched: int = 0
+    items_failed: int = 0
+    duration_seconds: Optional[float] = None
+    notes: Optional[str] = None
+
+# ─── BATCH CONSTANTS & MODELS ───────────────────────────────────────────────
+
+BATCH_MODES = {
+    "input-only": {
+        "run_input": True,
+        "run_primary": False,
+        "run_output": False,
+        "skip_input": False,
+        "required_phase": None,
+    },
+    "primary-only": {
+        "run_input": False,
+        "run_primary": True,
+        "run_output": False,
+        "skip_input": True,
+        "required_phase": "input",
+    },
+    "output-only": {
+        "run_input": False,
+        "run_primary": False,
+        "run_output": True,
+        "skip_input": True,
+        "required_phase": "primary",
+    },
+    "semifull": {
+        "run_input": False,
+        "run_primary": True,
+        "run_output": True,
+        "skip_input": True,
+        "required_phase": "input",
+    },
+    "full": {
+        "run_input": True,
+        "run_primary": True,
+        "run_output": True,
+        "skip_input": False,
+        "required_phase": None,
+    },
+}
+
+class BatchOptions(BaseModel):
+    persist: bool = True
+    skip_existing: bool = True
+    max_concurrent: int = 1
+    timeout_per_entry_ms: int = 120000
+    on_error: str = "continue"
+    max_retries: int = 0
+
 class EntryBatchEnrich(BaseModel):
     entry_ids: list[int]
 
@@ -230,31 +307,419 @@ class EntryBatchEnrich(BaseModel):
     analyzed_model: Optional[str] = None
     bihp_directives: Optional[list] = None
 
-class EntryReenrichRequest(BaseModel):
-    """
-    Control de fases per a POST /entries/{entry_id}/reenrich.
 
-    persist=True (defecte): mode operatiu; escriu el resultat a public.entries.
-    persist=False: mode de prova; no modifica l'entry ni en cas d'èxit ni en
-    cas d'error, i retorna les sortides de les fases executades.
-    """
-    skip_input: bool = False
-    run_input: bool = True
-    run_primary: bool = True
-    run_output: bool = True
-    persist: bool = True
+class BatchProcessRequest(BaseModel):
+    entry_ids: List[int]
+    mode: str = "full"
+    options: BatchOptions = Field(default_factory=BatchOptions)
 
-class ConfigUpdate(BaseModel):
-    value: str
 
-class CrawlerLogCreate(BaseModel):
-    sources_checked: int = 0
-    items_found: int = 0
-    items_relevant: int = 0
-    items_enriched: int = 0
-    items_failed: int = 0
-    duration_seconds: Optional[float] = None
-    notes: Optional[str] = None
+# ─── BATCH HELPERS ────────────────────────────────────────────────────────────
+
+def validate_batch_request(body: BatchProcessRequest) -> None:
+    if not body.entry_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="entry_ids no pot estar buit",
+        )
+
+    if len(body.entry_ids) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Màxim de 500 entry_ids per batch",
+        )
+
+    if len(set(body.entry_ids)) != len(body.entry_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="entry_ids conté IDs duplicats",
+        )
+
+    if body.mode not in BATCH_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "mode no vàlid",
+                "allowed_modes": sorted(BATCH_MODES.keys()),
+            },
+        )
+
+    if body.options.max_concurrent != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "La primera versió només permet processament seqüencial: "
+                "max_concurrent ha de ser 1"
+            ),
+        )
+
+    if body.options.timeout_per_entry_ms < 1000:
+        raise HTTPException(
+            status_code=400,
+            detail="timeout_per_entry_ms ha de ser com a mínim 1000",
+        )
+
+    if body.options.on_error not in {"continue", "abort"}:
+        raise HTTPException(
+            status_code=400,
+            detail="on_error ha de ser 'continue' o 'abort'",
+        )
+
+
+def generate_batch_id() -> str:
+    return f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def get_batch_job(batch_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.batch_jobs
+            WHERE batch_id = %s
+            """,
+            (batch_id,),
+        )
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_batch_job(batch_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+
+    allowed_fields = {
+        "status",
+        "processed",
+        "succeeded",
+        "failed",
+        "skipped",
+        "items",
+        "error_message",
+        "started_at",
+        "finished_at",
+        "updated_at",
+    }
+
+    unknown = set(fields) - allowed_fields
+    if unknown:
+        raise ValueError(f"Camps de batch no permesos: {sorted(unknown)}")
+
+    assignments = []
+    values = []
+
+    for field, value in fields.items():
+        assignments.append(f"{field} = %s")
+        if field == "items":
+            values.append(Json(value))
+        else:
+            values.append(value)
+
+    assignments.append("updated_at = NOW()")
+    values.append(batch_id)
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            f"""
+            UPDATE public.batch_jobs
+            SET {", ".join(assignments)}
+            WHERE batch_id = %s
+            """,
+            values,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_entry_phase_state(cur: Any, entry_id: int) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT
+            id,
+            processing_status,
+            input_relevance,
+            ready_for_primary,
+            summary_factual,
+            why_it_matters,
+            enriched_at
+        FROM public.entries
+        WHERE id = %s
+        """,
+        (entry_id,),
+    )
+    return cur.fetchone()
+
+
+def phase_is_persisted(entry: Dict[str, Any], phase: str) -> bool:
+    if phase == "input":
+        return (
+            entry.get("input_relevance") is not None
+            and entry.get("ready_for_primary") is not None
+        )
+
+    if phase == "primary":
+        return (
+            entry.get("summary_factual") is not None
+            or entry.get("why_it_matters") is not None
+            or entry.get("enriched_at") is not None
+        )
+
+    return False
+
+# ─── BATCH WORKER ─────────────────────────────────────────────────────────────
+
+def process_batch_job(
+    batch_id: str,
+    entry_ids: List[int],
+    mode: str,
+    options: Dict[str, Any],
+) -> None:
+    batch_config = BATCH_MODES[mode]
+    timeout_seconds = options["timeout_per_entry_ms"] / 1000.0
+
+    items: List[Dict[str, Any]] = []
+    processed = 0
+    succeeded = 0
+    failed = 0
+    skipped = 0
+
+    update_batch_job(
+        batch_id,
+        status="RUNNING",
+        started_at=utc_now(),
+    )
+
+    for entry_id in entry_ids:
+        item_started_at = time.monotonic()
+        item_result: Dict[str, Any] = {
+            "entry_id": entry_id,
+            "status": "pending",
+        }
+
+        try:
+            conn = get_connection()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+
+            try:
+                entry = get_entry_phase_state(cur, entry_id)
+            finally:
+                cur.close()
+                conn.close()
+
+            if not entry:
+                item_result.update(
+                    status="skipped",
+                    reason="entry_not_found",
+                )
+                skipped += 1
+                processed += 1
+                items.append(item_result)
+
+                update_batch_job(
+                    batch_id,
+                    processed=processed,
+                    succeeded=succeeded,
+                    failed=failed,
+                    skipped=skipped,
+                    items=items,
+                )
+                continue
+
+            required_phase = batch_config["required_phase"]
+
+            if required_phase and not phase_is_persisted(
+                entry,
+                required_phase,
+            ):
+                item_result.update(
+                    status="skipped",
+                    reason=f"missing_{required_phase}_phase",
+                )
+                skipped += 1
+                processed += 1
+                items.append(item_result)
+
+                update_batch_job(
+                    batch_id,
+                    processed=processed,
+                    succeeded=succeeded,
+                    failed=failed,
+                    skipped=skipped,
+                    items=items,
+                )
+                continue
+
+            if options["skip_existing"]:
+                if mode == "input-only" and phase_is_persisted(entry, "input"):
+                    item_result.update(
+                        status="skipped",
+                        reason="input_already_persisted",
+                    )
+                    skipped += 1
+                    processed += 1
+                    items.append(item_result)
+
+                    update_batch_job(
+                        batch_id,
+                        processed=processed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        skipped=skipped,
+                        items=items,
+                    )
+                    continue
+
+                if mode == "primary-only" and phase_is_persisted(
+                    entry,
+                    "primary",
+                ):
+                    item_result.update(
+                        status="skipped",
+                        reason="primary_already_persisted",
+                    )
+                    skipped += 1
+                    processed += 1
+                    items.append(item_result)
+
+                    update_batch_job(
+                        batch_id,
+                        processed=processed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        skipped=skipped,
+                        items=items,
+                    )
+                    continue
+
+                if mode == "output-only" and entry.get("enriched_at"):
+                    item_result.update(
+                        status="skipped",
+                        reason="output_already_persisted",
+                    )
+                    skipped += 1
+                    processed += 1
+                    items.append(item_result)
+
+                    update_batch_job(
+                        batch_id,
+                        processed=processed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        skipped=skipped,
+                        items=items,
+                    )
+                    continue
+
+            if time.monotonic() - item_started_at > timeout_seconds:
+                raise TimeoutError(
+                    "Timeout abans d'executar l'entry"
+                )
+
+            result = run_entry_enrichment(
+                entry_id=entry_id,
+                skip_input=batch_config["skip_input"],
+                run_input=batch_config["run_input"],
+                run_primary=batch_config["run_primary"],
+                run_output=batch_config["run_output"],
+                persist=options["persist"],
+            )
+
+            elapsed = time.monotonic() - item_started_at
+
+            if elapsed > timeout_seconds:
+                raise TimeoutError(
+                    f"Timeout processant entry {entry_id}"
+                )
+
+            result_status = result.get("status")
+
+            if result_status in {"enriched", "stopped"}:
+                item_result.update(
+                    status="succeeded",
+                    result_status=result_status,
+                    elapsed_seconds=round(elapsed, 3),
+                )
+                succeeded += 1
+            elif result_status == "discarded":
+                item_result.update(
+                    status="succeeded",
+                    result_status="discarded",
+                    elapsed_seconds=round(elapsed, 3),
+                )
+                succeeded += 1
+            else:
+                item_result.update(
+                    status="failed",
+                    reason=result.get("detail", "unknown_error"),
+                    elapsed_seconds=round(elapsed, 3),
+                )
+                failed += 1
+
+        except Exception as exc:
+            item_result.update(
+                status="failed",
+                reason=str(exc)[:2000],
+            )
+            failed += 1
+
+            if options["on_error"] == "abort":
+                processed += 1
+                items.append(item_result)
+
+                update_batch_job(
+                    batch_id,
+                    processed=processed,
+                    succeeded=succeeded,
+                    failed=failed,
+                    skipped=skipped,
+                    items=items,
+                    status="FAILED",
+                    error_message=str(exc)[:2000],
+                    finished_at=utc_now(),
+                )
+                return
+
+        processed += 1
+        items.append(item_result)
+
+        update_batch_job(
+            batch_id,
+            processed=processed,
+            succeeded=succeeded,
+            failed=failed,
+            skipped=skipped,
+            items=items,
+        )
+
+    final_status = (
+        "COMPLETED"
+        if failed == 0
+        else "COMPLETED_WITH_ERRORS"
+    )
+
+    update_batch_job(
+        batch_id,
+        status=final_status,
+        processed=processed,
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        items=items,
+        finished_at=utc_now(),
+    )
 
 # ─── DEDUP ────────────────────────────────────────────────────────────────────
 
@@ -1866,6 +2331,98 @@ def run_thematic_search_now(body: ThematicEntrySearchRequest):
             status_code=500,
             detail=f"Error executant cerca temàtica: {str(exc)}",
         )
+
+# ─── BATCH ENDPOINTS ──────────────────────────────────────────────────────────
+
+@protected_router.post("/api/batch/process", status_code=202)
+def start_batch_process(body: BatchProcessRequest):
+    validate_batch_request(body)
+
+    batch_id = generate_batch_id()
+    entry_ids = list(body.entry_ids)
+    options = body.options.dict()
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            INSERT INTO public.batch_jobs (
+                batch_id,
+                mode,
+                entry_ids,
+                status,
+                total,
+                options
+            )
+            VALUES (%s, %s, %s, 'QUEUED', %s, %s)
+            """,
+            (
+                batch_id,
+                body.mode,
+                entry_ids,
+                len(entry_ids),
+                Json(options),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="No s'ha pogut crear el batch",
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+    worker = threading.Thread(
+        target=process_batch_job,
+        args=(batch_id, entry_ids, body.mode, options),
+        daemon=True,
+        name=f"asimovwatch-{batch_id}",
+    )
+    worker.start()
+
+    return {
+        "batch_id": batch_id,
+        "status": "QUEUED",
+        "mode": body.mode,
+        "total": len(entry_ids),
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+
+
+@protected_router.get("/api/batch/status/{batch_id}")
+def get_batch_status(batch_id: str):
+    job = get_batch_job(batch_id)
+
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="Batch no trobat",
+        )
+
+    return {
+        "batch_id": job["batch_id"],
+        "mode": job["mode"],
+        "status": job["status"],
+        "total": job["total"],
+        "processed": job["processed"],
+        "succeeded": job["succeeded"],
+        "failed": job["failed"],
+        "skipped": job["skipped"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "updated_at": job["updated_at"],
+        "error_message": job["error_message"],
+        "items": job["items"],
+    }
 
 # ─── STATS ────────────────────────────────────────────────────────────────────
 
