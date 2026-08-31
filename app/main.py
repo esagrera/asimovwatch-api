@@ -186,6 +186,50 @@ class EntryEnrich(BaseModel):
     analyzed_model: Optional[str] = None
     bihp_directives: Optional[list] = None
 
+class EntryBatchEnrich(BaseModel):
+    entry_ids: list[int]
+
+    processing_status: Optional[str] = None
+    processing_error: Optional[str] = None
+    processing_retries: Optional[int] = None
+
+    relevance_score: Optional[str] = None
+    relevance_reason: Optional[str] = None
+
+    translated_summary_ca: Optional[str] = None
+    translated_whyitmatters_ca: Optional[str] = None
+    translated_debatequestions_ca: Optional[list] = None
+
+    enriched_model: Optional[str] = None
+    raw_snippet_original: Optional[str] = None
+    source_language: Optional[str] = None
+
+    summary_factual: Optional[str] = None
+    why_it_matters: Optional[str] = None
+    debate_questions: Optional[list] = None
+    theme_tags: Optional[list] = None
+    affected_principles: Optional[list] = None
+    risk_level: Optional[str] = None
+
+    human_protection_declared: Optional[str] = None
+    human_protection_verifiable: Optional[str] = None
+    human_protection_depth: Optional[str] = None
+    human_protection_notes: Optional[str] = None
+    confidence_notes: Optional[str] = None
+
+    input_relevance: Optional[str] = None
+    input_relevance_reason: Optional[str] = None
+    ready_for_primary: Optional[str] = None
+    clean_input_text: Optional[str] = None
+    input_summary: Optional[str] = None
+    input_quality: Optional[str] = None
+    input_quality_notes: Optional[str] = None
+
+    entry_category: Optional[str] = None
+    analyzed_provider: Optional[str] = None
+    analyzed_model: Optional[str] = None
+    bihp_directives: Optional[list] = None
+
 class EntryReenrichRequest(BaseModel):
     """
     Control de fases per a POST /entries/{entry_id}/reenrich.
@@ -743,6 +787,148 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to enrich entry: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+# ─── BATCH ENRICH ENTRIES ─────────────────────────────────────────────────────
+
+@protected_router.post("/entries/batch-enrich")
+def batch_enrich_entries(enrich: EntryBatchEnrich):
+    entry_ids = enrich.entry_ids or []
+
+    if not entry_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="entry_ids no pot estar buit"
+        )
+
+    if len(entry_ids) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Màxim de 100 entry_ids per operació batch"
+        )
+
+    if len(set(entry_ids)) != len(entry_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="entry_ids conté IDs duplicats"
+        )
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        scalar_fields = {
+            "processing_status": enrich.processing_status,
+            "processing_error": enrich.processing_error,
+            "processing_retries": enrich.processing_retries,
+            "relevance_score": enrich.relevance_score,
+            "relevance_reason": enrich.relevance_reason,
+            "translated_summary_ca": enrich.translated_summary_ca,
+            "translated_whyitmatters_ca": enrich.translated_whyitmatters_ca,
+            "enriched_model": enrich.enriched_model,
+            "raw_snippet_original": enrich.raw_snippet_original,
+            "source_language": enrich.source_language,
+            "summary_factual": enrich.summary_factual,
+            "why_it_matters": enrich.why_it_matters,
+            "risk_level": enrich.risk_level,
+            "human_protection_declared": enrich.human_protection_declared,
+            "human_protection_verifiable": enrich.human_protection_verifiable,
+            "human_protection_depth": enrich.human_protection_depth,
+            "human_protection_notes": enrich.human_protection_notes,
+            "confidence_notes": enrich.confidence_notes,
+            "input_relevance": enrich.input_relevance,
+            "input_relevance_reason": enrich.input_relevance_reason,
+            "ready_for_primary": enrich.ready_for_primary,
+            "clean_input_text": enrich.clean_input_text,
+            "input_summary": enrich.input_summary,
+            "input_quality": enrich.input_quality,
+            "input_quality_notes": enrich.input_quality_notes,
+            "entry_category": enrich.entry_category,
+            "analyzed_provider": enrich.analyzed_provider,
+            "analyzed_model": enrich.analyzed_model,
+        }
+
+        json_fields = {
+            "translated_debatequestions_ca": enrich.translated_debatequestions_ca,
+            "debate_questions": enrich.debate_questions,
+            "theme_tags": enrich.theme_tags,
+            "affected_principles": enrich.affected_principles,
+            "bihp_directives": enrich.bihp_directives,
+        }
+
+        fields = []
+        values = []
+
+        for column, value in scalar_fields.items():
+            if value is not None:
+                fields.append(f"{column} = %s")
+                values.append(value)
+
+        for column, value in json_fields.items():
+            if value is not None:
+                fields.append(f"{column} = %s")
+                values.append(Json(value))
+
+        if not fields:
+            raise HTTPException(
+                status_code=400,
+                detail="No s'ha proporcionat cap camp per actualitzar"
+            )
+
+        cur.execute(
+            "SELECT id FROM public.entries WHERE id = ANY(%s)",
+            (entry_ids,)
+        )
+        existing_ids = {row["id"] for row in cur.fetchall()}
+        missing_ids = [
+            entry_id for entry_id in entry_ids
+            if entry_id not in existing_ids
+        ]
+
+        fields.append("enriched_at = now()")
+        fields.append("updated_at = now()")
+        values.append(entry_ids)
+
+        cur.execute(
+            f"""
+            UPDATE public.entries
+            SET {", ".join(fields)}
+            WHERE id = ANY(%s)
+            RETURNING
+                id,
+                processing_status,
+                input_relevance,
+                ready_for_primary,
+                updated_at
+            """,
+            values,
+        )
+
+        updated = cur.fetchall()
+        conn.commit()
+
+        return {
+            "status": "updated",
+            "requested_count": len(entry_ids),
+            "updated_count": len(updated),
+            "updated_ids": sorted(row["id"] for row in updated),
+            "missing_ids": missing_ids,
+            "items": updated,
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to batch enrich entries: {str(e)}"
+        )
+
     finally:
         cur.close()
         conn.close()
