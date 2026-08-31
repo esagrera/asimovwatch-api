@@ -999,6 +999,149 @@ def get_entry_diagnostics(
         cur.close()
         conn.close()
 
+# ─── ENTRIES AGGREGATE ────────────────────────────────────────────────────────────
+
+@protected_router.get("/entries/aggregate")
+def aggregate_entries(
+    group_by: str = "source_domain",
+    source_domain: Optional[str] = None,
+    entry_category: Optional[str] = None,
+    processing_status: Optional[str] = None,
+    review_status: Optional[str] = None,
+    analyzed_provider: Optional[str] = None,
+    analyzed_model: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    relevance_score: Optional[str] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    limit: int = 50,
+):
+    """
+    Agregació d'entries per un camp específic amb filtres opcionals.
+    
+    Retorna una llista d'agregacions amb el valor del grup i el comptador.
+    """
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Validar group_by
+        allowed_group_by = {
+            "source_domain",
+            "entry_category",
+            "processing_status",
+            "review_status",
+            "analyzed_provider",
+            "analyzed_model",
+            "risk_level",
+            "relevance_score",
+        }
+        
+        if group_by not in allowed_group_by:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"group_by no vàlid. Permès: {sorted(allowed_group_by)}",
+                    "provided": group_by,
+                },
+            )
+        
+        # Construir filtres
+        filters = []
+        params = []
+        
+        if source_domain:
+            filters.append("LOWER(source_domain) = LOWER(%s)")
+            params.append(source_domain)
+        
+        if entry_category:
+            filters.append("entry_category = %s")
+            params.append(entry_category)
+        
+        if processing_status:
+            filters.append("processing_status = %s")
+            params.append(processing_status.upper())
+        
+        if review_status:
+            filters.append("review_status = %s")
+            params.append(review_status.upper())
+        
+        if analyzed_provider:
+            filters.append("LOWER(analyzed_provider) = LOWER(%s)")
+            params.append(analyzed_provider)
+        
+        if analyzed_model:
+            filters.append("LOWER(analyzed_model) = LOWER(%s)")
+            params.append(analyzed_model)
+        
+        if risk_level:
+            filters.append("risk_level = %s")
+            params.append(risk_level.lower())
+        
+        if relevance_score:
+            filters.append("relevance_score = %s")
+            params.append(relevance_score.lower())
+        
+        if date_from:
+            filters.append("detected_at >= %s")
+            params.append(ensure_utc(date_from))
+        
+        if date_to:
+            filters.append("detected_at <= %s")
+            params.append(ensure_utc(date_to))
+        
+        where_clause = ""
+        if filters:
+            where_clause = "WHERE " + " AND ".join(filters)
+        
+        # Consulta de total
+        count_query = f"SELECT COUNT(*) AS total FROM public.entries {where_clause}"
+        cur.execute(count_query, params)
+        total = cur.fetchone()["total"]
+        
+        # Consulta d'agregació
+        # Per a analyzed_provider i analyzed_model, cal COALESCE per tractar NULLs
+        if group_by in ("analyzed_provider", "analyzed_model"):
+            group_expr = f"COALESCE({group_by}, '(not set)')"
+        else:
+            group_expr = group_by
+        
+        aggregate_query = f"""
+        SELECT
+            {group_expr} AS group_value,
+            COUNT(*) AS count
+        FROM public.entries
+        {where_clause}
+        GROUP BY {group_expr}
+        ORDER BY count DESC
+        LIMIT %s
+        """
+        
+        params_with_limit = params + [limit]
+        cur.execute(aggregate_query, params_with_limit)
+        rows = cur.fetchall()
+        
+        return {
+            "group_by": group_by,
+            "total": total,
+            "count": len(rows),
+            "groups": [
+                {
+                    "group_value": row["group_value"],
+                    "count": row["count"],
+                }
+                for row in rows
+            ],
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 # ─── ENTRY DETAIL ─────────────────────────────────────────────────────────────
 
 @protected_router.get("/entries/{entry_id}")
@@ -2453,148 +2596,7 @@ def get_stats():
         cur.close()
         conn.close()
 
-# ─── ENTRIES AGGREGATE ────────────────────────────────────────────────────────────
 
-@protected_router.get("/entries/aggregate")
-def aggregate_entries(
-    group_by: str = "source_domain",
-    source_domain: Optional[str] = None,
-    entry_category: Optional[str] = None,
-    processing_status: Optional[str] = None,
-    review_status: Optional[str] = None,
-    analyzed_provider: Optional[str] = None,
-    analyzed_model: Optional[str] = None,
-    risk_level: Optional[str] = None,
-    relevance_score: Optional[str] = None,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
-    limit: int = 50,
-):
-    """
-    Agregació d'entries per un camp específic amb filtres opcionals.
-    
-    Retorna una llista d'agregacions amb el valor del grup i el comptador.
-    """
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    try:
-        # Validar group_by
-        allowed_group_by = {
-            "source_domain",
-            "entry_category",
-            "processing_status",
-            "review_status",
-            "analyzed_provider",
-            "analyzed_model",
-            "risk_level",
-            "relevance_score",
-        }
-        
-        if group_by not in allowed_group_by:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": f"group_by no vàlid. Permès: {sorted(allowed_group_by)}",
-                    "provided": group_by,
-                },
-            )
-        
-        # Construir filtres
-        filters = []
-        params = []
-        
-        if source_domain:
-            filters.append("LOWER(source_domain) = LOWER(%s)")
-            params.append(source_domain)
-        
-        if entry_category:
-            filters.append("entry_category = %s")
-            params.append(entry_category)
-        
-        if processing_status:
-            filters.append("processing_status = %s")
-            params.append(processing_status.upper())
-        
-        if review_status:
-            filters.append("review_status = %s")
-            params.append(review_status.upper())
-        
-        if analyzed_provider:
-            filters.append("LOWER(analyzed_provider) = LOWER(%s)")
-            params.append(analyzed_provider)
-        
-        if analyzed_model:
-            filters.append("LOWER(analyzed_model) = LOWER(%s)")
-            params.append(analyzed_model)
-        
-        if risk_level:
-            filters.append("risk_level = %s")
-            params.append(risk_level.lower())
-        
-        if relevance_score:
-            filters.append("relevance_score = %s")
-            params.append(relevance_score.lower())
-        
-        if date_from:
-            filters.append("detected_at >= %s")
-            params.append(ensure_utc(date_from))
-        
-        if date_to:
-            filters.append("detected_at <= %s")
-            params.append(ensure_utc(date_to))
-        
-        where_clause = ""
-        if filters:
-            where_clause = "WHERE " + " AND ".join(filters)
-        
-        # Consulta de total
-        count_query = f"SELECT COUNT(*) AS total FROM public.entries {where_clause}"
-        cur.execute(count_query, params)
-        total = cur.fetchone()["total"]
-        
-        # Consulta d'agregació
-        # Per a analyzed_provider i analyzed_model, cal COALESCE per tractar NULLs
-        if group_by in ("analyzed_provider", "analyzed_model"):
-            group_expr = f"COALESCE({group_by}, '(not set)')"
-        else:
-            group_expr = group_by
-        
-        aggregate_query = f"""
-        SELECT
-            {group_expr} AS group_value,
-            COUNT(*) AS count
-        FROM public.entries
-        {where_clause}
-        GROUP BY {group_expr}
-        ORDER BY count DESC
-        LIMIT %s
-        """
-        
-        params_with_limit = params + [limit]
-        cur.execute(aggregate_query, params_with_limit)
-        rows = cur.fetchall()
-        
-        return {
-            "group_by": group_by,
-            "total": total,
-            "count": len(rows),
-            "groups": [
-                {
-                    "group_value": row["group_value"],
-                    "count": row["count"],
-                }
-                for row in rows
-            ],
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
 
 # ─── REGISTRE DE ROUTERS ──────────────────────────────────────────────────────
 
