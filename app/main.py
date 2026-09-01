@@ -2349,6 +2349,7 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
         "items_duplicates": 0,
         "items_skipped": 0,
         "items_failed": 0,
+        "created_entry_ids": [],
     }
     runs = []
 
@@ -2372,8 +2373,19 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
                 source_id=source_id,
                 limit_per_source=safe_limit,
             )
-            for key in aggregate:
+            for key in (
+                "sources_checked",
+                "items_found",
+                "items_created",
+                "items_duplicates",
+                "items_skipped",
+                "items_failed",
+            ):
                 aggregate[key] += int(result.get(key, 0) or 0)
+
+            aggregate["created_entry_ids"].extend(
+                result.get("created_entry_ids", [])
+            )
             runs.append({"source_id": source_id, "result": result})
 
         finished_at = utc_now()
