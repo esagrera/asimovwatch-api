@@ -2625,19 +2625,23 @@ def get_stats():
             ) AS rejected,
 
             COUNT(*) FILTER (
-                WHERE input_relevance = 'high'
+                WHERE LOWER(BTRIM(COALESCE(input_relevance, ''))) = 'high'
             ) AS high_input_relevance,
 
             COUNT(*) FILTER (
-                WHERE input_relevance = 'medium'
+                WHERE LOWER(BTRIM(COALESCE(input_relevance, ''))) = 'medium'
             ) AS medium_input_relevance,
 
             COUNT(*) FILTER (
-                WHERE input_relevance = 'low'
+                WHERE LOWER(BTRIM(COALESCE(input_relevance, ''))) = 'low'
             ) AS low_input_relevance,
 
             COUNT(*) FILTER (
-                WHERE input_relevance IS NULL
+                WHERE LOWER(BTRIM(COALESCE(input_relevance, ''))) NOT IN (
+                    'high',
+                    'medium',
+                    'low'
+                )
             ) AS unknown_input_relevance,
 
             COUNT(*) FILTER (
