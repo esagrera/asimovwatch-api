@@ -723,6 +723,51 @@ def _validate_and_normalize_final_output(
     result["confidence_notes"] = notes.strip() or None
     return result
 
+def has_analyzable_content(entry: Dict[str, Any]) -> bool:
+    """
+    Retorna True si l'entry té contingut textual mínim per executar Input.
+
+    La regla és deliberadament conservadora: n'hi ha prou que raw_content
+    o raw_snippet contingui text no buit. Si tots dos són buits, no hi ha
+    evidència suficient per iniciar classificació ni consumir un LLM.
+    """
+    raw_content = str(entry.get("raw_content") or "").strip()
+    raw_snippet = str(entry.get("raw_snippet") or "").strip()
+    return bool(raw_content or raw_snippet)
+
+
+def mark_entry_discarded_no_content(
+    cur: Any,
+    entry_id: int,
+) -> None:
+    """
+    Marca una entry com a descartada abans del pipeline perquè el feed no
+    ha aportat contingut analitzable.
+
+    No s'omplen camps BIHP, categoria, resum factual ni enriched_at:
+    no hi ha hagut anàlisi de contingut, així que aquests camps han de
+    romandre NULL i no s'ha d'inferir cap conclusió.
+    """
+    cur.execute(
+        """
+        UPDATE public.entries
+        SET
+            processing_status = 'DISCARDED',
+            processing_error = NULL,
+            input_relevance = 'unknown',
+            input_relevance_reason = %s,
+            ready_for_primary = 'no',
+            input_quality = 'low',
+            input_quality_notes = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (
+            "No hi ha contingut RSS analitzable.",
+            "El feed no ha aportat summary, description ni content.",
+            entry_id,
+        ),
+    )
 
 def run_entry_enrichment(
     entry_id: int,
@@ -751,6 +796,24 @@ def run_entry_enrichment(
             entry = cur.fetchone()
             if not entry:
                 return {"status": "error", "entry_id": entry_id, "detail": "Entry not found"}
+
+            if not has_analyzable_content(entry):
+                if persist:
+                    mark_entry_discarded_no_content(cur, entry_id)
+                    conn.commit()
+
+                return {
+                    "status": "discarded",
+                    "entry_id": entry_id,
+                    "persisted": persist,
+                    "detail": {
+                        "reason": "no_analyzable_content",
+                        "message": (
+                            "No hi ha raw_content ni raw_snippet "
+                            "per executar el pipeline d'enriquiment."
+                        ),
+                    },
+                }
 
             input_result = None
             should_run_input = run_input and not skip_input
