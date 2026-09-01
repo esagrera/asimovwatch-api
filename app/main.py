@@ -2573,25 +2573,77 @@ def get_batch_status(batch_id: str):
 def get_stats():
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
+
     try:
         cur.execute("""
-            SELECT
-                COUNT(*) AS total_entries,
-                COUNT(*) FILTER (WHERE processing_status = 'RAW') AS pending_enrichment,
-                COUNT(*) FILTER (WHERE processing_status = 'ENRICHED') AS enriched,
-                COUNT(*) FILTER (WHERE processing_status = 'ERROR') AS enrichment_errors,
-                COUNT(*) FILTER (WHERE review_status = 'NEW') AS pending_review,
-                COUNT(*) FILTER (WHERE review_status = 'APPROVED') AS approved,
-                COUNT(*) FILTER (WHERE review_status = 'REJECTED') AS rejected,
-                COUNT(*) FILTER (WHERE relevance_score = 'high') AS high_relevance,
-                COUNT(*) FILTER (WHERE relevance_score = 'medium') AS medium_relevance,
-                COUNT(*) FILTER (WHERE relevance_score = 'low') AS low_relevance
-            FROM public.entries
+        SELECT
+            COUNT(*) AS total_entries,
+
+            COUNT(*) FILTER (
+                WHERE processing_status IN ('RAW', 'ERROR')
+            ) AS pending_enrichment,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'RAW'
+            ) AS raw_pending_enrichment,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ERROR'
+            ) AS enrichment_errors,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ERROR'
+                  AND COALESCE(processing_retries, 0) < 3
+            ) AS retryable_enrichment_errors,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ERROR'
+                  AND COALESCE(processing_retries, 0) >= 3
+            ) AS blocked_enrichment_errors,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+            ) AS enriched,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'DISCARDED'
+            ) AS discarded_by_input,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                  AND review_status = 'NEW'
+            ) AS pending_review,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                  AND review_status = 'APPROVED'
+            ) AS approved,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                  AND review_status = 'REJECTED'
+            ) AS rejected,
+
+            COUNT(*) FILTER (
+                WHERE relevance_score = 'high'
+            ) AS high_relevance,
+
+            COUNT(*) FILTER (
+                WHERE relevance_score = 'medium'
+            ) AS medium_relevance,
+
+            COUNT(*) FILTER (
+                WHERE relevance_score = 'low'
+            ) AS low_relevance
+
+        FROM public.entries
         """)
-        stats = cur.fetchone()
-        return stats
+
+        return cur.fetchone()
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         cur.close()
         conn.close()
