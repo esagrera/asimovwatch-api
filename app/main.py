@@ -26,7 +26,8 @@ from app.db import get_connection
 from app.source_candidates import router_candidates
 from app.llm_admin import router_llm_admin
 from app.llm_clients import get_supported_providers
-from app.crawler import run as run_entries_crawler, run_entry_enrichment
+from app.crawler import run_entry_enrichment
+from app.enrichment_queue import run_enrichment_queue
 
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
@@ -202,6 +203,19 @@ class EntryReenrichRequest(BaseModel):
     run_primary: bool = True
     run_output: bool = True
     persist: bool = True
+
+class EntryEnrichmentQueueRequest(BaseModel):
+    """
+    Controls opcionals per inspeccionar o executar la cua d'enriquiment.
+
+    La primera versió del mòdul enrichment_queue és només de selecció:
+    encara no executa LLM ni modifica entries, fins i tot amb dry_run=False.
+    """
+    max_per_run: Optional[int] = None
+    max_per_source: Optional[int] = None
+    retry_max: Optional[int] = None
+    timeout_seconds: Optional[int] = None
+    dry_run: bool = True
 
 class ConfigUpdate(BaseModel):
     value: str
@@ -1594,6 +1608,38 @@ def reenrich_entry(entry_id: int, body: EntryReenrichRequest):
         raise HTTPException(status_code=404, detail="Entry not found")
 
     return result
+
+# ─── ENRICHMENT QUEUE ─────────────────────────────────────────────────────────
+
+@protected_router.post("/entries/enrichment/run-queue")
+def run_entry_enrichment_queue(
+    body: Optional[EntryEnrichmentQueueRequest] = None,
+):
+    """
+    Inspecciona la selecció de la cua d'enriquiment.
+
+    Aquesta primera versió és només de selecció: no executa Input, Primary
+    ni Output, no actualitza entries i no escriu cap estat a public.config.
+    El flag entry_enrichment_enabled és informatiu per a l'acció manual;
+    el futur scheduler serà qui el respectarà per a l'execució automàtica.
+    """
+    body = body or EntryEnrichmentQueueRequest()
+
+    try:
+        return run_enrichment_queue(
+            max_per_run=body.max_per_run,
+            max_per_source=body.max_per_source,
+            retry_max=body.retry_max,
+            timeout_seconds=body.timeout_seconds,
+            dry_run=body.dry_run,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error seleccionant cua d'enriquiment: {str(exc)}",
+        )
 
 # ─── DELETE ENTRY ─────────────────────────────────────────────────────────────
 
