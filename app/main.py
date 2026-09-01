@@ -2485,12 +2485,14 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
                 "dry_run": body.dry_run,
                 "requested_by": body.requested_by,
                 "hours_back_ignored": body.hours_back,
-                "run_enrichment_ignored": body.run_enrichment,
+                "run_enrichment_requested": body.run_enrichment,
+                "run_enrichment_executed": enrichment_executed,
                 "retry_errors_ignored": body.retry_errors,
                 "force_ignored": body.force,
             },
             "result": aggregate,
             "runs": runs,
+            "enrichment": enrichment_result,
         }
 
     except Exception as exc:
