@@ -1035,6 +1035,10 @@ def aggregate_entries(
             "analyzed_model",
             "risk_level",
             "relevance_score",
+            "input_relevance",
+            "human_protection_declared",
+            "human_protection_verifiable",
+            "human_protection_depth",
         }
         
         if group_by not in allowed_group_by:
@@ -1099,13 +1103,28 @@ def aggregate_entries(
         cur.execute(count_query, params)
         total = cur.fetchone()["total"]
         
-        # Consulta d'agregació
-        # Per a analyzed_provider i analyzed_model, cal COALESCE per tractar NULLs
-        if group_by in ("analyzed_provider", "analyzed_model"):
-            group_expr = f"COALESCE({group_by}, '(not set)')"
+        # Consulta d'agregació.
+        # Alguns camps poden ser NULL o strings buits. Els agrupem com
+        # "(not set)" per distingir absència tècnica de dades del valor
+        # metodològic explícit "unknown".
+        nullable_group_fields = {
+            "analyzed_provider",
+            "analyzed_model",
+            "input_relevance",
+            "human_protection_declared",
+            "human_protection_verifiable",
+            "human_protection_depth",
+        }
+
+        if group_by in nullable_group_fields:
+            group_expr = (
+                f"COALESCE(NULLIF(BTRIM({group_by}), ''), '(not set)')"
+            )
         else:
             group_expr = group_by
-        
+
+        safe_limit = min(max(limit, 1), 100)
+
         aggregate_query = f"""
         SELECT
             {group_expr} AS group_value,
@@ -1113,17 +1132,18 @@ def aggregate_entries(
         FROM public.entries
         {where_clause}
         GROUP BY {group_expr}
-        ORDER BY count DESC
+        ORDER BY count DESC, group_value ASC
         LIMIT %s
         """
-        
-        params_with_limit = params + [limit]
+
+        params_with_limit = params + [safe_limit]
         cur.execute(aggregate_query, params_with_limit)
         rows = cur.fetchall()
         
         return {
             "group_by": group_by,
             "total": total,
+            "limit": safe_limit,
             "count": len(rows),
             "groups": [
                 {
