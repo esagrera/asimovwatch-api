@@ -14,10 +14,13 @@ Responsabilitats:
 - Retornar una selecció explicable i apta per a dry-run.
 """
 
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2.extras
 
+from app.crawler import run_entry_enrichment
 from app.db import get_connection
 
 
@@ -318,6 +321,154 @@ def select_enrichment_candidates(
         "excluded": excluded,
     }
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _set_config_value(cur: Any, key: str, value: Optional[str]) -> None:
+    """
+    Desa telemetria del worker a public.config.
+
+    Aquesta funció s'utilitza només per a entry_enrichment_last_*.
+    No crea ni modifica la configuració de política (enabled, límits,
+    retry_max o timeout), que s'ha de gestionar explícitament des de
+    la UI o SQL administratiu.
+    """
+    safe_value = "" if value is None else str(value)
+
+    cur.execute(
+        """
+        INSERT INTO public.config (key, value, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value,
+            updated_at = NOW()
+        """,
+        (key, safe_value),
+    )
+
+
+def _persist_queue_run_status(
+    run_started_at: datetime,
+    status: str,
+    duration_seconds: Optional[float] = None,
+    error: Optional[str] = None,
+) -> None:
+    """
+    Persisteix només telemetria de l'execució real de la cua.
+
+    S'obre una connexió curta i independent perquè el pipeline de cada
+    entry també obre/gestiona la seva connexió pròpia.
+    """
+    conn = get_connection()
+
+    try:
+        with conn.cursor() as cur:
+            _set_config_value(
+                cur,
+                "entry_enrichment_last_status",
+                status,
+            )
+            _set_config_value(
+                cur,
+                "entry_enrichment_last_run_at",
+                run_started_at.isoformat(),
+            )
+            _set_config_value(
+                cur,
+                "entry_enrichment_last_duration_seconds",
+                "" if duration_seconds is None else str(duration_seconds),
+            )
+            _set_config_value(
+                cur,
+                "entry_enrichment_last_error",
+                error,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def _run_selected_entries(
+    selected_items: List[Dict[str, Any]],
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    """
+    Executa seqüencialment el pipeline complet sobre cada entry seleccionada.
+
+    timeout_seconds és un llindar d'observabilitat en aquesta versió:
+    es mesura la durada real després de cada crida, però no s'intenta
+    cancel·lar un LLM que ja està en curs. Els timeouts efectius de xarxa
+    continuen controlats per la configuració LLM de cada fase.
+    """
+    result_summary = {
+        "attempted": 0,
+        "enriched": 0,
+        "discarded": 0,
+        "stopped": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+    item_results: List[Dict[str, Any]] = []
+
+    for selected_item in selected_items:
+        entry_id = selected_item["id"]
+        item_started_at = time.monotonic()
+
+        try:
+            pipeline_result = run_entry_enrichment(
+                entry_id=entry_id,
+                skip_input=False,
+                run_input=True,
+                run_primary=True,
+                run_output=True,
+                persist=True,
+            )
+            elapsed_seconds = round(time.monotonic() - item_started_at, 3)
+            pipeline_status = pipeline_result.get("status", "error")
+
+            item_result = {
+                "entry_id": entry_id,
+                "status": pipeline_status,
+                "elapsed_seconds": elapsed_seconds,
+                "exceeded_timeout_seconds": elapsed_seconds > timeout_seconds,
+            }
+
+            if pipeline_status == "enriched":
+                result_summary["enriched"] += 1
+            elif pipeline_status == "discarded":
+                result_summary["discarded"] += 1
+            elif pipeline_status == "stopped":
+                result_summary["stopped"] += 1
+            elif pipeline_status == "skipped":
+                result_summary["skipped"] += 1
+            else:
+                result_summary["failed"] += 1
+                item_result["detail"] = pipeline_result.get(
+                    "detail",
+                    "Error de pipeline sense detall.",
+                )
+
+        except Exception as exc:
+            elapsed_seconds = round(time.monotonic() - item_started_at, 3)
+            item_result = {
+                "entry_id": entry_id,
+                "status": "error",
+                "elapsed_seconds": elapsed_seconds,
+                "exceeded_timeout_seconds": elapsed_seconds > timeout_seconds,
+                "detail": str(exc)[:2000],
+            }
+            result_summary["failed"] += 1
+
+        result_summary["attempted"] += 1
+        item_results.append(item_result)
+
+    return {
+        "summary": result_summary,
+        "items": item_results,
+    }
 
 def run_enrichment_queue(
     max_per_run: Optional[int] = None,
@@ -327,63 +478,177 @@ def run_enrichment_queue(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Executa la primera versió segura de la cua: només selecció.
+    Selecciona i, només en execució real, processa la cua d'enriquiment.
 
-    En aquesta iteració, dry_run no modifica el comportament perquè el mòdul
-    encara no escriu ni executa LLM. El paràmetre es retorna explícitament
-    per mantenir el contracte de la futura fase d'execució.
+    dry_run=True:
+    - Selecciona candidates.
+    - No crida LLM.
+    - No actualitza public.entries.
+    - No escriu entry_enrichment_last_*.
 
-    entry_enrichment_enabled és informatiu en aquesta capa: no bloqueja una
-    invocació manual directa. El futur scheduler serà qui respectarà aquest
-    flag abans de cridar la cua automàtica.
+    dry_run=False:
+    - Selecciona candidates.
+    - Executa una entry rere l'altra amb Input -> Primary -> Output.
+    - Continua si una entry falla.
+    - Desa només telemetria entry_enrichment_last_*.
     """
+    run_started_at = _utc_now()
     config = get_enrichment_queue_config()
 
     effective_max_per_run = (
         config["max_per_run"]
         if max_per_run is None
-        else _parse_int(max_per_run, config["max_per_run"], minimum=1, maximum=100)
+        else _parse_int(
+            max_per_run,
+            config["max_per_run"],
+            minimum=1,
+            maximum=100,
+        )
     )
     effective_max_per_source = (
         config["max_per_source"]
         if max_per_source is None
-        else _parse_int(max_per_source, config["max_per_source"], minimum=1, maximum=100)
+        else _parse_int(
+            max_per_source,
+            config["max_per_source"],
+            minimum=1,
+            maximum=100,
+        )
     )
     effective_retry_max = (
         config["retry_max"]
         if retry_max is None
-        else _parse_int(retry_max, config["retry_max"], minimum=0, maximum=20)
+        else _parse_int(
+            retry_max,
+            config["retry_max"],
+            minimum=0,
+            maximum=20,
+        )
     )
     effective_timeout_seconds = (
         config["timeout_seconds"]
         if timeout_seconds is None
-        else _parse_int(timeout_seconds, config["timeout_seconds"], minimum=1, maximum=3600)
+        else _parse_int(
+            timeout_seconds,
+            config["timeout_seconds"],
+            minimum=1,
+            maximum=3600,
+        )
     )
 
-    selection_result = select_enrichment_candidates(
-        max_per_run=effective_max_per_run,
-        max_per_source=effective_max_per_source,
-        retry_max=effective_retry_max,
-    )
+    try:
+        selection_result = select_enrichment_candidates(
+            max_per_run=effective_max_per_run,
+            max_per_source=effective_max_per_source,
+            retry_max=effective_retry_max,
+        )
 
-    return {
-        "status": "ok",
-        "mode": "selection_only",
-        "dry_run": dry_run,
-        "config": {
-            "enabled": config["enabled"],
-            "max_per_run": effective_max_per_run,
-            "max_per_source": effective_max_per_source,
-            "retry_max": effective_retry_max,
-            "timeout_seconds": effective_timeout_seconds,
-        },
-        **selection_result,
-        "result": {
-            "attempted": 0,
-            "enriched": 0,
-            "discarded": 0,
-            "stopped": 0,
-            "failed": 0,
-            "skipped": 0,
-        },
-    }
+        base_response = {
+            "status": "ok",
+            "mode": "dry_run" if dry_run else "executed",
+            "dry_run": dry_run,
+            "config": {
+                "enabled": config["enabled"],
+                "max_per_run": effective_max_per_run,
+                "max_per_source": effective_max_per_source,
+                "retry_max": effective_retry_max,
+                "timeout_seconds": effective_timeout_seconds,
+            },
+            **selection_result,
+        }
+
+        if dry_run:
+            return {
+                **base_response,
+                "result": {
+                    "attempted": 0,
+                    "enriched": 0,
+                    "discarded": 0,
+                    "stopped": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+                "items": [],
+            }
+
+        if not selection_result["selected_items"]:
+            duration_seconds = round(
+                (_utc_now() - run_started_at).total_seconds(),
+                3,
+            )
+            _persist_queue_run_status(
+                run_started_at=run_started_at,
+                status="OK_EMPTY",
+                duration_seconds=duration_seconds,
+                error=None,
+            )
+
+            return {
+                **base_response,
+                "result": {
+                    "attempted": 0,
+                    "enriched": 0,
+                    "discarded": 0,
+                    "stopped": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                },
+                "items": [],
+            }
+
+        execution_result = _run_selected_entries(
+            selected_items=selection_result["selected_items"],
+            timeout_seconds=effective_timeout_seconds,
+        )
+        duration_seconds = round(
+            (_utc_now() - run_started_at).total_seconds(),
+            3,
+        )
+
+        failures = [
+            item
+            for item in execution_result["items"]
+            if item["status"] == "error"
+        ]
+
+        if failures:
+            worker_status = "COMPLETED_WITH_ERRORS"
+            worker_error = "; ".join(
+                f"entry {item['entry_id']}: {str(item.get('detail', 'error'))[:300]}"
+                for item in failures[:5]
+            )
+        else:
+            worker_status = "OK"
+            worker_error = None
+
+        _persist_queue_run_status(
+            run_started_at=run_started_at,
+            status=worker_status,
+            duration_seconds=duration_seconds,
+            error=worker_error,
+        )
+
+        return {
+            **base_response,
+            "result": execution_result["summary"],
+            "items": execution_result["items"],
+        }
+
+    except Exception as exc:
+        duration_seconds = round(
+            (_utc_now() - run_started_at).total_seconds(),
+            3,
+        )
+
+        if not dry_run:
+            try:
+                _persist_queue_run_status(
+                    run_started_at=run_started_at,
+                    status="ERROR",
+                    duration_seconds=duration_seconds,
+                    error=str(exc)[:2000],
+                )
+            except Exception:
+                pass
+
+        raise
