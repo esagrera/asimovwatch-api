@@ -2437,6 +2437,28 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
         finished_at = utc_now()
         duration_seconds = round((finished_at - started_at).total_seconds(), 3)
 
+        # ─── INTEGRACIÓ RUN_ENRICHMENT ─────────────────────────────────────
+        enrichment_executed = False
+        enrichment_result = None
+
+        if body.run_enrichment and not body.dry_run:
+            # Configura els límits de la cua (pots ajustar-los o llegir-los de config)
+            queue_result = run_enrichment_queue(
+                max_per_run=10,          # o el valor que vulguis per defecte
+                max_per_source=2,
+                retry_max=3,
+                timeout_seconds=180,
+                dry_run=False,
+            )
+            enrichment_executed = True
+            enrichment_result = {
+                "attempted": queue_result.get("result", {}).get("attempted", 0),
+                "enriched": queue_result.get("result", {}).get("enriched", 0),
+                "discarded": queue_result.get("result", {}).get("discarded", 0),
+                "failed": queue_result.get("result", {}).get("failed", 0),
+            }
+        # ────────────────────────────────────────────────────────────────────
+
         conn = get_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         try:
