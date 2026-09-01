@@ -1352,6 +1352,7 @@ def run(
         "items_failed": 0,
         "items_enriched": 0,
         "items_left_raw": 0,
+        "created_entry_ids": [],
     }
 
     sources = get_active_rss_sources(source_id=source_id)
@@ -1395,28 +1396,9 @@ def run(
 
                             new_entry_id = insert_entry(cur, payload, dedup_key)
                             counters["items_created"] += 1
+                            counters["created_entry_ids"].append(new_entry_id)
+                            counters["items_left_raw"] = counters.get("items_left_raw", 0) + 1
                             conn.commit()
-
-                            enrichment_result = run_entry_enrichment(
-                                entry_id=new_entry_id,
-                                skip_input=False,
-                            )
-
-                            enrichment_status = enrichment_result.get("status")
-
-                            if enrichment_status == "enriched":
-                                counters["items_enriched"] = counters.get("items_enriched", 0) + 1
-                            elif enrichment_status == "discarded":
-                                counters["items_discarded_by_relevance"] += 1
-                            elif enrichment_status == "error":
-                                counters["items_failed"] += 1
-                            else:
-                                counters["items_left_raw"] = counters.get("items_left_raw", 0) + 1
-                                logger.error(
-                                    "Entry %s ha acabat amb estat inesperat després de l'enriquiment: %s",
-                                    new_entry_id,
-                                    enrichment_status,
-                                )
 
                         except Exception as exc:
                             counters["items_failed"] += 1
