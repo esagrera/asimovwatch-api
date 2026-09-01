@@ -2625,16 +2625,43 @@ def get_stats():
             ) AS rejected,
 
             COUNT(*) FILTER (
-                WHERE relevance_score = 'high'
-            ) AS high_relevance,
+                WHERE input_relevance = 'high'
+            ) AS high_input_relevance,
 
             COUNT(*) FILTER (
-                WHERE relevance_score = 'medium'
-            ) AS medium_relevance,
+                WHERE input_relevance = 'medium'
+            ) AS medium_input_relevance,
 
             COUNT(*) FILTER (
-                WHERE relevance_score = 'low'
-            ) AS low_relevance
+                WHERE input_relevance = 'low'
+            ) AS low_input_relevance,
+
+            COUNT(*) FILTER (
+                WHERE input_relevance IS NULL
+            ) AS unknown_input_relevance,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                AND risk_level = 'high'
+            ) AS high_risk,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                AND risk_level = 'medium'
+            ) AS medium_risk,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                AND risk_level = 'low'
+            ) AS low_risk,
+
+            COUNT(*) FILTER (
+                WHERE processing_status = 'ENRICHED'
+                AND (
+                    risk_level = 'unknown'
+                    OR risk_level IS NULL
+                )
+            ) AS unknown_risk
 
         FROM public.entries
         """)
