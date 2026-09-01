@@ -26,7 +26,7 @@ from app.db import get_connection
 from app.source_candidates import router_candidates
 from app.llm_admin import router_llm_admin
 from app.llm_clients import get_supported_providers
-from app.crawler import run_entry_enrichment
+from app.crawler import run as run_entries_crawler, run_entry_enrichment
 from app.enrichment_queue import run_enrichment_queue
 
 
