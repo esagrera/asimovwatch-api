@@ -20,6 +20,7 @@ def generate_scheduler_run_id() -> str:
 
 def run_scheduler_cycle(
     *,
+    run_id: str,
     dry_run: bool,
     force: bool,
     acquire_lock: Callable[[], Tuple[Any, Any]],
@@ -36,29 +37,7 @@ def run_scheduler_cycle(
     worker_type: str = "scheduler",
     worker_instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    run_id = generate_scheduler_run_id()
     started_at = utc_now()
-
-    create_scheduler_run(
-        run_id=run_id,
-        mode="dry_run" if dry_run else "executed",
-        dry_run=dry_run,
-        force=force,
-        worker_type=worker_type,
-        worker_instance_id=worker_instance_id,
-    )
-
-    append_scheduler_event(
-        run_id,
-        "scheduler",
-        "created",
-        message="Execució del scheduler creada",
-        metadata={
-            "dry_run": dry_run,
-            "force": force,
-            "worker_type": worker_type,
-        },
-    )
 
     lock_conn = None
     lock_cur = None

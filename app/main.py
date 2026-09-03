@@ -29,10 +29,16 @@ from app.llm_clients import get_supported_providers
 from app.crawler import run as run_entries_crawler, run_entry_enrichment
 from app.enrichment_queue import run_enrichment_queue
 from app.scheduler_tracking import (
+    append_scheduler_event,
+    create_scheduler_run,
     get_scheduler_run,
     get_scheduler_run_events,
+    update_scheduler_run,
 )
-from app.scheduler_core import run_scheduler_cycle
+from app.scheduler_core import (
+    generate_scheduler_run_id,
+    run_scheduler_cycle,
+)
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -2787,31 +2793,107 @@ def _scheduler_run_enrichment_queue(
         dry_run=False,
     )
 
-@protected_router.post("/scheduler/run-due")
+def _run_scheduler_worker(
+    run_id: str,
+    dry_run: bool,
+    force: bool,
+) -> None:
+    try:
+        run_scheduler_cycle(
+            run_id=run_id,
+            dry_run=dry_run,
+            force=force,
+            acquire_lock=_acquire_scheduler_lock,
+            release_lock=_release_scheduler_lock,
+            get_config_map=get_config_map,
+            parse_bool=_parse_bool,
+            parse_int=_parse_int,
+            is_due=_is_due,
+            run_sources=_scheduler_run_sources,
+            run_entries_rss=_scheduler_run_entries_rss,
+            run_enrichment_queue=_scheduler_run_enrichment_queue,
+            set_telemetry=_scheduler_set_telemetry,
+            telemetry_keys={
+                "last_run_at": SCHEDULER_LAST_RUN_AT,
+                "last_status": SCHEDULER_LAST_STATUS,
+                "last_duration_seconds": (
+                    SCHEDULER_LAST_DURATION_SECONDS
+                ),
+                "last_error": SCHEDULER_LAST_ERROR,
+            },
+            worker_type="api",
+        )
+    except Exception as exc:
+        # Protecció addicional per si hi ha un error no controlat
+        # abans que run_scheduler_cycle el pugui persistir.
+        try:
+            update_scheduler_run(
+                run_id,
+                status="FAILED",
+                current_stage="scheduler",
+                current_action="worker_error",
+                error_message=str(exc)[:2000],
+                heartbeat=True,
+                finished=True,
+            )
+
+            append_scheduler_event(
+                run_id,
+                "scheduler",
+                "worker_error",
+                message="Error no controlat del worker asíncron",
+                metadata={
+                    "error_type": type(exc).__name__,
+                },
+            )
+        except Exception:
+            pass
+
+@protected_router.post(
+    "/scheduler/run-due",
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def run_scheduler_due(body: SchedulerRunRequest):
-    return run_scheduler_cycle(
+    run_id = generate_scheduler_run_id()
+
+    create_scheduler_run(
+        run_id=run_id,
+        mode="dry_run" if body.dry_run else "executed",
         dry_run=body.dry_run,
         force=body.force,
-        acquire_lock=_acquire_scheduler_lock,
-        release_lock=_release_scheduler_lock,
-        get_config_map=get_config_map,
-        parse_bool=_parse_bool,
-        parse_int=_parse_int,
-        is_due=_is_due,
-        run_sources=_scheduler_run_sources,
-        run_entries_rss=_scheduler_run_entries_rss,
-        run_enrichment_queue=_scheduler_run_enrichment_queue,
-        set_telemetry=_scheduler_set_telemetry,
-        telemetry_keys={
-            "last_run_at": SCHEDULER_LAST_RUN_AT,
-            "last_status": SCHEDULER_LAST_STATUS,
-            "last_duration_seconds": (
-                SCHEDULER_LAST_DURATION_SECONDS
-            ),
-            "last_error": SCHEDULER_LAST_ERROR,
-        },
         worker_type="api",
     )
+
+    append_scheduler_event(
+        run_id,
+        "scheduler",
+        "created",
+        message="Execució del scheduler acceptada i enviada al worker",
+        metadata={
+            "dry_run": body.dry_run,
+            "force": body.force,
+            "trigger": "api",
+        },
+    )
+
+    worker = threading.Thread(
+        target=_run_scheduler_worker,
+        args=(run_id, body.dry_run, body.force),
+        daemon=True,
+        name=f"asimovwatch-scheduler-{run_id}",
+    )
+    worker.start()
+
+    return {
+        "status": "accepted",
+        "run_id": run_id,
+        "mode": "dry_run" if body.dry_run else "executed",
+        "dry_run": body.dry_run,
+        "force": body.force,
+        "worker_started": True,
+        "status_url": f"/scheduler/runs/{run_id}",
+        "events_url": f"/scheduler/runs/{run_id}/events",
+    }
 
 @protected_router.post(
     "/crawler/entries/search",
@@ -3068,7 +3150,68 @@ def get_stats():
         FROM public.entries
         """)
 
-        return cur.fetchone()
+        entry_stats = cur.fetchone()
+
+        cur.execute("""
+        SELECT
+            run_id,
+            status,
+            mode,
+            dry_run,
+            force,
+            worker_type,
+            worker_instance_id,
+            current_stage,
+            current_action,
+            current_entry_id,
+            current_source_domain,
+            progress,
+            error_message,
+            started_at,
+            last_heartbeat_at,
+            finished_at,
+            duration_seconds,
+            updated_at
+        FROM public.scheduler_runs
+        WHERE status IN ('QUEUED', 'RUNNING')
+        ORDER BY started_at DESC
+        LIMIT 1
+        """)
+        active_run = cur.fetchone()
+
+        cur.execute("""
+        SELECT
+            run_id,
+            status,
+            mode,
+            dry_run,
+            force,
+            worker_type,
+            current_stage,
+            current_action,
+            progress,
+            error_message,
+            started_at,
+            finished_at,
+            duration_seconds,
+            updated_at
+        FROM public.scheduler_runs
+        ORDER BY started_at DESC
+        LIMIT 1
+        """)
+        last_run = cur.fetchone()
+
+        return {
+            **entry_stats,
+            "scheduler": {
+                "active_run_id": active_run["run_id"] if active_run else None,
+                "active_run_status": active_run["status"] if active_run else None,
+                "last_run_id": last_run["run_id"] if last_run else None,
+                "last_run_status": last_run["status"] if last_run else None,
+                "active_run": active_run,
+                "last_run": last_run,
+            },
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
