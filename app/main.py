@@ -19,8 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, AnyUrl, Field
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 from app.db import get_connection
 from app.source_candidates import router_candidates
@@ -28,7 +28,11 @@ from app.llm_admin import router_llm_admin
 from app.llm_clients import get_supported_providers
 from app.crawler import run as run_entries_crawler, run_entry_enrichment
 from app.enrichment_queue import run_enrichment_queue
-
+from app.scheduler_tracking import (
+    get_scheduler_run,
+    get_scheduler_run_events,
+)
+from app.scheduler_core import run_scheduler_cycle
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -2052,6 +2056,30 @@ class EntryCrawlerConfigUpdate(BaseModel):
     run_day: str = "friday"
     max_items_per_source: int
 
+class SchedulerRunRequest(BaseModel):
+    """
+    Controls per a POST /scheduler/run-due.
+
+    dry_run=True (defecte): decideix què tocaria fer, sense executar
+    cap crawler ni la cua, i sense escriure telemetria d'execució.
+
+    force=True: ignora únicament la comprovació de periodicitat
+    (last_run_at + frequency_minutes). No ignora `enabled`, no ignora
+    el lock, i no salta els límits configurats de cada mòdul.
+    """
+    dry_run: bool = True
+    force: bool = False
+
+
+# ─── SCHEDULER CONSTANTS ────────────────────────────────────────────────────
+
+SCHEDULER_LOCK_KEY = 987654321
+
+SCHEDULER_LAST_RUN_AT = "scheduler_last_run_at"
+SCHEDULER_LAST_STATUS = "scheduler_last_status"
+SCHEDULER_LAST_DURATION_SECONDS = "scheduler_last_duration_seconds"
+SCHEDULER_LAST_ERROR = "scheduler_last_error"
+
 # ─── HELPERS CRAWLER OPS ──────────────────────────────────────────────────────
 
 def _parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -2109,6 +2137,125 @@ def _validate_entry_crawler_config(
                 "max_items_per_source ha d'estar entre 1 i 100"
             ),
         )
+
+# ─── SCHEDULER HELPERS ─────────────────────────────────────────────────────────
+
+def _parse_config_datetime(value: Optional[str]) -> Optional[datetime]:
+    """
+    Parseja una data ISO guardada a public.config.
+
+    Retorna None si el valor és buit o invàlid.
+    """
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+        return ensure_utc(parsed)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_due(
+    last_run_at: Optional[str],
+    frequency_minutes: int,
+    force: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Determina si una tasca està deguda.
+
+    force=True salta només la comprovació temporal.
+    No modifica ni escriu cap configuració.
+    """
+    if force:
+        return True, "forced"
+
+    last_run = _parse_config_datetime(last_run_at)
+
+    if last_run is None:
+        return True, "never_run"
+
+    safe_frequency = max(int(frequency_minutes), 1)
+    next_run = last_run + timedelta(minutes=safe_frequency)
+
+    if next_run <= utc_now():
+        return True, "interval_elapsed"
+
+    return False, "not_due"
+
+
+def _acquire_scheduler_lock() -> Tuple[Any, Any]:
+    """
+    Intenta obtenir el lock global del scheduler.
+
+    És un lock de sessió perquè crawler i cua obren connexions
+    PostgreSQL pròpies. La connexió retornada s'ha de mantenir oberta
+    fins a cridar _release_scheduler_lock().
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT pg_try_advisory_lock(%s)",
+            (SCHEDULER_LOCK_KEY,),
+        )
+        acquired = bool(cur.fetchone()[0])
+
+        if not acquired:
+            cur.close()
+            conn.close()
+            return None, None
+
+        return conn, cur
+
+    except Exception:
+        cur.close()
+        conn.close()
+        raise
+
+
+def _release_scheduler_lock(conn: Any, cur: Any) -> None:
+    """
+    Allibera el lock de sessió i tanca la connexió dedicada.
+    """
+    if conn is None or cur is None:
+        return
+
+    try:
+        cur.execute(
+            "SELECT pg_advisory_unlock(%s)",
+            (SCHEDULER_LOCK_KEY,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _scheduler_set_telemetry(
+    key: str,
+    value: Optional[str],
+) -> None:
+    """
+    Persisteix una clau scheduler_last_* a public.config.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        _set_config_value(cur, key, value)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 # ─── CRAWLER STATUS ────────────────────────────────────────────────────────────
 
@@ -2517,6 +2664,155 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
             detail=f"Error executant crawler d'entries: {str(exc)}",
         )
 
+# ─── SCHEDULER COORDINATOR ───────────────────────────────────────────────────
+
+def _scheduler_run_sources(config_map: Dict[str, Any]) -> Dict[str, Any]:
+    from app.source_candidates import (
+        SourceCandidateDiscoverRequest,
+        discover_source_candidates,
+    )
+
+    prompt_key = (
+        config_map.get(
+            "crawler_prompt_key",
+            "Source candidates discovery",
+        )
+        or "Source candidates discovery"
+    )
+
+    brief = (
+        config_map.get(
+            "source_discovery_default_brief",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not brief:
+        raise ValueError("missing_default_brief")
+
+    return discover_source_candidates(
+        SourceCandidateDiscoverRequest(
+            prompt_key=prompt_key,
+            input_text=brief,
+            proposed_by="scheduler",
+            dry_run=False,
+        )
+    )
+
+
+def _scheduler_run_entries_rss(
+    config_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    max_items_per_source = min(
+        max(
+            _parse_int(
+                config_map.get(
+                    "entry_crawler_max_items_per_source",
+                ),
+                default=20,
+            ),
+            1,
+        ),
+        50,
+    )
+
+    return run_entries_crawler(
+        dry_run=False,
+        source_ids=None,
+        limit_per_source=max_items_per_source,
+    )
+
+
+def _scheduler_run_enrichment_queue(
+    config_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    max_per_run = min(
+        max(
+            _parse_int(
+                config_map.get(
+                    "entry_enrichment_max_per_run",
+                ),
+                default=10,
+            ),
+            1,
+        ),
+        100,
+    )
+
+    max_per_source = min(
+        max(
+            _parse_int(
+                config_map.get(
+                    "entry_enrichment_max_per_source",
+                ),
+                default=2,
+            ),
+            1,
+        ),
+        100,
+    )
+
+    retry_max = min(
+        max(
+            _parse_int(
+                config_map.get(
+                    "entry_enrichment_retry_max",
+                ),
+                default=3,
+            ),
+            0,
+        ),
+        20,
+    )
+
+    timeout_seconds = min(
+        max(
+            _parse_int(
+                config_map.get(
+                    "entry_enrichment_timeout_seconds",
+                ),
+                default=180,
+            ),
+            1,
+        ),
+        3600,
+    )
+
+    return run_enrichment_queue(
+        max_per_run=max_per_run,
+        max_per_source=max_per_source,
+        retry_max=retry_max,
+        timeout_seconds=timeout_seconds,
+        dry_run=False,
+    )
+
+@protected_router.post("/scheduler/run-due")
+def run_scheduler_due(body: SchedulerRunRequest):
+    return run_scheduler_cycle(
+        dry_run=body.dry_run,
+        force=body.force,
+        acquire_lock=_acquire_scheduler_lock,
+        release_lock=_release_scheduler_lock,
+        get_config_map=get_config_map,
+        parse_bool=_parse_bool,
+        parse_int=_parse_int,
+        is_due=_is_due,
+        run_sources=_scheduler_run_sources,
+        run_entries_rss=_scheduler_run_entries_rss,
+        run_enrichment_queue=_scheduler_run_enrichment_queue,
+        set_telemetry=_scheduler_set_telemetry,
+        telemetry_keys={
+            "last_run_at": SCHEDULER_LAST_RUN_AT,
+            "last_status": SCHEDULER_LAST_STATUS,
+            "last_duration_seconds": (
+                SCHEDULER_LAST_DURATION_SECONDS
+            ),
+            "last_error": SCHEDULER_LAST_ERROR,
+        },
+        worker_type="api",
+    )
+
 @protected_router.post(
     "/crawler/entries/search",
     status_code=status.HTTP_201_CREATED,
@@ -2781,7 +3077,49 @@ def get_stats():
         cur.close()
         conn.close()
 
+@protected_router.get(
+    "/scheduler/runs/{run_id}",
+    summary="Consulta l'estat d'una execució del scheduler",
+)
+def get_scheduler_run_status(run_id: str):
+    run = get_scheduler_run(run_id)
 
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scheduler run no trobat",
+        )
+
+    return run
+
+@protected_router.get(
+    "/scheduler/runs/{run_id}/events",
+    summary="Consulta els esdeveniments d'una execució del scheduler",
+)
+def get_scheduler_run_events_status(
+    run_id: str,
+    limit: int = 200,
+    after_sequence: Optional[int] = None,
+):
+    run = get_scheduler_run(run_id)
+
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scheduler run no trobat",
+        )
+
+    events = get_scheduler_run_events(
+        run_id,
+        limit=limit,
+        after_sequence=after_sequence,
+    )
+
+    return {
+        "run_id": run_id,
+        "count": len(events),
+        "events": events,
+    }
 
 # ─── REGISTRE DE ROUTERS ──────────────────────────────────────────────────────
 
