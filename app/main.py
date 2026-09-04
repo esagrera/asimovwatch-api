@@ -2725,7 +2725,7 @@ def _scheduler_run_entries_rss(
 
     return run_entries_crawler(
         dry_run=False,
-        source_ids=None,
+        source_id=None,
         limit_per_source=max_items_per_source,
     )
 
