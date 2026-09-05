@@ -2673,61 +2673,105 @@ def run_entry_crawler_now(body: EntryCrawlerRunRequest):
 # ─── SCHEDULER COORDINATOR ───────────────────────────────────────────────────
 
 def _scheduler_run_sources(config_map: Dict[str, Any]) -> Dict[str, Any]:
-    from app.source_candidates import (
-        SourceCandidateDiscoverRequest,
-        discover_source_candidates,
-    )
+    from app.source_candidates import SourceCandidateDiscoverRequest, discover_source_candidates
 
-    prompt_key = (
-        config_map.get(
-            "crawler_prompt_key",
-            "Source candidates discovery",
-        )
-        or "Source candidates discovery"
-    )
-
-    brief = (
-        config_map.get(
-            "source_discovery_default_brief",
-            "",
-        )
-        or ""
-    ).strip()
-
+    prompt_key = config_map.get("crawler_prompt_key", "Source candidates discovery") or "Source candidates discovery"
+    brief = (config_map.get("source_discovery_default_brief", "") or "").strip()
     if not brief:
         raise ValueError("missing_default_brief")
 
-    return discover_source_candidates(
-        SourceCandidateDiscoverRequest(
-            prompt_key=prompt_key,
-            input_text=brief,
-            proposed_by="scheduler",
-            dry_run=False,
+    started_at = utc_now()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        _set_config_value(cur, "crawler_last_status", "RUNNING")
+        _set_config_value(cur, "crawler_last_run_at", started_at.isoformat())
+        _set_config_value(cur, "crawler_last_error", None)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    try:
+        result = discover_source_candidates(
+            SourceCandidateDiscoverRequest(
+                prompt_key=prompt_key,
+                input_text=brief,
+                proposed_by="scheduler",
+                dry_run=False,
+            )
         )
-    )
+        finished_at = utc_now()
+        duration_seconds = round((finished_at - started_at).total_seconds(), 3)
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _set_config_value(cur, "crawler_last_status", "OK")
+            _set_config_value(cur, "crawler_last_duration_seconds", str(duration_seconds))
+            _set_config_value(cur, "crawler_last_error", None)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        return result
+    except Exception as exc:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _set_config_value(cur, "crawler_last_status", "ERROR")
+            _set_config_value(cur, "crawler_last_error", str(exc)[:2000])
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        raise
 
 
-def _scheduler_run_entries_rss(
-    config_map: Dict[str, Any],
-) -> Dict[str, Any]:
-    max_items_per_source = min(
-        max(
-            _parse_int(
-                config_map.get(
-                    "entry_crawler_max_items_per_source",
-                ),
-                default=20,
-            ),
-            1,
-        ),
-        50,
-    )
+def _scheduler_run_entries_rss(config_map: Dict[str, Any]) -> Dict[str, Any]:
+    max_items_per_source = min(max(_parse_int(config_map.get("entry_crawler_max_items_per_source"), default=20), 1), 50)
 
-    return run_entries_crawler(
-        dry_run=False,
-        source_id=None,
-        limit_per_source=max_items_per_source,
-    )
+    started_at = utc_now()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        _set_config_value(cur, "entry_crawler_last_status", "RUNNING")
+        _set_config_value(cur, "entry_crawler_last_run_at", started_at.isoformat())
+        _set_config_value(cur, "entry_crawler_last_error", None)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    try:
+        result = run_entries_crawler(
+            dry_run=False,
+            source_id=None,
+            limit_per_source=max_items_per_source,
+        )
+        finished_at = utc_now()
+        duration_seconds = round((finished_at - started_at).total_seconds(), 3)
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _set_config_value(cur, "entry_crawler_last_status", "OK")
+            _set_config_value(cur, "entry_crawler_last_duration_seconds", str(duration_seconds))
+            _set_config_value(cur, "entry_crawler_last_error", None)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        return result
+    except Exception as exc:
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            _set_config_value(cur, "entry_crawler_last_status", "ERROR")
+            _set_config_value(cur, "entry_crawler_last_error", str(exc)[:2000])
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        raise
 
 
 def _scheduler_run_enrichment_queue(
