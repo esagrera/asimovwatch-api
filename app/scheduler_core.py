@@ -159,7 +159,7 @@ def run_scheduler_cycle(
         sources_due_raw, sources_reason = _resolve_due(
             is_due,
             config_map,
-            "crawler_runtime",
+            "crawler_schedule_time",
             config_map.get("crawler_last_run_at"),
             sources_frequency,
             force,
@@ -168,7 +168,7 @@ def run_scheduler_cycle(
         entries_due_raw, entries_reason = _resolve_due(
             is_due,
             config_map,
-            "entry_crawler_runtime",
+            "entry_crawler_run_time",
             config_map.get("entry_crawler_last_run_at"),
             entries_frequency,
             force,
