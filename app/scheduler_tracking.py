@@ -310,3 +310,90 @@ def get_scheduler_run_events(
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+QUEUED_STALE_AFTER_SECONDS = 900   # 15 minuts (1 cicle de cron)
+RUNNING_STALE_AFTER_SECONDS = 1800  # 30 minuts (2 cicles de cron)
+
+
+def recover_stale_scheduler_runs(
+    queued_stale_after_seconds: int = QUEUED_STALE_AFTER_SECONDS,
+    running_stale_after_seconds: int = RUNNING_STALE_AFTER_SECONDS,
+) -> List[str]:
+    """
+    Marca com a FAILED els runs QUEUED o RUNNING que han deixat d'actualitzar
+    el seu heartbeat. No toca mai runs en estats terminals (COMPLETED,
+    COMPLETED_WITH_ERRORS, FAILED, SKIPPED_LOCKED).
+    No allibera cap pg_advisory_lock: només corregeix telemetria.
+    """
+    conn = get_connection()
+    recovered: List[Dict[str, Any]] = []
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT run_id, status, last_heartbeat_at
+                FROM public.scheduler_runs
+                WHERE status = 'QUEUED'
+                  AND last_heartbeat_at < NOW() - (%s * INTERVAL '1 second')
+                FOR UPDATE SKIP LOCKED
+                """,
+                (queued_stale_after_seconds,),
+            )
+            queued_stale = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT run_id, status, last_heartbeat_at
+                FROM public.scheduler_runs
+                WHERE status = 'RUNNING'
+                  AND last_heartbeat_at < NOW() - (%s * INTERVAL '1 second')
+                FOR UPDATE SKIP LOCKED
+                """,
+                (running_stale_after_seconds,),
+            )
+            running_stale = cur.fetchall()
+
+            for row in list(queued_stale) + list(running_stale):
+                cur.execute(
+                    """
+                    UPDATE public.scheduler_runs
+                    SET status = 'FAILED',
+                        current_stage = 'scheduler',
+                        current_action = 'stale_run_recovered',
+                        error_message = %s,
+                        finished_at = NOW(),
+                        duration_seconds = EXTRACT(EPOCH FROM NOW() - started_at),
+                        updated_at = NOW()
+                    WHERE run_id = %s
+                    RETURNING run_id
+                    """,
+                    (
+                        f"Run {row['status']} sense heartbeat des de "
+                        f"{row['last_heartbeat_at']}; recuperat automàticament "
+                        f"abans del nou cicle del cron.",
+                        row["run_id"],
+                    ),
+                )
+                recovered.append(row)
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    for row in recovered:
+        append_scheduler_event(
+            row["run_id"],
+            "scheduler",
+            "stale_run_recovered",
+            message="Run marcat com FAILED per manca de heartbeat abans del nou cicle del cron.",
+            metadata={
+                "previous_status": row["status"],
+                "queued_stale_after_seconds": queued_stale_after_seconds,
+                "running_stale_after_seconds": running_stale_after_seconds,
+            },
+        )
+
+    return [row["run_id"] for row in recovered]        

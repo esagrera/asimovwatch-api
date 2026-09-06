@@ -34,6 +34,7 @@ from app.scheduler_tracking import (
     get_scheduler_run,
     get_scheduler_run_events,
     update_scheduler_run,
+    recover_stale_scheduler_runs,
 )
 from app.scheduler_core import (
     generate_scheduler_run_id,
@@ -2866,10 +2867,9 @@ def _run_scheduler_worker(
                 "last_error": SCHEDULER_LAST_ERROR,
             },
             worker_type="api",
+            recover_stale_runs=recover_stale_scheduler_runs,
         )
     except Exception as exc:
-        # Protecció addicional per si hi ha un error no controlat
-        # abans que run_scheduler_cycle el pugui persistir.
         try:
             update_scheduler_run(
                 run_id,

@@ -6,6 +6,7 @@ from app.scheduler_tracking import (
     append_scheduler_event,
     create_scheduler_run,
     update_scheduler_run,
+    recover_stale_scheduler_runs,
 )
 
 
@@ -36,7 +37,11 @@ def run_scheduler_cycle(
     telemetry_keys: Dict[str, str],
     worker_type: str = "scheduler",
     worker_instance_id: Optional[str] = None,
+    recover_stale_runs: Callable[..., Any] = recover_stale_scheduler_runs,  # NOU
 ) -> Dict[str, Any]:
+
+    recover_stale_runs()
+
     started_at = utc_now()
 
     lock_conn = None
