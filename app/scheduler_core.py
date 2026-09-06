@@ -8,7 +8,7 @@ from app.scheduler_tracking import (
     update_scheduler_run,
     recover_stale_scheduler_runs,
 )
-
+from app.scheduler_utils import is_due_daily_at
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -18,6 +18,40 @@ def generate_scheduler_run_id() -> str:
     timestamp = utc_now().strftime("%Y%m%d_%H%M%S")
     return f"scheduler_{timestamp}_{uuid.uuid4().hex[:8]}"
 
+def _resolve_due(
+    is_due: Callable[..., Tuple[bool, str]],
+    config_map: Dict[str, Any],
+    runtime_key: str,
+    last_run_at: Optional[str],
+    frequency_minutes: int,
+    force: bool,
+) -> Tuple[bool, str]:
+    """
+    Decideix due/reason per a un mòdul concret (sources o entries_rss).
+
+    L'admin.html actual NO envia el preset (hourly/daily/weekly/monthly)
+    com a clau pròpia al backend: només envia el resultat calculat en
+    minuts (frequency_minutes) i el runtime "HH:MM" com a metadada
+    editorial. Per tant, l'única manera fiable de saber si l'usuari ha
+    triat el preset "Diàriament" és comprovar frequency_minutes == 1440.
+
+    - Si frequency_minutes == 1440 I hi ha un runtime_key vàlid a
+      config_map: s'aplica execució diària a hora fixa
+      (is_due_daily_at), respectant l'hora configurada a l'admin.
+    - Si frequency_minutes != 1440 (hourly=60, weekly=10080,
+      monthly=43200) o no hi ha runtime configurat: es manté el
+      comportament original per interval (is_due), tal com espera
+      l'usuari quan tria "Cada hora", "Setmanalment" o "Mensualment".
+
+    Això garanteix que activar el Pas 3 no trenca cap dels 4 presets
+    existents a l'admin: només millora el preset "Diàriament", que
+    passa de "cada 1440 minuts des de l'última execució" a "cada dia a
+    l'hora exacta configurada".
+    """
+    runtime_value = (config_map.get(runtime_key) or "").strip()
+    if frequency_minutes == 1440 and runtime_value:
+        return is_due_daily_at(last_run_at, runtime_value, force)
+    return is_due(last_run_at, frequency_minutes, force)
 
 def run_scheduler_cycle(
     *,
@@ -122,16 +156,25 @@ def run_scheduler_cycle(
             default=15,
         )
 
-        sources_due_raw, sources_reason = is_due(
+        sources_due_raw, sources_reason = _resolve_due(
+            is_due,
+            config_map,
+            "crawler_runtime",
             config_map.get("crawler_last_run_at"),
             sources_frequency,
             force,
         )
-        entries_due_raw, entries_reason = is_due(
+
+        entries_due_raw, entries_reason = _resolve_due(
+            is_due,
+            config_map,
+            "entry_crawler_runtime",
             config_map.get("entry_crawler_last_run_at"),
             entries_frequency,
             force,
         )
+
+        # enrichment_queue no té preset ni runtime a l'admin: sempre interval.
         enrichment_due_raw, enrichment_reason = is_due(
             config_map.get("entry_enrichment_last_run_at"),
             enrichment_frequency,
