@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, AnyUrl, Field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Literal
 from datetime import datetime, timezone, timedelta
 
 from app.db import get_connection
@@ -160,11 +160,22 @@ class EntryIngest(BaseModel):
     editor_notes: Optional[str] = None
     validation_notes: Optional[str] = None
 
+ReviewStatus = Literal["NEW", "IN_REVIEW", "APPROVED", "REJECTED"]
+
 class EntryReview(BaseModel):
-    review_status: str
+    review_status: ReviewStatus
     reviewer: Optional[str] = None
     editor_notes: Optional[str] = None
     validation_notes: Optional[str] = None
+    needs_info: Optional[bool] = None
+
+
+class EntryBatchReview(BaseModel):
+    entry_ids: List[int]
+    review_status: Optional[ReviewStatus] = None
+    reviewer: Optional[str] = None
+    editor_notes: Optional[str] = None
+    needs_info: Optional[bool] = None
 
 class EntryEnrich(BaseModel):
     processing_status: Optional[str] = None
@@ -785,6 +796,8 @@ def db_check():
 
 # ─── ENTRIES LIST ─────────────────────────────────────────────────────────────
 
+BIHP_ALLOWED_VALUES = ("green", "yellow", "red", "unknown")
+
 @protected_router.get("/entries")
 def list_entries(
     limit: int = 20,
@@ -798,80 +811,97 @@ def list_entries(
     relevance_score: Optional[str] = None,
     entry_category: Optional[str] = None,
     analyzed_provider: Optional[str] = None,
+    # --- Nous paràmetres Fase 1 (additius) ---
+    institution_type: Optional[str] = None,
+    analyzed_model: Optional[str] = None,
+    needs_info: Optional[bool] = None,
+    human_protection_declared: Optional[str] = None,
+    human_protection_verifiable: Optional[str] = None,
+    human_protection_depth: Optional[str] = None,
     q: Optional[str] = None,
 ):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-
     try:
         safe_limit = min(max(limit, 1), 100)
         safe_offset = max(offset, 0)
-
-        filters = []
-        params = []
+        filters: List[str] = []
+        params: List[Any] = []
 
         if status:
             filters.append("review_status = %s")
             params.append(status.upper())
-
         if risk_level:
             filters.append("risk_level = %s")
             params.append(risk_level.lower())
-
         if source_type:
             filters.append("source_type = %s")
             params.append(source_type.lower())
-
         if country_region:
             filters.append("LOWER(country_region) = LOWER(%s)")
             params.append(country_region)
-
         if reviewer:
             filters.append("LOWER(reviewer) = LOWER(%s)")
             params.append(reviewer)
-
         if processing_status:
             filters.append("processing_status = %s")
             params.append(processing_status.upper())
-
         if relevance_score:
             filters.append("relevance_score = %s")
             params.append(relevance_score.lower())
-
         if entry_category:
             filters.append("entry_category = %s")
             params.append(entry_category)
-
         if analyzed_provider:
             filters.append("LOWER(analyzed_provider) = LOWER(%s)")
-            params.append(analyzed_provider)   
+            params.append(analyzed_provider)
+
+        # --- Nous filtres Fase 1 ---
+        if institution_type:
+            filters.append("LOWER(institution_type) = LOWER(%s)")
+            params.append(institution_type)
+        if analyzed_model:
+            filters.append("LOWER(analyzed_model) = LOWER(%s)")
+            params.append(analyzed_model)
+        if needs_info is not None:
+            filters.append("needs_info = %s")
+            params.append(needs_info)
+        for field_name, value in (
+            ("human_protection_declared", human_protection_declared),
+            ("human_protection_verifiable", human_protection_verifiable),
+            ("human_protection_depth", human_protection_depth),
+        ):
+            if value:
+                if value.lower() not in BIHP_ALLOWED_VALUES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{field_name} ha de ser un de: {', '.join(BIHP_ALLOWED_VALUES)}",
+                    )
+                filters.append(f"{field_name} = %s")
+                params.append(value.lower())
 
         if q:
-            filters.append("""
-                (LOWER(source_title) LIKE LOWER(%s)
-                OR LOWER(raw_snippet) LIKE LOWER(%s)
-                OR LOWER(summary_factual) LIKE LOWER(%s)
-                OR LOWER(translated_summary_ca) LIKE LOWER(%s))
-            """)
+            filters.append(
+                "(LOWER(source_title) LIKE LOWER(%s) OR LOWER(raw_snippet) LIKE LOWER(%s) "
+                "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+            )
             like_q = f"%{q}%"
             params.extend([like_q, like_q, like_q, like_q])
 
-        where_clause = ""
-        if filters:
-            where_clause = "WHERE " + " AND ".join(filters)
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
         count_query = f"SELECT COUNT(*) AS total FROM public.entries {where_clause}"
         cur.execute(count_query, params)
         total = cur.fetchone()["total"]
 
         data_query = f"""
-            SELECT
-                id, source_url, source_domain, source_title, source_type,
-                source_language, country_region, risk_level, review_status,
-                reviewer, published_date, detected_at, ingested_at, ingest_status,
-                summary_factual, theme_tags, affected_principles, processing_status,
-                relevance_score, relevance_reason, enriched_at, enriched_model,
-                translated_summary_ca
+            SELECT id, source_url, source_domain, source_title, source_type, source_language,
+                   country_region, institution_type, risk_level, review_status, reviewer,
+                   needs_info, published_date, detected_at, ingested_at, ingest_status,
+                   summary_factual, theme_tags, affected_principles, processing_status,
+                   relevance_score, relevance_reason, analyzed_provider, analyzed_model,
+                   human_protection_declared, human_protection_verifiable, human_protection_depth,
+                   enriched_at, enriched_model, translated_summary_ca
             FROM public.entries
             {where_clause}
             ORDER BY detected_at DESC NULLS LAST, id DESC
@@ -886,12 +916,12 @@ def list_entries(
             "limit": safe_limit,
             "offset": safe_offset,
             "count": len(rows),
-            "items": rows
+            "items": rows,
         }
-
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
     finally:
         cur.close()
         conn.close()
@@ -1310,12 +1340,10 @@ def create_entry(entry: EntryIngest):
 
 # ─── REVIEW ENTRY ─────────────────────────────────────────────────────────────
 
-@protected_router.put("/entries/{entry_id}/review",
-    responses={404: {"description": "Entry not found"}})
+@protected_router.put("/entries/{entry_id}/review", responses={404: {"description": "Entry not found"}})
 def review_entry(entry_id: int, review: EntryReview):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-
     try:
         cur.execute("SELECT id FROM public.entries WHERE id = %s", (entry_id,))
         if not cur.fetchone():
@@ -1323,34 +1351,123 @@ def review_entry(entry_id: int, review: EntryReview):
 
         reviewed_at = utc_now() if review.review_status != "NEW" else None
 
-        cur.execute("""
-            UPDATE public.entries
-            SET
-                review_status = %s,
-                reviewer = %s,
-                editor_notes = %s,
-                validation_notes = %s,
-                reviewed_at = COALESCE(%s, reviewed_at),
-                updated_at = now()
-            WHERE id = %s
-            RETURNING
-                id, source_url, source_title, source_domain,
-                review_status, reviewer, editor_notes,
-                validation_notes, reviewed_at, updated_at
-        """, (
-            review.review_status, review.reviewer, review.editor_notes,
-            review.validation_notes, reviewed_at, entry_id
-        ))
+        fields = [
+            "review_status = %s",
+            "reviewer = %s",
+            "editor_notes = %s",
+            "validation_notes = %s",
+            "reviewed_at = COALESCE(%s, reviewed_at)",
+            "updated_at = now()",
+        ]
+        values = [
+            review.review_status,
+            review.reviewer,
+            review.editor_notes,
+            review.validation_notes,
+            reviewed_at,
+        ]
 
+        if review.needs_info is not None:
+            fields.insert(-1, "needs_info = %s")
+            values.append(review.needs_info)
+
+        values.append(entry_id)
+
+        cur.execute(
+            f"""
+            UPDATE public.entries SET {', '.join(fields)}
+            WHERE id = %s
+            RETURNING id, source_url, source_title, source_domain,
+                      review_status, reviewer, editor_notes, validation_notes,
+                      needs_info, reviewed_at, updated_at
+            """,
+            values,
+        )
         updated = cur.fetchone()
         conn.commit()
         return {"status": "updated", "item": updated}
-
     except HTTPException:
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update entry: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update entry: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+@protected_router.post("/entries/batch-review")
+def batch_review_entries(review: EntryBatchReview):
+    entry_ids = review.entry_ids or []
+
+    if not entry_ids:
+        raise HTTPException(status_code=400, detail="entry_ids no pot estar buit")
+    if len(entry_ids) > 500:
+        raise HTTPException(status_code=400, detail="Màxim de 500 entry_ids per operació batch")
+    if len(set(entry_ids)) != len(entry_ids):
+        raise HTTPException(status_code=400, detail="entry_ids conté IDs duplicats")
+
+    if review.review_status is None and review.reviewer is None \
+            and review.editor_notes is None and review.needs_info is None:
+        raise HTTPException(status_code=400, detail="No s'ha proporcionat cap camp per actualitzar")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        fields: List[str] = []
+        values: List[Any] = []
+
+        if review.review_status is not None:
+            fields.append("review_status = %s")
+            values.append(review.review_status)
+            # reviewed_at calculat en Python (coherent amb PUT /entries/{id}/review),
+            # no amb CASE WHEN dins la mateixa query.
+            fields.append("reviewed_at = %s")
+            values.append(utc_now() if review.review_status != "NEW" else None)
+
+        if review.reviewer is not None:
+            fields.append("reviewer = %s")
+            values.append(review.reviewer)
+
+        if review.editor_notes is not None:
+            fields.append("editor_notes = %s")
+            values.append(review.editor_notes)
+
+        if review.needs_info is not None:
+            fields.append("needs_info = %s")
+            values.append(review.needs_info)
+
+        cur.execute("SELECT id FROM public.entries WHERE id = ANY(%s)", (entry_ids,))
+        existing_ids = [row["id"] for row in cur.fetchall()]
+        missing_ids = [eid for eid in entry_ids if eid not in existing_ids]
+
+        fields.append("updated_at = now()")
+        values.append(entry_ids)
+
+        cur.execute(
+            f"""
+            UPDATE public.entries SET {', '.join(fields)}
+            WHERE id = ANY(%s)
+            RETURNING id, review_status, needs_info, reviewer, reviewed_at, updated_at
+            """,
+            values,
+        )
+        updated = cur.fetchall()
+        conn.commit()
+
+        return {
+            "status": "updated",
+            "requested_count": len(entry_ids),
+            "updated_count": len(updated),
+            "updated_ids": sorted(row["id"] for row in updated),
+            "missing_ids": missing_ids,
+            "items": updated,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to batch review entries: {e}")
     finally:
         cur.close()
         conn.close()

@@ -5,7 +5,7 @@ import json
 import re
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 
 import psycopg2
 import psycopg2.errors
@@ -971,6 +971,90 @@ def review_source_candidate(candidate_id: int, payload: SourceCandidateReview):
         if conn:
             conn.close()
 
+class SourceCandidateBatchReview(BaseModel):
+    """Payload per canviar l'estat editorial de múltiples candidates alhora."""
+    candidate_ids: List[int]
+    status: Optional[Literal["PENDING", "APPROVED", "REJECTED"]] = None
+    review_notes: Optional[str] = None
+
+
+@router_candidates.post("/batch-review")
+def batch_review_source_candidates(payload: SourceCandidateBatchReview):
+    """
+    Actualitza status i/o review_notes de múltiples candidates en una
+    sola transacció. Mateix patró síncron que /entries/batch-review
+    (no calen crides a LLM, és un UPDATE escalar sobre N files).
+
+    No valida transicions d'estat: permet PENDING -> APPROVED/REJECTED
+    directament, o reobrir a PENDING, igual que l'endpoint individual
+    /review ja permet.
+    """
+    candidate_ids = payload.candidate_ids or []
+
+    if not candidate_ids:
+        raise HTTPException(status_code=400, detail="candidate_ids no pot estar buit")
+    if len(candidate_ids) > 500:
+        raise HTTPException(status_code=400, detail="Màxim de 500 candidate_ids per operació batch")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise HTTPException(status_code=400, detail="candidate_ids conté IDs duplicats")
+    if payload.status is None and payload.review_notes is None:
+        raise HTTPException(status_code=400, detail="No s'ha proporcionat cap camp per actualitzar")
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            fields = []
+            values = []
+
+            if payload.status is not None:
+                fields.append("status = %s")
+                values.append(payload.status)
+                fields.append("reviewed_at = NOW()")
+
+            if payload.review_notes is not None:
+                fields.append("review_notes = %s")
+                values.append(payload.review_notes)
+
+            cur.execute(
+                "SELECT id FROM public.source_candidates WHERE id = ANY(%s)",
+                (candidate_ids,)
+            )
+            existing_ids = [row["id"] for row in cur.fetchall()]
+            missing_ids = [cid for cid in candidate_ids if cid not in existing_ids]
+
+            values.append(candidate_ids)
+
+            cur.execute(
+                f"""
+                UPDATE public.source_candidates SET {', '.join(fields)}
+                WHERE id = ANY(%s)
+                RETURNING id, status, review_notes, reviewed_at
+                """,
+                values,
+            )
+            updated = cur.fetchall()
+            conn.commit()
+
+            return {
+                "status": "updated",
+                "requested_count": len(candidate_ids),
+                "updated_count": len(updated),
+                "updated_ids": sorted(row["id"] for row in updated),
+                "missing_ids": missing_ids,
+                "items": updated,
+            }
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to batch review source candidates: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 # =============================================================================
 # ENDPOINT DE PROMOCIÓ — POST /source-candidates/{id}/promote
