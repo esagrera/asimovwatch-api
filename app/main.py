@@ -1088,6 +1088,8 @@ def aggregate_entries(
             "review_status",
             "analyzed_provider",
             "analyzed_model",
+            "country_region",
+            "institution_type",
             "risk_level",
             "relevance_score",
             "input_relevance",
@@ -1165,6 +1167,8 @@ def aggregate_entries(
         nullable_group_fields = {
             "analyzed_provider",
             "analyzed_model",
+            "country_region",
+            "institution_type",
             "input_relevance",
             "human_protection_declared",
             "human_protection_verifiable",
