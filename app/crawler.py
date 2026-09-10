@@ -1049,7 +1049,7 @@ def run_entry_enrichment(
                     final_result.get("translated_summary_ca"),
                     final_result.get("translated_whyitmatters_ca"),
                     final_result.get("translated_debatequestions_ca"),
-                    output_llm_result["model_used"],
+                    primary_llm_result.get("model_used"),
                     entry_id,
                 ))
                 conn.commit()
