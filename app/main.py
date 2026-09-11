@@ -1066,6 +1066,7 @@ def aggregate_entries(
     analyzed_provider: Optional[str] = None,
     analyzed_model: Optional[str] = None,
     risk_level: Optional[str] = None,
+    source_type: Optional[str] = None,
     relevance_score: Optional[str] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
@@ -1145,6 +1146,10 @@ def aggregate_entries(
         if risk_level:
             filters.append("risk_level = %s")
             params.append(risk_level.lower())
+        
+        if source_type:
+            filters.append("source_type = %s")
+            params.append(source_type.lower())
         
         if relevance_score:
             filters.append("relevance_score = %s")
