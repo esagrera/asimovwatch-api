@@ -1070,6 +1070,13 @@ def aggregate_entries(
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     limit: int = 50,
+    q: Optional[str] = None,
+    country_region: Optional[str] = None,
+    institution_type: Optional[str] = None,
+    needs_info: Optional[bool] = None,
+    human_protection_declared: Optional[str] = None,
+    human_protection_verifiable: Optional[str] = None,
+    human_protection_depth: Optional[str] = None,
 ):
     """
     Agregació d'entries per un camp específic amb filtres opcionals.
@@ -1150,6 +1157,42 @@ def aggregate_entries(
         if date_to:
             filters.append("detected_at <= %s")
             params.append(ensure_utc(date_to))
+        
+        if q:
+            filters.append(
+                "(LOWER(source_title) LIKE LOWER(%s) "
+                "OR LOWER(raw_snippet) LIKE LOWER(%s) "
+                "OR LOWER(summary_factual) LIKE LOWER(%s) "
+                "OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+            )
+            like_q = f"%{q}%"
+            params.extend([like_q, like_q, like_q, like_q])
+        
+        if country_region:
+            filters.append("LOWER(country_region) = LOWER(%s)")
+            params.append(country_region)
+        
+        if institution_type:
+            filters.append("LOWER(institution_type) = LOWER(%s)")
+            params.append(institution_type)
+        
+        if needs_info is not None:
+            filters.append("needs_info = %s")
+            params.append(needs_info)
+        
+        for field_name, value in [
+            ("human_protection_declared", human_protection_declared),
+            ("human_protection_verifiable", human_protection_verifiable),
+            ("human_protection_depth", human_protection_depth),
+        ]:
+            if value:
+                if value.lower() not in BIHP_ALLOWED_VALUES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{field_name} ha de ser un de: {', '.join(BIHP_ALLOWED_VALUES)}",
+                    )
+                filters.append(f"{field_name} = %s")
+                params.append(value.lower())
         
         where_clause = ""
         if filters:
