@@ -28,6 +28,11 @@ from app.llm_admin import router_llm_admin
 from app.llm_clients import get_supported_providers
 from app.crawler import run as run_entries_crawler, run_entry_enrichment
 from app.enrichment_queue import run_enrichment_queue
+from app.entries_search import (
+    EntriesSearchRequest,
+    FilterGroup,
+    build_entries_search_query,
+)
 from app.scheduler_tracking import (
     append_scheduler_event,
     create_scheduler_run,
@@ -1264,6 +1269,283 @@ def aggregate_entries(
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+# ─── ENTRIES SEARCH (bàsics + provider/model + regles BIHP combinables) ─────
+
+@protected_router.post("/entries/search")
+def search_entries(body: EntriesSearchRequest):
+    """
+    Cerca d'entries combinant filtres bàsics (review_status, risk_level,
+    source_type, country_region, institution_type, needs_info),
+    provider/model, i un constructor de regles AND/OR limitat als 3 eixos
+    BIHP (human_protection_declared/verifiable/depth).
+
+    Invocar només quan el bloc BIHP tingui alguna regla activa; en cas
+    contrari GET /entries ja cobreix el mateix resultat.
+
+    Exemple de cos:
+    {
+      "limit": 20, "offset": 0,
+      "review_status": "NEW", "risk_level": "high", "source_type": "company",
+      "filter": {
+        "root_operator": "OR",
+        "rules": [
+          {"field": "human_protection_declared", "operator": "equals", "value": "red"},
+          {"field": "human_protection_verifiable", "operator": "equals", "value": "red"}
+        ]
+      }
+    }
+    """
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        count_query, data_query, count_params, data_params, safe_limit = build_entries_search_query(body)
+
+        cur.execute(count_query, count_params)
+        total = cur.fetchone()["total"]
+
+        cur.execute(data_query, data_params)
+        rows = cur.fetchall()
+
+        return {
+            "total": total,
+            "limit": safe_limit,
+            "offset": max(body.offset, 0),
+            "count": len(rows),
+            "items": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ─── SAVED ENTRY FILTERS (vistes de filtres desades, abast complet) ─────────
+# filter_definition guarda TOT l'estat de filtres (bàsics + provider/model +
+# bihp_filter), perquè l'objectiu és desar combinacions com:
+# review_status=NEW + source_type=company + risk_level=high + BIHP combinat.
+
+class SavedEntryFilterCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    filter_definition: dict
+    scope: str = "personal"
+    owner_identifier: Optional[str] = None
+    is_favorite: bool = False
+
+
+class SavedEntryFilterUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    filter_definition: Optional[dict] = None
+    scope: Optional[str] = None
+    owner_identifier: Optional[str] = None
+    is_favorite: Optional[bool] = None
+
+
+def _validate_filter_definition(filter_definition: dict) -> None:
+    """Valida nomes la subestructura 'bihp_filter' (si existeix) contra
+    FilterGroup. La resta del document (basic_filters, provider_model)
+    son camps plans lliures de validar aqui; ja es validen quan
+    s'executen realment a /entries/search."""
+    bihp_filter = filter_definition.get("bihp_filter")
+    if bihp_filter:
+        try:
+            FilterGroup(**bihp_filter)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"bihp_filter no vàlid dins filter_definition: {e}")
+
+
+@protected_router.get("/saved-entry-filters")
+def list_saved_entry_filters(
+    scope: Optional[str] = None,
+    owner_identifier: Optional[str] = None,
+):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        filters = []
+        params = []
+        if scope:
+            filters.append("scope = %s")
+            params.append(scope)
+        if owner_identifier:
+            filters.append("owner_identifier = %s")
+            params.append(owner_identifier)
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        cur.execute(
+            f"""
+            SELECT id, name, description, filter_definition, scope,
+                   owner_identifier, is_favorite, created_at, updated_at
+            FROM public.saved_entry_filters
+            {where_clause}
+            ORDER BY is_favorite DESC, updated_at DESC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        return {"count": len(rows), "items": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@protected_router.post("/saved-entry-filters", status_code=status.HTTP_201_CREATED)
+def create_saved_entry_filter(body: SavedEntryFilterCreate):
+    if body.scope not in ("personal", "editorial"):
+        raise HTTPException(status_code=400, detail="scope ha de ser 'personal' o 'editorial'")
+
+    _validate_filter_definition(body.filter_definition)
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            """
+            INSERT INTO public.saved_entry_filters
+                (name, description, filter_definition, scope, owner_identifier, is_favorite)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, name, description, filter_definition, scope,
+                      owner_identifier, is_favorite, created_at, updated_at
+            """,
+            (
+                body.name.strip(),
+                body.description,
+                Json(body.filter_definition),
+                body.scope,
+                body.owner_identifier,
+                body.is_favorite,
+            ),
+        )
+        created = cur.fetchone()
+        conn.commit()
+        return {"status": "created", "item": created}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@protected_router.get("/saved-entry-filters/{filter_id}")
+def get_saved_entry_filter(filter_id: int):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            """
+            SELECT id, name, description, filter_definition, scope,
+                   owner_identifier, is_favorite, created_at, updated_at
+            FROM public.saved_entry_filters WHERE id = %s
+            """,
+            (filter_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Filtre desat no trobat")
+        return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@protected_router.put("/saved-entry-filters/{filter_id}")
+def update_saved_entry_filter(filter_id: int, body: SavedEntryFilterUpdate):
+    if body.filter_definition is not None:
+        _validate_filter_definition(body.filter_definition)
+
+    if body.scope is not None and body.scope not in ("personal", "editorial"):
+        raise HTTPException(status_code=400, detail="scope ha de ser 'personal' o 'editorial'")
+
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT id FROM public.saved_entry_filters WHERE id = %s", (filter_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Filtre desat no trobat")
+
+        fields: List[str] = []
+        values: List[Any] = []
+        if body.name is not None:
+            fields.append("name = %s")
+            values.append(body.name.strip())
+        if body.description is not None:
+            fields.append("description = %s")
+            values.append(body.description)
+        if body.filter_definition is not None:
+            fields.append("filter_definition = %s")
+            values.append(Json(body.filter_definition))
+        if body.scope is not None:
+            fields.append("scope = %s")
+            values.append(body.scope)
+        if body.owner_identifier is not None:
+            fields.append("owner_identifier = %s")
+            values.append(body.owner_identifier)
+        if body.is_favorite is not None:
+            fields.append("is_favorite = %s")
+            values.append(body.is_favorite)
+
+        if not fields:
+            raise HTTPException(status_code=400, detail="No s'ha proporcionat cap camp per actualitzar")
+
+        values.append(filter_id)
+        cur.execute(
+            f"""
+            UPDATE public.saved_entry_filters SET {', '.join(fields)}
+            WHERE id = %s
+            RETURNING id, name, description, filter_definition, scope,
+                      owner_identifier, is_favorite, created_at, updated_at
+            """,
+            values,
+        )
+        updated = cur.fetchone()
+        conn.commit()
+        return {"status": "updated", "item": updated}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@protected_router.delete("/saved-entry-filters/{filter_id}")
+def delete_saved_entry_filter(filter_id: int):
+    conn = get_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "DELETE FROM public.saved_entry_filters WHERE id = %s RETURNING id",
+            (filter_id,),
+        )
+        deleted = cur.fetchone()
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Filtre desat no trobat")
+        conn.commit()
+        return {"status": "deleted", "id": deleted["id"]}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
