@@ -1571,7 +1571,7 @@ def get_entry(entry_id: int):
                     input_relevance, input_relevance_reason, ready_for_primary,
                     clean_input_text, input_summary, input_quality, input_quality_notes,
                     entry_category, analyzed_provider, analyzed_model, bihp_directives,
-                    review_status, reviewer, reviewed_at, editor_notes, validation_notes,
+                    review_status, needs_info, reviewer, reviewed_at, editor_notes, validation_notes,
                     dedup_key, ingest_status, ingested_at, updated_at,
                     processing_status, processing_error, processing_retries,
                     relevance_score, relevance_reason, enriched_at, enriched_model,
