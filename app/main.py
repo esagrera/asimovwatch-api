@@ -886,12 +886,20 @@ def list_entries(
                 params.append(value.lower())
 
         if q:
-            filters.append(
-                "(LOWER(source_title) LIKE LOWER(%s) OR LOWER(raw_snippet) LIKE LOWER(%s) "
-                "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
-            )
-            like_q = f"%{q}%"
-            params.extend([like_q, like_q, like_q, like_q])
+            if q.strip().isdigit():
+                filters.append(
+                    "(id::text LIKE %s OR LOWER(source_title) LIKE LOWER(%s) OR LOWER(raw_snippet) LIKE LOWER(%s) "
+                    "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+                )
+                like_q = f"%{q}%"
+                params.extend([like_q, like_q, like_q, like_q, like_q])
+            else:
+                filters.append(
+                    "(LOWER(source_title) LIKE LOWER(%s) OR LOWER(raw_snippet) LIKE LOWER(%s) "
+                    "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+                )
+                like_q = f"%{q}%"
+                params.extend([like_q, like_q, like_q, like_q])
 
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
