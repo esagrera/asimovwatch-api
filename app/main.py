@@ -1683,38 +1683,34 @@ def review_entry(entry_id: int, review: EntryReview):
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Entry not found")
 
-        reviewed_at = utc_now() if review.review_status != "NEW" else None
+        reviewed_at = utcnow() if review.reviewstatus != "NEW" else None
 
         fields = [
-            "review_status = %s",
+            "reviewstatus = %s",
             "reviewer = %s",
-            "editor_notes = %s",
-            "validation_notes = %s",
-            "reviewed_at = COALESCE(%s, reviewed_at)",
-            "updated_at = now()",
+            "editornotes = %s",
+            "validationnotes = %s",
+            "reviewedat = COALESCE(%s, reviewedat)",
         ]
         values = [
-            review.review_status,
+            review.reviewstatus,
             review.reviewer,
-            review.editor_notes,
-            review.validation_notes,
+            review.editornotes,
+            review.validationnotes,
             reviewed_at,
         ]
 
-        if review.needs_info is not None:
-            fields.insert(-1, "needs_info = %s")
-            values.append(review.needs_info)
+        if review.needsinfo is not None:
+            fields.append("needsinfo = %s")
+            values.append(review.needsinfo)
 
+        fields.append("updatedat = now()")
         values.append(entry_id)
 
         cur.execute(
-            f"""
-            UPDATE public.entries SET {', '.join(fields)}
-            WHERE id = %s
-            RETURNING id, source_url, source_title, source_domain,
-                      review_status, reviewer, editor_notes, validation_notes,
-                      needs_info, reviewed_at, updated_at
-            """,
+            f"UPDATE public.entries SET {', '.join(fields)} WHERE id = %s "
+            f"RETURNING id, sourceurl, sourcetitle, sourcedomain, reviewstatus, reviewer, "
+            f"editornotes, validationnotes, needsinfo, reviewedat, updatedat",
             values,
         )
         updated = cur.fetchone()
