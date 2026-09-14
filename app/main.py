@@ -1683,34 +1683,34 @@ def review_entry(entry_id: int, review: EntryReview):
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Entry not found")
 
-        reviewed_at = utcnow() if review.reviewstatus != "NEW" else None
+        reviewed_at = utc_now() if review.review_status != "NEW" else None
 
         fields = [
-            "reviewstatus = %s",
+            "review_status = %s",
             "reviewer = %s",
-            "editornotes = %s",
-            "validationnotes = %s",
-            "reviewedat = COALESCE(%s, reviewedat)",
+            "editor_notes = %s",
+            "validation_notes = %s",
+            "reviewed_at = COALESCE(%s, reviewed_at)",
         ]
         values = [
-            review.reviewstatus,
+            review.review_status,
             review.reviewer,
-            review.editornotes,
-            review.validationnotes,
+            review.editor_notes,
+            review.validation_notes,
             reviewed_at,
         ]
 
-        if review.needsinfo is not None:
-            fields.append("needsinfo = %s")
-            values.append(review.needsinfo)
+        if review.needs_info is not None:
+            fields.append("needs_info = %s")
+            values.append(review.needs_info)
 
-        fields.append("updatedat = now()")
+        fields.append("updated_at = now()")
         values.append(entry_id)
 
         cur.execute(
             f"UPDATE public.entries SET {', '.join(fields)} WHERE id = %s "
-            f"RETURNING id, sourceurl, sourcetitle, sourcedomain, reviewstatus, reviewer, "
-            f"editornotes, validationnotes, needsinfo, reviewedat, updatedat",
+            f"RETURNING id, source_url, source_title, source_domain, review_status, reviewer, "
+            f"editor_notes, validation_notes, needs_info, reviewed_at, updated_at",
             values,
         )
         updated = cur.fetchone()
