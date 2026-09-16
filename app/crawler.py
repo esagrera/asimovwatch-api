@@ -592,6 +592,12 @@ def _build_primary_input_text(
             summary = ""
             source_note = "Origen: entrada processada sense executar la fase Input."
 
+    raw_source_language = (entry.get('source_language') or '').strip().lower()
+    if raw_source_language not in ('ca', 'en'):
+        primary_language = 'en'
+    else:
+        primary_language = raw_source_language
+
     return f"""Metadades de la peça:
 source_url: {entry.get('source_url', '')}
 source_domain: {entry.get('source_domain', '')}
@@ -600,6 +606,8 @@ source_type: {entry.get('source_type') or 'desconegut'}
 country_region: {entry.get('country_region') or 'desconegut'}
 institution_type: {entry.get('institution_type') or 'desconegut'}
 published_date: {entry.get('published_date') or 'desconeguda'}
+source_language: {raw_source_language or 'desconegut'}
+primary_language: {primary_language}
 
 {source_note}
 
