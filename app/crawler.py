@@ -677,8 +677,8 @@ def _validate_and_normalize_final_output(
 ) -> Dict[str, Any]:
     """
     Combina i valida el resultat final a persistir:
-    - Els camps textuals/traduïts venen d'output_result (fase Output: neteja
-      editorial + traducció al català).
+    - Els camps textuals bilingues (_ca / _en) venen d'output_result (fase
+      Output: copia a l'idioma original de Primary + traduccio a l'altre).
     - entry_category, analyzed_provider, analyzed_model i bihp_directives
       només existeixen a primary_result (Output no els reemet segons el seu
       esquema), així que es prenen d'aquí.
@@ -688,12 +688,18 @@ def _validate_and_normalize_final_output(
      """
     result = dict(primary_result)
 
-    # Output només pot sobreescriure els camps de traducció i les seves notes.
-    # Si Output retorna null (contingut ja en català), es respecta el null.
+    # Output només pot sobreescriure els camps bilingües _ca/_en i les seves
+    # notes. Substitueix l'antic esquema translated_*_ca (només català) pel
+    # nou esquema bilingüe amb 4 camps x 2 idiomes.
     translatable_fields = (
-        "translated_summary_ca",
-        "translated_whyitmatters_ca",
-        "translated_debatequestions_ca",
+        "summary_factual_ca",
+        "summary_factual_en",
+        "why_it_matters_ca",
+        "why_it_matters_en",
+        "debate_questions_ca",
+        "debate_questions_en",
+        "human_protection_notes_ca",
+        "human_protection_notes_en",
     )
     for field in translatable_fields:
         if field in output_result:
