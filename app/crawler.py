@@ -1019,8 +1019,8 @@ def run_entry_enrichment(
 
             if persist:
                 cur.execute("""
-                    UPDATE public.entries SET
-                        processing_status = 'ENRICHED',
+                    UPDATE public.entries
+                    SET processing_status = 'ENRICHED',
                         processing_error = NULL,
                         summary_factual = %s,
                         why_it_matters = %s,
@@ -1037,35 +1037,45 @@ def run_entry_enrichment(
                         analyzed_provider = %s,
                         analyzed_model = %s,
                         bihp_directives = %s,
-                        translated_summary_ca = %s,
-                        translated_whyitmatters_ca = %s,
-                        translated_debatequestions_ca = %s,
+                        summary_factual_ca = %s,
+                        summary_factual_en = %s,
+                        why_it_matters_ca = %s,
+                        why_it_matters_en = %s,
+                        debate_questions_ca = %s,
+                        debate_questions_en = %s,
+                        human_protection_notes_ca = %s,
+                        human_protection_notes_en = %s,
                         enriched_model = %s,
                         enriched_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
-                """, (
-                    final_result.get("summary_factual"),
-                    final_result.get("why_it_matters"),
-                    final_result.get("theme_tags"),
-                    final_result.get("affected_principles"),
-                    final_result.get("risk_level"),
-                    final_result.get("debate_questions"),
-                    final_result.get("confidence_notes"),
-                    final_result.get("human_protection_declared"),
-                    final_result.get("human_protection_verifiable"),
-                    final_result.get("human_protection_depth"),
-                    final_result.get("human_protection_notes"),
-                    final_result.get("entry_category"),
-                    final_result.get("analyzed_provider"),
-                    final_result.get("analyzed_model"),
-                    psycopg2.extras.Json(final_result.get("bihp_directives") or []),
-                    final_result.get("translated_summary_ca"),
-                    final_result.get("translated_whyitmatters_ca"),
-                    final_result.get("translated_debatequestions_ca"),
-                    primary_llm_result.get("model_used"),
-                    entry_id,
-                ))
+                    """, (
+                        final_result.get("summary_factual"),
+                        final_result.get("why_it_matters"),
+                        final_result.get("theme_tags"),
+                        final_result.get("affected_principles"),
+                        final_result.get("risk_level"),
+                        final_result.get("debate_questions"),
+                        final_result.get("confidence_notes"),
+                        final_result.get("human_protection_declared"),
+                        final_result.get("human_protection_verifiable"),
+                        final_result.get("human_protection_depth"),
+                        final_result.get("human_protection_notes"),
+                        final_result.get("entry_category"),
+                        final_result.get("analyzed_provider"),
+                        final_result.get("analyzed_model"),
+                        psycopg2.extras.Json(final_result.get("bihp_directives") or []),
+                        final_result.get("summary_factual_ca"),
+                        final_result.get("summary_factual_en"),
+                        final_result.get("why_it_matters_ca"),
+                        final_result.get("why_it_matters_en"),
+                        final_result.get("debate_questions_ca"),
+                        final_result.get("debate_questions_en"),
+                        final_result.get("human_protection_notes_ca"),
+                        final_result.get("human_protection_notes_en"),
+                        primary_llm_result.get("model_used"),
+                        entry_id,
+                    ))
                 conn.commit()
 
             return {
