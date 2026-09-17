@@ -267,10 +267,11 @@ def _build_basic_filters_sql(body: EntriesSearchRequest, params: List[Any]) -> L
             "(LOWER(source_title) LIKE LOWER(%s) "
             "OR LOWER(raw_snippet) LIKE LOWER(%s) "
             "OR LOWER(summary_factual) LIKE LOWER(%s) "
-            "OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+            "OR LOWER(summary_factual_ca) LIKE LOWER(%s) "
+            "OR LOWER(summary_factual_en) LIKE LOWER(%s))"
         )
         like_q = f"%{body.q}%"
-        params.extend([like_q, like_q, like_q, like_q])
+        params.extend([like_q, like_q, like_q, like_q, like_q])
 
     return fragments
 
@@ -310,7 +311,10 @@ def build_entries_search_query(body: EntriesSearchRequest) -> Tuple[str, str, Li
             relevance_reason, analyzed_provider, analyzed_model,
             human_protection_declared, human_protection_verifiable,
             human_protection_depth, enriched_at, enriched_model,
-            translated_summary_ca
+            summary_factual_ca, summary_factual_en,
+            why_it_matters_ca, why_it_matters_en,
+            debate_questions_ca, debate_questions_en,
+            human_protection_notes_ca, human_protection_notes_en
         FROM public.entries
         {where_clause_data}
         ORDER BY {sort_field} {sort_dir} NULLS LAST, id DESC

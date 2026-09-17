@@ -188,9 +188,14 @@ class EntryEnrich(BaseModel):
     processing_retries: Optional[int] = None
     relevance_score: Optional[str] = None
     relevance_reason: Optional[str] = None
-    translated_summary_ca: Optional[str] = None
-    translated_whyitmatters_ca: Optional[str] = None
-    translated_debatequestions_ca: Optional[str] = None
+    summary_factual_ca: Optional[str] = None
+    summary_factual_en: Optional[str] = None
+    why_it_matters_ca: Optional[str] = None
+    why_it_matters_en: Optional[str] = None
+    debate_questions_ca: Optional[list] = None
+    debate_questions_en: Optional[list] = None
+    human_protection_notes_ca: Optional[str] = None
+    human_protection_notes_en: Optional[str] = None
     enriched_model: Optional[str] = None
     raw_snippet_original: Optional[str] = None
     source_language: Optional[str] = None
@@ -314,9 +319,14 @@ class EntryBatchEnrich(BaseModel):
     relevance_score: Optional[str] = None
     relevance_reason: Optional[str] = None
 
-    translated_summary_ca: Optional[str] = None
-    translated_whyitmatters_ca: Optional[str] = None
-    translated_debatequestions_ca: Optional[list] = None
+    summary_factual_ca: Optional[str] = None
+    summary_factual_en: Optional[str] = None
+    why_it_matters_ca: Optional[str] = None
+    why_it_matters_en: Optional[str] = None
+    debate_questions_ca: Optional[list] = None
+    debate_questions_en: Optional[list] = None
+    human_protection_notes_ca: Optional[str] = None
+    human_protection_notes_en: Optional[str] = None
 
     enriched_model: Optional[str] = None
     raw_snippet_original: Optional[str] = None
@@ -889,17 +899,20 @@ def list_entries(
             if q.strip().isdigit():
                 filters.append(
                     "(id::text LIKE %s OR LOWER(source_title) LIKE LOWER(%s) OR LOWER(raw_snippet) LIKE LOWER(%s) "
-                    "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+                    "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(summary_factual_ca) LIKE LOWER(%s) "
+                    "OR LOWER(summary_factual_en) LIKE LOWER(%s))"
                 )
                 like_q = f"%{q}%"
-                params.extend([like_q, like_q, like_q, like_q, like_q])
+                params.extend([like_q, like_q, like_q, like_q, like_q, like_q])
             else:
                 filters.append(
                     "(LOWER(source_title) LIKE LOWER(%s) OR LOWER(raw_snippet) LIKE LOWER(%s) "
-                    "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+                    "OR LOWER(summary_factual) LIKE LOWER(%s) OR LOWER(summary_factual_ca) LIKE LOWER(%s) "
+                    "OR LOWER(summary_factual_en) LIKE LOWER(%s))"
                 )
                 like_q = f"%{q}%"
-                params.extend([like_q, like_q, like_q, like_q])
+                params.extend([like_q, like_q, like_q, like_q, like_q])
+
 
         where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
 
@@ -914,7 +927,11 @@ def list_entries(
                    summary_factual, theme_tags, affected_principles, processing_status,
                    relevance_score, relevance_reason, analyzed_provider, analyzed_model,
                    human_protection_declared, human_protection_verifiable, human_protection_depth,
-                   enriched_at, enriched_model, translated_summary_ca
+                   enriched_at, enriched_model,
+                   summary_factual_ca, summary_factual_en,
+                   why_it_matters_ca, why_it_matters_en,
+                   debate_questions_ca, debate_questions_en,
+                   human_protection_notes_ca, human_protection_notes_en
             FROM public.entries
             {where_clause}
             ORDER BY detected_at DESC NULLS LAST, id DESC
@@ -1181,10 +1198,11 @@ def aggregate_entries(
                 "(LOWER(source_title) LIKE LOWER(%s) "
                 "OR LOWER(raw_snippet) LIKE LOWER(%s) "
                 "OR LOWER(summary_factual) LIKE LOWER(%s) "
-                "OR LOWER(translated_summary_ca) LIKE LOWER(%s))"
+                "OR LOWER(summary_factual_ca) LIKE LOWER(%s) "
+                "OR LOWER(summary_factual_en) LIKE LOWER(%s))"
             )
             like_q = f"%{q}%"
-            params.extend([like_q, like_q, like_q, like_q])
+            params.extend([like_q, like_q, like_q, like_q, like_q])
         
         if country_region:
             filters.append("LOWER(country_region) = LOWER(%s)")
@@ -1583,7 +1601,10 @@ def get_entry(entry_id: int):
                     dedup_key, ingest_status, ingested_at, updated_at,
                     processing_status, processing_error, processing_retries,
                     relevance_score, relevance_reason, enriched_at, enriched_model,
-                    translated_summary_ca, translated_whyitmatters_ca, translated_debatequestions_ca
+                    summary_factual_ca, summary_factual_en,
+                    why_it_matters_ca, why_it_matters_en,
+                    debate_questions_ca, debate_questions_en,
+                    human_protection_notes_ca, human_protection_notes_en
             FROM public.entries
             WHERE id = %s
         """, (entry_id,))
@@ -1832,9 +1853,12 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
             "processing_retries": enrich.processing_retries,
             "relevance_score": enrich.relevance_score,
             "relevance_reason": enrich.relevance_reason,
-            "translated_summary_ca": enrich.translated_summary_ca,
-            "translated_whyitmatters_ca": enrich.translated_whyitmatters_ca,
-            "translated_debatequestions_ca": enrich.translated_debatequestions_ca,
+            "summary_factual_ca": enrich.summary_factual_ca,
+            "summary_factual_en": enrich.summary_factual_en,
+            "why_it_matters_ca": enrich.why_it_matters_ca,
+            "why_it_matters_en": enrich.why_it_matters_en,
+            "human_protection_notes_ca": enrich.human_protection_notes_ca,
+            "human_protection_notes_en": enrich.human_protection_notes_en,
             "enriched_model": enrich.enriched_model,
             "raw_snippet_original": enrich.raw_snippet_original,
             "source_language": enrich.source_language,
@@ -1866,6 +1890,14 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
                 fields.append(f"{col} = %s")
                 values.append(val)
 
+        if enrich.debate_questions_ca is not None:
+            fields.append("debate_questions_ca = %s")
+            values.append(enrich.debate_questions_ca)
+
+        if enrich.debate_questions_en is not None:
+            fields.append("debate_questions_en = %s")
+            values.append(enrich.debate_questions_en)
+
         if enrich.bihp_directives is not None:
             fields.append("bihp_directives = %s")
             values.append(Json(enrich.bihp_directives))        
@@ -1883,7 +1915,7 @@ def enrich_entry(entry_id: int, enrich: EntryEnrich):
             WHERE id = %s
             RETURNING
                 id, processing_status, relevance_score, enriched_at,
-                enriched_model, translated_summary_ca, updated_at
+                enriched_model, summary_factual_ca, summary_factual_en, updated_at
         """, values)
 
         updated = cur.fetchone()
@@ -1933,8 +1965,12 @@ def batch_enrich_entries(enrich: EntryBatchEnrich):
             "processing_retries": enrich.processing_retries,
             "relevance_score": enrich.relevance_score,
             "relevance_reason": enrich.relevance_reason,
-            "translated_summary_ca": enrich.translated_summary_ca,
-            "translated_whyitmatters_ca": enrich.translated_whyitmatters_ca,
+            "summary_factual_ca": enrich.summary_factual_ca,
+            "summary_factual_en": enrich.summary_factual_en,
+            "why_it_matters_ca": enrich.why_it_matters_ca,
+            "why_it_matters_en": enrich.why_it_matters_en,
+            "human_protection_notes_ca": enrich.human_protection_notes_ca,
+            "human_protection_notes_en": enrich.human_protection_notes_en,
             "enriched_model": enrich.enriched_model,
             "raw_snippet_original": enrich.raw_snippet_original,
             "source_language": enrich.source_language,
@@ -1959,7 +1995,8 @@ def batch_enrich_entries(enrich: EntryBatchEnrich):
         }
 
         json_fields = {
-            "translated_debatequestions_ca": enrich.translated_debatequestions_ca,
+            "debate_questions_ca": enrich.debate_questions_ca,
+            "debate_questions_en": enrich.debate_questions_en,
             "debate_questions": enrich.debate_questions,
             "theme_tags": enrich.theme_tags,
             "affected_principles": enrich.affected_principles,
