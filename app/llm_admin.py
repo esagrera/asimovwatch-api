@@ -496,6 +496,8 @@ def list_provider_models(provider: str):
         from app.llm_clients.openai_client import list_available_models
     elif provider == "perplexity":
         from app.llm_clients.perplexity_client import list_available_models
+    elif provider == "nvidia":
+        from app.llm_clients.nvidia_client import list_available_models
     else:
         raise HTTPException(status_code=400, detail=f"provider no suportat: {provider}")
 

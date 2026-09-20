@@ -16,6 +16,7 @@ SUPPORTED_PROVIDERS = (
     "gemini",
     "openai",
     "perplexity",
+    "nvidia",
 )
 
 PROVIDER_ENV_MAP = {
@@ -23,6 +24,7 @@ PROVIDER_ENV_MAP = {
     "claude": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "perplexity": "PERPLEXITY_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
 }
 
 PROVIDER_CLIENT_MAP = {
@@ -30,6 +32,7 @@ PROVIDER_CLIENT_MAP = {
     "claude": ("app.llm_clients.claude_client", "call_claude_client"),
     "openai": ("app.llm_clients.openai_client", "call_openai_client"),
     "perplexity": ("app.llm_clients.perplexity_client", "call_perplexity_client"),
+    "nvidia": ("app.llm_clients.nvidia_client", "call_nvidia_client"),
 }
 
 DEFAULT_SCOPE_VALUES = {
