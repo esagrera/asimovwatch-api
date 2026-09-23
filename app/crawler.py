@@ -1418,6 +1418,164 @@ def run_thematic_search(
     finally:
         conn.close()
 
+def process_thematic_search_job(
+    batch_id: str,
+    brief: str,
+    date_range: Optional[str],
+    source_scope: Optional[str],
+    source_types: Optional[list],
+    max_results: int,
+    run_enrichment: bool,
+    dry_run: bool,
+    requested_by: str,
+    prompt_key: str,
+) -> None:
+    """
+    Worker de background per a la cerca temàtica asíncrona.
+
+    Es llança en un threading.Thread des de
+    POST /crawler/entries/search-async (app/main.py) i no bloqueja
+    la petició HTTP que l'ha iniciat.
+
+    Reutilitza run_thematic_search() sense modificar-la: aquesta funció
+    NOMÉS s'encarrega d'actualitzar public.batch_jobs abans i després
+    de la crida, seguint el mateix patró SQL que ja usa process_batch_job()
+    a app/main.py (UPDATE per batch_id).
+
+    IMPORTANT: run_thematic_search() retorna un ÚNIC dict (mai una tupla).
+    Els warnings viuen dins la clau "warnings" del mateix dict. Si la clau
+    "error" hi és present, la cerca ha fallat de manera global (excepció
+    capturada internament) i el batch s'ha de marcar FAILED, no
+    COMPLETED_WITH_ERRORS.
+
+    Estats possibles a batch_jobs.status:
+      QUEUED               -> just inserit, worker encara no ha arrencat
+      RUNNING               -> worker ha començat a executar-se
+      COMPLETED             -> acabat sense errors (items_failed == 0)
+      COMPLETED_WITH_ERRORS -> acabat amb algun error parcial per item
+      FAILED                -> error global (clau "error" al resultat,
+                               o excepció no controlada al propi worker)
+    """
+    from psycopg2.extras import Json as _Json
+    from app.db import get_connection as _get_connection
+
+    # ── 1. Marcar RUNNING abans de començar ────────────────────────────────
+    conn = _get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE public.batch_jobs
+            SET status = 'RUNNING',
+                started_at = NOW(),
+                updated_at = NOW()
+            WHERE batch_id = %s
+            """,
+            (batch_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+    # ── 2. Executar la cerca temàtica real (mateixa funció d'avui) ─────────
+    try:
+        result = run_thematic_search(
+            brief=brief,
+            date_range=date_range,
+            source_scope=source_scope,
+            source_types=source_types,
+            max_results=max_results,
+            run_enrichment=run_enrichment,
+            dry_run=dry_run,
+            requested_by=requested_by,
+            prompt_key=prompt_key,
+        )
+
+        warnings = result.get("warnings", []) or []
+        global_error = result.get("error")
+
+        items_failed = int(result.get("items_failed", 0) or 0)
+        items_created = int(result.get("items_created", 0) or 0)
+        items_found = int(result.get("items_found", 0) or 0)
+        items_skipped = int(result.get("items_skipped", 0) or 0)
+        duplicates_general = result.get("items_duplicates", []) or []
+        duplicates_monitored = result.get("items_duplicates_monitored", []) or []
+        total_duplicates = len(duplicates_general) + len(duplicates_monitored)
+
+        if global_error:
+            final_status = "FAILED"
+        elif items_failed == 0:
+            final_status = "COMPLETED"
+        else:
+            final_status = "COMPLETED_WITH_ERRORS"
+
+        # ── 3. Persistir el resultat final ──────────────────────────────────
+        conn = _get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE public.batch_jobs
+                SET status = %s,
+                    processed = %s,
+                    succeeded = %s,
+                    failed = %s,
+                    skipped = %s,
+                    items = %s,
+                    error_message = %s,
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE batch_id = %s
+                """,
+                (
+                    final_status,
+                    items_found,
+                    items_created,
+                    items_failed,
+                    items_skipped + total_duplicates,
+                    _Json({
+                        "result": result,
+                        "warnings": warnings,
+                    }),
+                    (str(global_error)[:2000] if global_error else None),
+                    batch_id,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+    except Exception as exc:
+        # ── 4. Excepció no controlada AL PROPI WORKER (no ve de dins de
+        #      run_thematic_search(), que ja captura els seus propis errors
+        #      i els retorna dins el dict) ────────────────────────────────
+        conn = _get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE public.batch_jobs
+                SET status = 'FAILED',
+                    error_message = %s,
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE batch_id = %s
+                """,
+                (str(exc)[:2000], batch_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CRAWLER RSS

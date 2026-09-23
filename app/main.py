@@ -3491,6 +3491,143 @@ def run_thematic_search_now(body: ThematicEntrySearchRequest):
             detail=f"Error executant cerca temàtica: {str(exc)}",
         )
 
+@protected_router.post(
+    "/crawler/entries/search-async",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def run_thematic_search_async(body: ThematicEntrySearchRequest):
+    """
+    Versió asíncrona de la cerca temàtica web.
+
+    A diferència de POST /crawler/entries/search (síncron, bloqueja fins
+    que totes les crides LLM d'enriquiment han acabat, ~20-40s per crida
+    i fins a ~11 crides seqüencials amb 5 resultats), aquest endpoint:
+
+      1. Crea una fila a public.batch_jobs amb status QUEUED.
+      2. Llança process_thematic_search_job() en un thread de fons.
+      3. Retorna IMMEDIATAMENT amb 202 Accepted i un batch_id.
+
+    El client ha de fer polling a
+    GET /crawler/entries/search-async/{batch_id}
+    per conèixer el progrés i el resultat final.
+
+    No toca ni substitueix l'endpoint síncron existent.
+    """
+    from app.crawler import process_thematic_search_job
+
+    safe_limit = min(max(body.max_results, 1), 50)
+    batch_id = generate_batch_id()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO public.batch_jobs (
+                batch_id,
+                mode,
+                entry_ids,
+                status,
+                total,
+                options
+            )
+            VALUES (%s, 'thematic_search', %s, 'QUEUED', %s, %s)
+            """,
+            (
+                batch_id,
+                [],  # entry_ids: no coneguts a priori, es descobreixen durant l'execució
+                safe_limit,
+                Json({
+                    "brief": body.brief,
+                    "date_range": body.date_range,
+                    "source_scope": body.source_scope,
+                    "source_types": body.source_types,
+                    "max_results": safe_limit,
+                    "run_enrichment": body.run_enrichment,
+                    "dry_run": body.dry_run,
+                    "requested_by": body.requested_by,
+                    "prompt_key": body.prompt_key,
+                }),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="No s'ha pogut crear el batch de cerca temàtica",
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+    worker = threading.Thread(
+        target=process_thematic_search_job,
+        args=(
+            batch_id,
+            body.brief,
+            body.date_range,
+            body.source_scope,
+            body.source_types,
+            safe_limit,
+            body.run_enrichment,
+            body.dry_run,
+            body.requested_by,
+            body.prompt_key,
+        ),
+        daemon=True,
+        name=f"asimovwatch-thematic-{batch_id}",
+    )
+    worker.start()
+
+    return {
+        "batch_id": batch_id,
+        "status": "QUEUED",
+        "total": safe_limit,
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+
+
+@protected_router.get("/crawler/entries/search-async/{batch_id}")
+def get_thematic_search_status(batch_id: str):
+    """
+    Consulta l'estat i el progrés d'una cerca temàtica asíncrona.
+
+    Retorna 404 si el batch_id no existeix.
+
+    El camp "items" conté el JSON complet amb "result" (els mateixos
+    comptadors que ja retornava l'endpoint síncron: items_found,
+    items_created, items_duplicates, items_duplicates_monitored,
+    items_skipped, items_failed) i "warnings", disponible només
+    quan status ja no és QUEUED/RUNNING.
+    """
+    job = get_batch_job(batch_id)
+
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="Batch de cerca temàtica no trobat",
+        )
+
+    return {
+        "batch_id": job["batch_id"],
+        "status": job["status"],
+        "total": job["total"],
+        "processed": job["processed"],
+        "succeeded": job["succeeded"],
+        "failed": job["failed"],
+        "skipped": job["skipped"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "updated_at": job["updated_at"],
+        "error_message": job["error_message"],
+        "items": job["items"],
+    }
+
 # ─── BATCH ENDPOINTS ──────────────────────────────────────────────────────────
 
 @protected_router.post("/api/batch/process", status_code=202)
