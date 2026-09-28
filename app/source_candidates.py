@@ -819,26 +819,21 @@ def _detect_candidate_feed(candidate_url: str) -> dict:
 # ENDPOINT DE EVALUACIO — POST /source-candidates/{candidate_id}/evaluate
 # =============================================================================
 
-@router_candidates.post("/{candidate_id}/evaluate", status_code=200)
-def evaluate_source_candidate(
-    candidate_id: int,
-    payload: Optional[SourceCandidateEvaluateRequest] = None
-):
-    if payload is None:
-        payload = SourceCandidateEvaluateRequest()
-
+def _evaluate_candidate_core(candidate_id: int, payload: SourceCandidateEvaluateRequest) -> dict:
+    """
+    Lògica pura d'avaluació BIHP d'un candidate, extreta de l'endpoint
+    individual per reutilitzar-la també des del worker de batch.
+    Llança excepcions normals de Python (ValueError, Exception) — el
+    cridant (endpoint individual o worker) decideix com traduir-les.
+    """
     conn = None
     try:
         conn = get_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-
-            cur.execute(
-                "SELECT * FROM public.source_candidates WHERE id = %s",
-                (candidate_id,)
-            )
+            cur.execute("SELECT * FROM public.source_candidates WHERE id = %s", (candidate_id,))
             candidate = cur.fetchone()
             if not candidate:
-                raise HTTPException(status_code=404, detail="Candidate no trobat")
+                raise ValueError(f"Candidate {candidate_id} no trobat")
 
             candidate_context_text = json.dumps({
                 "name": candidate.get("name"),
@@ -851,37 +846,27 @@ def evaluate_source_candidate(
             }, ensure_ascii=False)
 
             from app.llm_config import call_llm_for_prompt
-
             llm_result = call_llm_for_prompt(
                 conn=conn,
                 prompt_key=payload.prompt_key,
-                prompt_overrides={"{input_text}": candidate_context_text}
+                prompt_overrides={"{input_text}": candidate_context_text},
             )
             llm_response = llm_result["output"]
-
             if isinstance(llm_response, dict):
                 parsed = llm_response
             else:
                 parsed = _extract_json_candidate(llm_response)
-
             if not isinstance(parsed, dict):
-                raise HTTPException(
-                    status_code=500,
-                    detail="La resposta del model no és JSON vàlid"
-                )
+                raise ValueError("La resposta del model no és JSON vàlid")
 
             rationale = (parsed.get("built_in_human_protection_rationale") or "").strip()
             if not rationale:
                 rationale = "Evidència insuficient"
 
             addendum = (parsed.get("justification_addendum") or "").strip()
-
             new_justification = candidate.get("justification")
             if payload.apply_addendum and addendum:
-                if new_justification:
-                    new_justification = f"{new_justification}\n\n{addendum}"
-                else:
-                    new_justification = addendum
+                new_justification = f"{new_justification}\n{addendum}" if new_justification else addendum
 
             feed_detection = _detect_candidate_feed(candidate.get("url"))
 
@@ -895,39 +880,44 @@ def evaluate_source_candidate(
                 WHERE id = %s
                 RETURNING *
                 """,
-                (
-                    rationale,
-                    new_justification,
-                    json.dumps(feed_detection, ensure_ascii=False),
-                    candidate_id,
-                )
+                (rationale, new_justification, json.dumps(feed_detection, ensure_ascii=False), candidate_id),
             )
             updated = cur.fetchone()
-            conn.commit()
-
-            return {
-                "status": "evaluated",
-                "item": updated,
-                "feed_detection": feed_detection,
-                "llm": {
-                    "prompt_key": payload.prompt_key,
-                    "provider": llm_result["provider_used"],
-                    "model": llm_result["model_used"],
-                    "used_fallback": llm_result["used_fallback"],
-                },
-            }
-
-    except HTTPException:
+        conn.commit()
+        return {
+            "status": "evaluated",
+            "item": updated,
+            "feed_detection": feed_detection,
+            "llm": {
+                "prompt_key": payload.prompt_key,
+                "provider": llm_result["provider_used"],
+                "model": llm_result["model_used"],
+                "used_fallback": llm_result["used_fallback"],
+            },
+        }
+    except Exception:
         if conn:
             conn.rollback()
         raise
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if conn:
             conn.close()
+
+
+@router_candidates.post("/{candidate_id}/evaluate", status_code=200)
+def evaluate_source_candidate(candidate_id: int, payload: Optional[SourceCandidateEvaluateRequest] = None):
+    """
+    Endpoint individual — comportament idèntic al d'abans del refactor.
+    Ara delega tota la lògica a _evaluate_candidate_core().
+    """
+    if payload is None:
+        payload = SourceCandidateEvaluateRequest()
+    try:
+        return _evaluate_candidate_core(candidate_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
 # ENDPOINT DE REVISIÓ — POST /source-candidates/{id}/review
@@ -1055,6 +1045,189 @@ def batch_review_source_candidates(payload: SourceCandidateBatchReview):
     finally:
         if conn:
             conn.close()
+
+class SourceCandidateBatchEvaluateRequest(BaseModel):
+    """Payload per llançar l'avaluació BIHP massiva asíncrona."""
+    candidate_ids: List[int]
+    prompt_key: str = "Source candidate evaluation"
+    apply_addendum: bool = True
+
+
+def process_candidates_bihp_batch_job(
+    batch_id: str,
+    candidate_ids: List[int],
+    prompt_key: str,
+    apply_addendum: bool,
+) -> None:
+    """
+    Worker de background per a l'avaluació BIHP massiva de candidates.
+    Mateix patró que process_thematic_search_job() a app/crawler.py.
+    """
+    from psycopg2.extras import Json as _Json
+    from app.db import get_connection as _get_connection
+
+    conn = _get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE public.batch_jobs SET status = 'RUNNING', started_at = NOW(), updated_at = NOW() WHERE batch_id = %s",
+            (batch_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+    payload = SourceCandidateEvaluateRequest(prompt_key=prompt_key, apply_addendum=apply_addendum)
+
+    items = []
+    processed = 0
+    succeeded = 0
+    failed = 0
+
+    for candidate_id in candidate_ids:
+        item_result = {"candidate_id": candidate_id, "status": "pending"}
+        try:
+            result = _evaluate_candidate_core(candidate_id, payload)
+            item_result.update(
+                status="succeeded",
+                rationale=(result["item"].get("built_in_human_protection_rationale") or "")[:200],
+                feed_detected=result.get("feed_detection", {}).get("feed_detected", False),
+            )
+            succeeded += 1
+        except Exception as exc:
+            item_result.update(status="failed", reason=str(exc)[:2000])
+            failed += 1
+
+        processed += 1
+        items.append(item_result)
+
+        conn = _get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE public.batch_jobs
+                SET processed = %s, succeeded = %s, failed = %s, items = %s, updated_at = NOW()
+                WHERE batch_id = %s
+                """,
+                (processed, succeeded, failed, _Json(items), batch_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+    final_status = "COMPLETED" if failed == 0 else "COMPLETED_WITH_ERRORS"
+    conn = _get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE public.batch_jobs SET status = %s, finished_at = NOW(), updated_at = NOW() WHERE batch_id = %s",
+            (final_status, batch_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+class SourceCandidateBatchEvaluateResponse(BaseModel):
+    """Només per documentació/tipat, no obligatori si no vols validar la resposta."""
+    pass
+
+
+@router_candidates.post("/batch-evaluate", status_code=202)
+def batch_evaluate_source_candidates(payload: SourceCandidateBatchEvaluateRequest):
+    """
+    Llença l'avaluació BIHP massiva de candidates en background.
+    Retorna immediatament amb un batch_id consultable a
+    GET /source-candidates/batch-evaluate/{batch_id}.
+    """
+    import threading
+    from app.main import generate_batch_id  # import diferit: evita circularitat
+    from psycopg2.extras import Json as _Json
+
+    candidate_ids = list(dict.fromkeys(payload.candidate_ids))
+    if not candidate_ids:
+        raise HTTPException(status_code=400, detail="candidate_ids no pot estar buit")
+    if len(candidate_ids) > 100:
+        raise HTTPException(status_code=400, detail="Màxim de 100 candidate_ids per operació batch")
+
+    batch_id = generate_batch_id()
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO public.batch_jobs (batch_id, mode, entry_ids, status, total, options)
+            VALUES (%s, 'candidates_bihp_evaluate', %s, 'QUEUED', %s, %s)
+            """,
+            (
+                batch_id,
+                [],
+                len(candidate_ids),
+                _Json({
+                    "candidate_ids": candidate_ids,
+                    "prompt_key": payload.prompt_key,
+                    "apply_addendum": payload.apply_addendum,
+                }),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="No s'ha pogut crear el batch d'avaluació BIHP")
+    finally:
+        cur.close()
+        conn.close()
+
+    worker = threading.Thread(
+        target=process_candidates_bihp_batch_job,
+        args=(batch_id, candidate_ids, payload.prompt_key, payload.apply_addendum),
+        daemon=True,
+        name=f"asimovwatch-bihp-{batch_id}",
+    )
+    worker.start()
+
+    return {
+        "batch_id": batch_id,
+        "status": "QUEUED",
+        "total": len(candidate_ids),
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+    }
+
+
+@router_candidates.get("/batch-evaluate/{batch_id}")
+def get_candidates_batch_evaluate_status(batch_id: str):
+    from app.main import get_batch_job
+
+    job = get_batch_job(batch_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch d'avaluació BIHP no trobat")
+
+    return {
+        "batch_id": job["batch_id"],
+        "status": job["status"],
+        "total": job["total"],
+        "processed": job["processed"],
+        "succeeded": job["succeeded"],
+        "failed": job["failed"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "updated_at": job["updated_at"],
+        "error_message": job["error_message"],
+        "items": job["items"],
+    }
 
 # =============================================================================
 # ENDPOINT DE PROMOCIÓ — POST /source-candidates/{id}/promote
