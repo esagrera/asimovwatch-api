@@ -2,9 +2,11 @@
 # app/llm_admin.py
 # Router d'administració per a configuració LLM
 # =============================================================================
+import importlib
 from typing import Optional, Literal
 from datetime import datetime, timezone
 
+import psycopg2.errors
 from psycopg2.extras import RealDictCursor
 
 from fastapi import APIRouter, HTTPException
@@ -23,6 +25,8 @@ from app.llm_config import (
     call_llm_for_prompt,
     list_llm_provider_registry,
     get_llm_provider_registry_item,
+    create_llm_provider_registry_item,
+    PROVIDER_CLIENT_MAP,
     list_llm_provider_models,
     list_llm_provider_status,
     replace_provider_models,
@@ -73,9 +77,17 @@ class LLMProviderModelSelection(BaseModel):
 class LLMProviderModelsReplaceRequest(BaseModel):
     models: list[LLMProviderModelSelection] = Field(default_factory=list)
 
+class LLMProviderRegistryCreate(BaseModel):
+    provider: str
+    display_name: str = Field(min_length=1, max_length=100)
+    dashboard_url: Optional[str] = None
+    billing_url: Optional[str] = None
+    docs_url: Optional[str] = None
+    supports_test: bool = True
+    supports_usage_tracking: bool = False
+    notes: Optional[str] = None
 
 VALID_PHASES = {"fallback"}
-
 
 def _normalize_phase(phase: str) -> str:
     phase_norm = (phase or "").strip().lower()
@@ -164,6 +176,52 @@ def list_providers_registry():
         if conn:
             conn.close()
 
+@router_llm_admin.post("/providers/registry", status_code=201)
+def create_provider_registry(payload: LLMProviderRegistryCreate):
+    conn = None
+    try:
+        provider = _normalize_provider(payload.provider)
+        conn = get_connection()
+
+        if get_llm_provider_registry_item(conn, provider):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Provider ja registrat: {provider}",
+            )
+
+        item = create_llm_provider_registry_item(
+            conn,
+            provider,
+            payload.display_name,
+            payload.dashboard_url,
+            payload.billing_url,
+            payload.docs_url,
+            payload.supports_test,
+            payload.supports_usage_tracking,
+            payload.notes,
+        )
+        item.update(_build_key_status(provider))
+        return {"status": "created", "item": item}
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except psycopg2.errors.UniqueViolation:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=409, detail="Provider ja registrat")
+    except ValueError as exc:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if conn:
+            conn.close()
 
 @router_llm_admin.get("/providers/registry/{provider}")
 def get_provider_registry_detail(provider: str):
@@ -488,18 +546,19 @@ def get_latest_model_advisor():
 def list_provider_models(provider: str):
     provider = provider.strip().lower()
 
-    if provider == "gemini":
-        from app.llm_clients.gemini_client import list_available_models
-    elif provider == "claude":
-        from app.llm_clients.claude_client import list_available_models
-    elif provider == "openai":
-        from app.llm_clients.openai_client import list_available_models
-    elif provider == "perplexity":
-        from app.llm_clients.perplexity_client import list_available_models
-    elif provider == "nvidia":
-        from app.llm_clients.nvidia_client import list_available_models
-    else:
-        raise HTTPException(status_code=400, detail=f"provider no suportat: {provider}")
+    if provider not in PROVIDER_CLIENT_MAP:
+        raise HTTPException(
+            status_code=400, detail=f"provider no suportat: {provider}"
+        )
+
+    try:
+        module = importlib.import_module(PROVIDER_CLIENT_MAP[provider][0])
+        list_available_models = getattr(module, "list_available_models")
+    except (ImportError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"El client de '{provider}' no exposa list_available_models: {exc}",
+        ) from exc
 
     return {
         "status": "ok",

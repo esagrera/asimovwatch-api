@@ -433,6 +433,56 @@ def get_llm_provider_registry_item(conn, provider: str):
         row = cur.fetchone()
         return dict(row) if row else None
 
+def create_llm_provider_registry_item(
+    conn,
+    provider: str,
+    display_name: str,
+    dashboard_url: Optional[str] = None,
+    billing_url: Optional[str] = None,
+    docs_url: Optional[str] = None,
+    supports_test: bool = True,
+    supports_usage_tracking: bool = False,
+    notes: Optional[str] = None,
+) -> dict:
+    provider = (provider or "").strip().lower()
+    _validate_provider(provider)
+
+    clean_name = (display_name or "").strip()
+    if not clean_name:
+        raise ValueError("display_name no pot estar buit")
+
+    key_env_var = PROVIDER_ENV_MAP.get(provider)
+    if not key_env_var:
+        raise ValueError(
+            f"PROVIDER_ENV_MAP no té entrada per al provider '{provider}'"
+        )
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO public.llm_provider_registry (
+                provider, display_name, enabled, dashboard_url, billing_url,
+                docs_url, key_env_var, supports_test,
+                supports_usage_tracking, notes, created_at, updated_at
+            ) VALUES (%s, %s, true, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            RETURNING *
+            """,
+            (
+                provider,
+                clean_name,
+                (dashboard_url or "").strip() or None,
+                (billing_url or "").strip() or None,
+                (docs_url or "").strip() or None,
+                key_env_var,
+                bool(supports_test),
+                bool(supports_usage_tracking),
+                (notes or "").strip() or None,
+            ),
+        )
+        row = cur.fetchone()
+
+    conn.commit()
+    return dict(row)
 
 def list_llm_provider_models(conn, provider: str = None) -> list[dict]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
