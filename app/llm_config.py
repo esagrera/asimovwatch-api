@@ -18,6 +18,7 @@ SUPPORTED_PROVIDERS = (
     "openai",
     "perplexity",
     "nvidia",
+    "grok",
 )
 
 PROVIDER_ENV_MAP = {
@@ -26,6 +27,7 @@ PROVIDER_ENV_MAP = {
     "openai": "OPENAI_API_KEY",
     "perplexity": "PERPLEXITY_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
+    "grok": "XAI_API_KEY",
 }
 
 PROVIDER_CLIENT_MAP = {
@@ -34,6 +36,7 @@ PROVIDER_CLIENT_MAP = {
     "openai": ("app.llm_clients.openai_client", "call_openai_client"),
     "perplexity": ("app.llm_clients.perplexity_client", "call_perplexity_client"),
     "nvidia": ("app.llm_clients.nvidia_client", "call_nvidia_client"),
+    "grok": ("app.llm_clients.grok_client", "call_grok_client"),
 }
 
 DEFAULT_SCOPE_VALUES = {
@@ -548,6 +551,12 @@ PROVIDER_ERROR_SIGNATURES = {
         "quota_exceeded": ["402", "insufficient", "quota"],
         "rate_limited": ["429"],
         "service_unavailable": ["502", "503", "504", "unavailable"],
+    },
+    "grok": {
+        "model_not_found": ["404", "not found"],
+        "rate_limited": ["429"],
+        "service_unavailable": ["502", "503", "504", "unavailable"],
+        "config_error": ["401", "xai_api_key no configurada", "unauthorized"],
     },
 }
 
