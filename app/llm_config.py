@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional
 
 from psycopg2.extras import RealDictCursor
@@ -522,31 +523,57 @@ PROVIDER_ERROR_SIGNATURES = {
         "model_not_found": ["404", "not_found", "no longer available", "is not found for api version"],
         "quota_exceeded": ["resource_exhausted", "quota"],
         "rate_limited": ["429", "rate limit"],
+        "service_unavailable": ["503", "unavailable", "high demand"],
     },
     "claude": {
         "model_not_found": ["404", "not_found", "no longer available", "model not found"],
         "quota_exceeded": ["credit balance", "insufficient", "quota"],
-        "rate_limited": ["429", "rate_limit", "overloaded"],
+        "rate_limited": ["429", "rate_limit"],
+        "service_unavailable": ["503", "overloaded_error", "overloaded"],
     },
     "openai": {
         "model_not_found": ["404", "model_not_found", "does not exist", "no longer available"],
         "quota_exceeded": ["insufficient_quota", "exceeded your current quota"],
         "rate_limited": ["429", "rate_limit_exceeded"],
+        "config_error": ["api_key no configurada", "invalid api key"],
     },
     "perplexity": {
         "model_not_found": ["404", "not_found", "no longer available"],
         "quota_exceeded": ["insufficient credit", "quota"],
         "rate_limited": ["429", "rate limit"],
     },
+    # PROVISIONAL: validar amb errors reals de NVIDIA NIM
+    "nvidia": {
+        "model_not_found": ["404", "not found"],
+        "quota_exceeded": ["402", "insufficient", "quota"],
+        "rate_limited": ["429"],
+        "service_unavailable": ["502", "503", "504", "unavailable"],
+    },
 }
+
+_ERROR_ORDER = (
+    "model_not_found",
+    "quota_exceeded",
+    "rate_limited",
+    "service_unavailable",
+    "config_error",
+)
+
+
+def _signature_matches(keyword: str, msg: str) -> bool:
+    # Els codis numèrics només coincideixen com a token sencer, no dins
+    # d'IDs o números llargs (p. ex. req_0404abc no és un 404).
+    if keyword.isdigit():
+        return re.search(rf"(?<![a-z0-9]){keyword}(?![a-z0-9])", msg) is not None
+    return keyword in msg
 
 
 def classify_llm_error(exc: Exception, provider: str) -> str:
     msg = str(exc).lower()
     signatures = PROVIDER_ERROR_SIGNATURES.get(provider, {})
-    for error_type in ("model_not_found", "quota_exceeded", "rate_limited"):
+    for error_type in _ERROR_ORDER:
         for keyword in signatures.get(error_type, []):
-            if keyword in msg:
+            if _signature_matches(keyword, msg):
                 return error_type
     return "unknown_error"
 
