@@ -3,14 +3,14 @@ AsimovWatch · Fase 5 · Peça 5.2 (Processos en curs, fase MANUAL) i 5.2d (nete
 
 Router de supervisió dels processos de fons del servidor:
   - public.batch_jobs      (enriquiment, cerca temàtica, avaluació BIHP)
-  - public.scheduler_runs  (cicles del scheduler, només lectura)
+  - public.scheduler_runs  (cicles del scheduler, només lectura; neteja opcional a 5.2d)
 
 Regles de seguretat:
   - Cap canvi d'estat automàtic. L'únic canvi d'estat és POST /processes/{id}/mark-failed,
     que és manual i només s'accepta si el procés no té cap thread viu i compleix el criteri
     d'estancament (silenci > llindar) o és orfe (la darrera activitat és anterior a l'arrencada
     d'aquest procés del servidor).
-  - La neteja (5.2d) només toca batch_jobs en estat final amb més de 30 dies.
+  - La neteja (5.2d) només toca processos en estat final i exigeix els recomptes de la vista prèvia.
   - Aquest mòdul NO importa app.main (evita imports circulars).
 
 Suposició verificada amb el pla Free de Render: una sola instància. Si el servei passa a diverses
@@ -45,6 +45,9 @@ BATCH_RUNNING_STALE_SECONDS = 20 * 60
 # Neteja d'historial (5.2d)
 PURGE_MIN_DAYS = 30
 PURGE_DEFAULT_DAYS = 90
+# La telemetria del scheduler (un cicle cada 15 min) té menys valor històric: llindar més curt.
+SCHEDULER_PURGE_MIN_DAYS = 7
+SCHEDULER_PURGE_DEFAULT_DAYS = 30
 
 ACTIVE_STATUSES = ("QUEUED", "RUNNING")
 FINAL_STATUSES = ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED")
@@ -77,6 +80,14 @@ PURGE_WHERE = (
     "status IN ('COMPLETED','COMPLETED_WITH_ERRORS','FAILED') "
     "AND finished_at IS NOT NULL "
     "AND finished_at < NOW() - make_interval(days => %(days)s)"
+)
+SCHEDULER_PURGE_WHERE = (
+    "status IN ('COMPLETED','COMPLETED_WITH_ERRORS','FAILED','SKIPPED_LOCKED') "
+    "AND finished_at IS NOT NULL "
+    "AND finished_at < NOW() - make_interval(days => %(sdays)s)"
+)
+SCHEDULER_PURGE_RUN_IDS = (
+    "SELECT run_id FROM public.scheduler_runs WHERE " + SCHEDULER_PURGE_WHERE
 )
 
 # Columnes lleugeres (sense items ni entry_ids) + indicadors calculats a la BD.
@@ -355,6 +366,9 @@ def list_processes(
     type: Optional[str] = Query(None, description="Tipus de procés"),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    exclude_scheduler: bool = Query(
+        False, description="Amaga els cicles del scheduler (només si no es filtra per tipus)"
+    ),
 ):
     """Llista unificada de batch_jobs i scheduler_runs, ordenada per data d'inici descendent."""
     statuses = _parse_statuses(status)
@@ -371,7 +385,7 @@ def list_processes(
         total += _count("batch_jobs", where_b, params_b)
         items += [_batch_item(r, live_names) for r in _fetch_batches(where_b, params_b, fetch_limit)]
 
-    if not type or type == TYPE_SCHEDULER:
+    if type == TYPE_SCHEDULER or (not type and not exclude_scheduler):
         where_s, params_s = _scheduler_filter(statuses)
         total += _count("scheduler_runs", where_s, params_s)
         items += [_scheduler_item(r) for r in _fetch_runs(where_s, params_s, fetch_limit)]
@@ -388,7 +402,13 @@ def list_processes(
 
 
 @router_processes.get("/purge-preview")
-def purge_preview(older_than_days: int = Query(PURGE_DEFAULT_DAYS, ge=PURGE_MIN_DAYS, le=3650)):
+def purge_preview(
+    older_than_days: int = Query(PURGE_DEFAULT_DAYS, ge=PURGE_MIN_DAYS, le=3650),
+    include_scheduler: bool = Query(False),
+    scheduler_older_than_days: int = Query(
+        SCHEDULER_PURGE_DEFAULT_DAYS, ge=SCHEDULER_PURGE_MIN_DAYS, le=3650
+    ),
+):
     """Previsualitza què esborraria la neteja (5.2d). No modifica res."""
     rows = _query(
         f"""
@@ -400,31 +420,84 @@ def purge_preview(older_than_days: int = Query(PURGE_DEFAULT_DAYS, ge=PURGE_MIN_
         """,
         {"days": older_than_days},
     )
-    oldest = min((r["oldest"] for r in rows), default=None)
-    newest = max((r["newest"] for r in rows), default=None)
-    return {
+    result: Dict[str, Any] = {
         "older_than_days": older_than_days,
         "count": sum(int(r["n"]) for r in rows),
         "bytes": sum(int(r["bytes"]) for r in rows),
-        "oldest": oldest,
-        "newest": newest,
+        "oldest": min((r["oldest"] for r in rows), default=None),
+        "newest": max((r["newest"] for r in rows), default=None),
         "by_status": {r["status"]: int(r["n"]) for r in rows},
+        "scheduler": None,
     }
+    if include_scheduler:
+        params = {"sdays": scheduler_older_than_days}
+        runs = _query(
+            f"""
+            SELECT COUNT(*) AS n, MIN(r.finished_at) AS oldest, MAX(r.finished_at) AS newest,
+                   COALESCE(SUM(pg_column_size(r)), 0) AS bytes
+            FROM public.scheduler_runs r
+            WHERE {SCHEDULER_PURGE_WHERE}
+            """,
+            params,
+            one=True,
+        )
+        events = _query(
+            f"""
+            SELECT COUNT(*) AS n, COALESCE(SUM(pg_column_size(e)), 0) AS bytes
+            FROM public.scheduler_run_events e
+            WHERE e.run_id IN ({SCHEDULER_PURGE_RUN_IDS})
+            """,
+            params,
+            one=True,
+        )
+        result["scheduler"] = {
+            "older_than_days": scheduler_older_than_days,
+            "count": int(runs["n"]),
+            "events": int(events["n"]),
+            "bytes": int(runs["bytes"]) + int(events["bytes"]),
+            "oldest": runs["oldest"],
+            "newest": runs["newest"],
+        }
+    return result
 
 
 @router_processes.get("/export")
-def export_purgeable(older_than_days: int = Query(PURGE_DEFAULT_DAYS, ge=PURGE_MIN_DAYS, le=3650)):
+def export_purgeable(
+    older_than_days: int = Query(PURGE_DEFAULT_DAYS, ge=PURGE_MIN_DAYS, le=3650),
+    include_scheduler: bool = Query(False),
+    scheduler_older_than_days: int = Query(
+        SCHEDULER_PURGE_DEFAULT_DAYS, ge=SCHEDULER_PURGE_MIN_DAYS, le=3650
+    ),
+):
     """Còpia JSON de les mateixes files que esborraria la neteja (per descarregar abans d'esborrar)."""
     rows = _query(
         f"SELECT * FROM public.batch_jobs WHERE {PURGE_WHERE} ORDER BY finished_at ASC",
         {"days": older_than_days},
     )
-    return {
+    result: Dict[str, Any] = {
         "exported_at": datetime.now(timezone.utc),
         "older_than_days": older_than_days,
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+    if include_scheduler:
+        params = {"sdays": scheduler_older_than_days}
+        runs = _query(
+            f"SELECT * FROM public.scheduler_runs WHERE {SCHEDULER_PURGE_WHERE} ORDER BY finished_at ASC",
+            params,
+        )
+        events = _query(
+            f"""
+            SELECT * FROM public.scheduler_run_events
+            WHERE run_id IN ({SCHEDULER_PURGE_RUN_IDS})
+            ORDER BY run_id, sequence
+            """,
+            params,
+        )
+        result["scheduler_older_than_days"] = scheduler_older_than_days
+        result["scheduler_runs"] = [dict(r) for r in runs]
+        result["scheduler_run_events"] = [dict(r) for r in events]
+    return result
 
 
 @router_processes.get("/{process_id}")
@@ -434,7 +507,7 @@ def get_process(process_id: str):
 
     if _is_scheduler_id(process_id):
         row = _query(
-            f"SELECT *, "
+            "SELECT *, "
             "EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat_at, updated_at, started_at)))::int AS silence_seconds, "
             "(COALESCE(last_heartbeat_at, updated_at, started_at) < %(started)s) AS before_start "
             "FROM public.scheduler_runs WHERE run_id = %(id)s",
@@ -550,7 +623,7 @@ def mark_failed(process_id: str, body: MarkFailedRequest):
                     "by": requested_by,
                     "at": datetime.now(timezone.utc).isoformat(),
                     "id": process_id,
-                    "seen": _seen_updated_at(process_id, row),
+                    "seen": row["updated_at"],
                 },
             )
             updated = cur.fetchone()
@@ -572,43 +645,67 @@ def mark_failed(process_id: str, body: MarkFailedRequest):
     return {"status": "marked_failed", "process_id": process_id, "new_status": "FAILED"}
 
 
-def _seen_updated_at(process_id: str, row: Dict[str, Any]):
-    """Retorna l'updated_at exacte llegit (el SELECT lleuger ja el porta)."""
-    return row.get("updated_at")
-
-
 # ---------------------------------------------------------------------------
 # 5.2d · Neteja de l'historial
 # ---------------------------------------------------------------------------
 
 class PurgeRequest(BaseModel):
     older_than_days: int = Field(PURGE_DEFAULT_DAYS, ge=PURGE_MIN_DAYS, le=3650)
-    confirm_count: int = Field(..., ge=0, description="Recompte vist a la vista prèvia")
+    confirm_count: int = Field(..., ge=0, description="Batches vistos a la vista prèvia")
+    include_scheduler: bool = False
+    scheduler_older_than_days: int = Field(
+        SCHEDULER_PURGE_DEFAULT_DAYS, ge=SCHEDULER_PURGE_MIN_DAYS, le=3650
+    )
+    confirm_scheduler_count: int = Field(
+        0, ge=0, description="Cicles del scheduler vistos a la vista prèvia"
+    )
 
 
 @router_processes.post("/purge")
 def purge_history(body: PurgeRequest):
     """
-    Esborra batch_jobs finalitzats amb més de `older_than_days` dies. Mai toca QUEUED ni RUNNING.
-    Exigeix `confirm_count` igual al recompte actual, perquè la vista prèvia no hagi quedat obsoleta.
+    Esborra batch_jobs finalitzats (i, si es demana, scheduler_runs finalitzats amb els seus events).
+    Mai toca processos QUEUED ni RUNNING. Exigeix recomptes iguals als de la vista prèvia.
+    Tot va en una sola transacció: o s'esborra tot, o res.
     """
-    params = {"days": body.older_than_days}
+    params = {"days": body.older_than_days, "sdays": body.scheduler_older_than_days}
+    deleted_events = 0
+    deleted_runs = 0
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(f"SELECT COUNT(*) AS n FROM public.batch_jobs WHERE {PURGE_WHERE}", params)
             current = int(cur.fetchone()["n"])
-            if current != body.confirm_count:
+            current_runs = 0
+            if body.include_scheduler:
+                cur.execute(
+                    f"SELECT COUNT(*) AS n FROM public.scheduler_runs WHERE {SCHEDULER_PURGE_WHERE}",
+                    params,
+                )
+                current_runs = int(cur.fetchone()["n"])
+            if current != body.confirm_count or (
+                body.include_scheduler and current_runs != body.confirm_scheduler_count
+            ):
                 conn.rollback()
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"El recompte ha canviat ({current} ara, {body.confirm_count} a la vista prèvia). "
+                        f"Els recomptes han canviat (batches {current}, cicles {current_runs}). "
                         "Torna a previsualitzar."
                     ),
                 )
             cur.execute(f"DELETE FROM public.batch_jobs WHERE {PURGE_WHERE}", params)
             deleted = cur.rowcount
+            if body.include_scheduler:
+                cur.execute(
+                    f"DELETE FROM public.scheduler_run_events WHERE run_id IN ({SCHEDULER_PURGE_RUN_IDS})",
+                    params,
+                )
+                deleted_events = cur.rowcount
+                cur.execute(
+                    f"DELETE FROM public.scheduler_runs WHERE {SCHEDULER_PURGE_WHERE}", params
+                )
+                deleted_runs = cur.rowcount
         conn.commit()
     except HTTPException:
         raise
@@ -616,7 +713,7 @@ def purge_history(body: PurgeRequest):
         conn.rollback()
         raise HTTPException(
             status_code=409,
-            detail="Hi ha dades que depenen d'aquests batches; no s'ha esborrat res.",
+            detail="Hi ha dades que depenen d'aquests registres; no s'ha esborrat res.",
         )
     except Exception as exc:
         conn.rollback()
@@ -624,4 +721,10 @@ def purge_history(body: PurgeRequest):
     finally:
         conn.close()
 
-    return {"status": "purged", "deleted": deleted, "older_than_days": body.older_than_days}
+    return {
+        "status": "purged",
+        "deleted": deleted,
+        "deleted_scheduler_runs": deleted_runs,
+        "deleted_scheduler_events": deleted_events,
+        "older_than_days": body.older_than_days,
+    }
