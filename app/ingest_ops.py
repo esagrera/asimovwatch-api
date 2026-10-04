@@ -167,7 +167,9 @@ def _where(params: Dict[str, Any], diagnosis=None, queue_state=None, source_doma
     if diagnosis:
         conds.append("diagnosis = %(diagnosis)s")
         params["diagnosis"] = diagnosis
-    if queue_state:
+    if queue_state == "blocked":
+        conds.append("queue_state IN ('blocked_retries', 'blocked_permanent', 'blocked_unknown')")
+    elif queue_state:
         conds.append("queue_state = %(queue_state)s")
         params["queue_state"] = queue_state
     if source_domain:
@@ -532,7 +534,7 @@ QUEUE_CONFIG_LIMITS = {
     "max_per_source": (1, 100),
     "retry_max": (0, 20),
     "timeout_seconds": (1, 3600),
-    "frequency_minutes": (15, 10080),
+    "frequency_minutes": (5, 10080),
 }
 
 
