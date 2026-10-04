@@ -72,18 +72,23 @@ TYPE_ENRICH = "entries_batch_enrich"
 TYPE_THEMATIC = "thematic_search"
 TYPE_BIHP = "bihp_batch_evaluate"
 TYPE_SCHEDULER = "scheduler_cycle"
-# Filtre (no és un tipus d'ítem): cicles del scheduler que han processat almenys una entrada
-# a la cua d'enriquiment (progress.attempted > 0).
-TYPE_SCHEDULER_ENRICH = "scheduler_enrichment"
+# Filtre (no és un tipus d'ítem): cicles del scheduler que han fet feina real, és a dir, que han
+# processat almenys una entrada a la cua d'enriquiment (progress.attempted > 0) o que han executat
+# el crawler de fonts (result.executed conté "sources").
+TYPE_SCHEDULER_ACTIVITY = "scheduler_activity"
 TYPE_UNKNOWN = "unknown"
 BATCH_TYPES = {TYPE_ENRICH, TYPE_THEMATIC, TYPE_BIHP, TYPE_UNKNOWN}
-SCHEDULER_TYPES = {TYPE_SCHEDULER, TYPE_SCHEDULER_ENRICH}
+SCHEDULER_TYPES = {TYPE_SCHEDULER, TYPE_SCHEDULER_ACTIVITY}
 ALL_TYPES = BATCH_TYPES | SCHEDULER_TYPES
 
 SCHEDULER_ENRICHED_SQL = (
     "(CASE WHEN (progress->>'attempted') ~ '^[0-9]+$' "
     "THEN (progress->>'attempted')::int ELSE 0 END) > 0"
 )
+SCHEDULER_RAN_SOURCES_SQL = (
+    "(COALESCE(result->'executed', '[]'::jsonb) @> '[\"sources\"]'::jsonb)"
+)
+SCHEDULER_ACTIVITY_SQL = f"({SCHEDULER_ENRICHED_SQL} OR {SCHEDULER_RAN_SOURCES_SQL})"
 
 PURGE_WHERE = (
     "status IN ('COMPLETED','COMPLETED_WITH_ERRORS','FAILED') "
@@ -113,12 +118,20 @@ BATCH_LIST_COLUMNS = """
     (COALESCE(updated_at, created_at) < %(started)s) AS before_start
 """
 
-SCHEDULER_LIST_COLUMNS = """
+# Indicadors calculats a la BD, comuns a la llista i al detall del scheduler.
+SCHEDULER_EXTRA_COLUMNS = f"""
+    {SCHEDULER_RAN_SOURCES_SQL} AS ran_sources,
+    result->'sources'->'result'->>'detected' AS src_detected,
+    result->'sources'->'result'->>'skipped_existing' AS src_skipped_existing,
+    EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat_at, updated_at, started_at)))::int AS silence_seconds,
+    (COALESCE(last_heartbeat_at, updated_at, started_at) < %(started)s) AS before_start
+"""
+
+SCHEDULER_LIST_COLUMNS = f"""
     run_id, status, mode, dry_run, force, current_stage, current_action,
     started_at, updated_at, last_heartbeat_at, finished_at, duration_seconds, error_message,
     progress,
-    EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat_at, updated_at, started_at)))::int AS silence_seconds,
-    (COALESCE(last_heartbeat_at, updated_at, started_at) < %(started)s) AS before_start
+    {SCHEDULER_EXTRA_COLUMNS}
 """
 
 
@@ -240,6 +253,30 @@ def _enrichment_summary(progress: Any) -> Optional[Dict[str, int]]:
     }
 
 
+def _sources_summary(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resum del crawler de fonts d'un cicle, o None si no s'ha executat en aquest cicle.
+
+    `new` es calcula com a detectades - ja existents, i no a partir de `inserted`: el comptador
+    `inserted` de discover_source_candidates surt duplicat si hi ha dues crides a inserted.append.
+    """
+    if not row.get("ran_sources"):
+        return None
+
+    def _int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    detected = _int(row.get("src_detected"))
+    existing = _int(row.get("src_skipped_existing")) or 0
+    return {
+        "detected": detected,
+        "existing": existing,
+        "new": max(0, detected - existing) if detected is not None else None,
+    }
+
+
 def _scheduler_item(row: Dict[str, Any]) -> Dict[str, Any]:
     status = row.get("status")
     active = status in ACTIVE_STATUSES
@@ -270,6 +307,7 @@ def _scheduler_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "current_stage": row.get("current_stage"),
         "current_action": row.get("current_action"),
         "enrichment": _enrichment_summary(row.get("progress")),
+        "sources_crawler": _sources_summary(row),
         "requested_by": None,
         "dry_run": bool(row.get("dry_run")),
         "seconds_since_update": silence if active else None,
@@ -326,13 +364,13 @@ def _batch_filter(statuses: List[str], ptype: Optional[str]):
     return ("WHERE " + " AND ".join(where)) if where else "", params
 
 
-def _scheduler_filter(statuses: List[str], enrichment_only: bool = False):
+def _scheduler_filter(statuses: List[str], activity_only: bool = False):
     where, params = [], {"started": PROCESS_STARTED_AT}
     if statuses:
         where.append("status = ANY(%(statuses)s)")
         params["statuses"] = statuses
-    if enrichment_only:
-        where.append(SCHEDULER_ENRICHED_SQL)
+    if activity_only:
+        where.append(SCHEDULER_ACTIVITY_SQL)
     return ("WHERE " + " AND ".join(where)) if where else "", params
 
 
@@ -399,8 +437,8 @@ def list_processes(
     type: Optional[str] = Query(
         None,
         description=(
-            "Tipus de procés; 'scheduler_enrichment' = cicles del scheduler que han processat "
-            "almenys una entrada a la cua d'enriquiment"
+            "Tipus de procés; 'scheduler_activity' = cicles del scheduler que han processat "
+            "almenys una entrada a la cua d'enriquiment o han executat el crawler de fonts"
         ),
     ),
     limit: int = Query(20, ge=1, le=100),
@@ -425,7 +463,7 @@ def list_processes(
         items += [_batch_item(r, live_names) for r in _fetch_batches(where_b, params_b, fetch_limit)]
 
     if type in SCHEDULER_TYPES or (not type and not exclude_scheduler):
-        where_s, params_s = _scheduler_filter(statuses, enrichment_only=(type == TYPE_SCHEDULER_ENRICH))
+        where_s, params_s = _scheduler_filter(statuses, activity_only=(type == TYPE_SCHEDULER_ACTIVITY))
         total += _count("scheduler_runs", where_s, params_s)
         items += [_scheduler_item(r) for r in _fetch_runs(where_s, params_s, fetch_limit)]
 
@@ -546,9 +584,7 @@ def get_process(process_id: str):
 
     if _is_scheduler_id(process_id):
         row = _query(
-            "SELECT *, "
-            "EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat_at, updated_at, started_at)))::int AS silence_seconds, "
-            "(COALESCE(last_heartbeat_at, updated_at, started_at) < %(started)s) AS before_start "
+            f"SELECT *, {SCHEDULER_EXTRA_COLUMNS} "
             "FROM public.scheduler_runs WHERE run_id = %(id)s",
             {"id": process_id, "started": PROCESS_STARTED_AT},
             one=True,
