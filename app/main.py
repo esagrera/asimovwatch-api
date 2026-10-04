@@ -46,6 +46,7 @@ from app.scheduler_core import (
     run_scheduler_cycle,
 )
 from app.processes import router_processes
+from app.ingest_ops import router_ingest_ops
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,7 @@ protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
 protected_router.include_router(router_candidates)
 protected_router.include_router(router_llm_admin)
 protected_router.include_router(router_processes)
+protected_router.include_router(router_ingest_ops)
 
 @app.middleware("http")
 async def protect_docs(request: Request, call_next):
@@ -310,6 +312,8 @@ class BatchOptions(BaseModel):
     timeout_per_entry_ms: int = 120000
     on_error: str = "continue"
     max_retries: int = 0
+    reason: Optional[str] = Field(default=None, max_length=500)
+    requested_by: Optional[str] = Field(default=None, max_length=100)
 
 class EntryBatchEnrich(BaseModel):
     entry_ids: list[int]
@@ -2531,7 +2535,7 @@ class EntryCrawlerRunRequest(BaseModel):
     source_ids: Optional[list[int]] = None
     hours_back: int = 24
     max_items_per_source: int = 20
-    run_enrichment: bool = True
+    run_enrichment: bool = False
     retry_errors: bool = False
     force: bool = False
     dry_run: bool = True
