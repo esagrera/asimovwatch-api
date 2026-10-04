@@ -45,6 +45,7 @@ from app.scheduler_core import (
     generate_scheduler_run_id,
     run_scheduler_cycle,
 )
+from app.processes import router_processes
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +69,7 @@ app = FastAPI(
 protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
 protected_router.include_router(router_candidates)
 protected_router.include_router(router_llm_admin)
+protected_router.include_router(router_processes)
 
 @app.middleware("http")
 async def protect_docs(request: Request, call_next):
