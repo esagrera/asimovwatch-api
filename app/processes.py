@@ -72,9 +72,18 @@ TYPE_ENRICH = "entries_batch_enrich"
 TYPE_THEMATIC = "thematic_search"
 TYPE_BIHP = "bihp_batch_evaluate"
 TYPE_SCHEDULER = "scheduler_cycle"
+# Filtre (no és un tipus d'ítem): cicles del scheduler que han processat almenys una entrada
+# a la cua d'enriquiment (progress.attempted > 0).
+TYPE_SCHEDULER_ENRICH = "scheduler_enrichment"
 TYPE_UNKNOWN = "unknown"
 BATCH_TYPES = {TYPE_ENRICH, TYPE_THEMATIC, TYPE_BIHP, TYPE_UNKNOWN}
-ALL_TYPES = BATCH_TYPES | {TYPE_SCHEDULER}
+SCHEDULER_TYPES = {TYPE_SCHEDULER, TYPE_SCHEDULER_ENRICH}
+ALL_TYPES = BATCH_TYPES | SCHEDULER_TYPES
+
+SCHEDULER_ENRICHED_SQL = (
+    "(CASE WHEN (progress->>'attempted') ~ '^[0-9]+$' "
+    "THEN (progress->>'attempted')::int ELSE 0 END) > 0"
+)
 
 PURGE_WHERE = (
     "status IN ('COMPLETED','COMPLETED_WITH_ERRORS','FAILED') "
@@ -107,6 +116,7 @@ BATCH_LIST_COLUMNS = """
 SCHEDULER_LIST_COLUMNS = """
     run_id, status, mode, dry_run, force, current_stage, current_action,
     started_at, updated_at, last_heartbeat_at, finished_at, duration_seconds, error_message,
+    progress,
     EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat_at, updated_at, started_at)))::int AS silence_seconds,
     (COALESCE(last_heartbeat_at, updated_at, started_at) < %(started)s) AS before_start
 """
@@ -210,6 +220,26 @@ def _batch_item(row: Dict[str, Any], live_names: List[str]) -> Dict[str, Any]:
     }
 
 
+def _enrichment_summary(progress: Any) -> Optional[Dict[str, int]]:
+    """Resum de la cua d'enriquiment d'un cicle (progress escrit per scheduler_core), o None."""
+    if not isinstance(progress, dict) or "attempted" not in progress:
+        return None
+
+    def _int(key: str) -> int:
+        try:
+            return int(progress.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "attempted": _int("attempted"),
+        "enriched": _int("enriched"),
+        "discarded": _int("discarded"),
+        "failed": _int("failed"),
+        "skipped": _int("skipped"),
+    }
+
+
 def _scheduler_item(row: Dict[str, Any]) -> Dict[str, Any]:
     status = row.get("status")
     active = status in ACTIVE_STATUSES
@@ -239,6 +269,7 @@ def _scheduler_item(row: Dict[str, Any]) -> Dict[str, Any]:
         "error_message": row.get("error_message"),
         "current_stage": row.get("current_stage"),
         "current_action": row.get("current_action"),
+        "enrichment": _enrichment_summary(row.get("progress")),
         "requested_by": None,
         "dry_run": bool(row.get("dry_run")),
         "seconds_since_update": silence if active else None,
@@ -295,12 +326,14 @@ def _batch_filter(statuses: List[str], ptype: Optional[str]):
     return ("WHERE " + " AND ".join(where)) if where else "", params
 
 
-def _scheduler_filter(statuses: List[str]):
-    params = {"started": PROCESS_STARTED_AT}
+def _scheduler_filter(statuses: List[str], enrichment_only: bool = False):
+    where, params = [], {"started": PROCESS_STARTED_AT}
     if statuses:
+        where.append("status = ANY(%(statuses)s)")
         params["statuses"] = statuses
-        return "WHERE status = ANY(%(statuses)s)", params
-    return "", params
+    if enrichment_only:
+        where.append(SCHEDULER_ENRICHED_SQL)
+    return ("WHERE " + " AND ".join(where)) if where else "", params
 
 
 def _fetch_batches(where_sql: str, params: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
@@ -363,7 +396,13 @@ def _global_counts(live_names: List[str]) -> Dict[str, int]:
 @router_processes.get("")
 def list_processes(
     status: Optional[str] = Query(None, description="Estats separats per coma"),
-    type: Optional[str] = Query(None, description="Tipus de procés"),
+    type: Optional[str] = Query(
+        None,
+        description=(
+            "Tipus de procés; 'scheduler_enrichment' = cicles del scheduler que han processat "
+            "almenys una entrada a la cua d'enriquiment"
+        ),
+    ),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     exclude_scheduler: bool = Query(
@@ -385,8 +424,8 @@ def list_processes(
         total += _count("batch_jobs", where_b, params_b)
         items += [_batch_item(r, live_names) for r in _fetch_batches(where_b, params_b, fetch_limit)]
 
-    if type == TYPE_SCHEDULER or (not type and not exclude_scheduler):
-        where_s, params_s = _scheduler_filter(statuses)
+    if type in SCHEDULER_TYPES or (not type and not exclude_scheduler):
+        where_s, params_s = _scheduler_filter(statuses, enrichment_only=(type == TYPE_SCHEDULER_ENRICH))
         total += _count("scheduler_runs", where_s, params_s)
         items += [_scheduler_item(r) for r in _fetch_runs(where_s, params_s, fetch_limit)]
 
