@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from app.db import get_connection
 from app.llm_config import call_llm_for_prompt
+from app.output_repair import run_output_only
 
 load_dotenv()
 
@@ -783,6 +784,42 @@ def mark_entry_discarded_no_content(
         ),
     )
 
+def find_incomplete_output_fields(
+    primary_result: Dict[str, Any],
+    final_result: Dict[str, Any],
+) -> List[str]:
+    """
+    Retorna camps bilingües que Output ha deixat buits tot i que Primary
+    tenia contingut per traduir.
+
+    Així una entrada no pot acabar ENRICHED de manera silenciosa amb una
+    traducció incompleta.
+    """
+    def is_empty(value: Any) -> bool:
+        return (
+            value is None
+            or (isinstance(value, str) and not value.strip())
+            or (isinstance(value, list) and not value)
+        )
+
+    missing = []
+
+    for base_field in (
+        "summary_factual",
+        "why_it_matters",
+        "debate_questions",
+        "human_protection_notes",
+    ):
+        if is_empty(primary_result.get(base_field)):
+            continue
+
+        for language in ("ca", "en"):
+            field_name = f"{base_field}_{language}"
+            if is_empty(final_result.get(field_name)):
+                missing.append(field_name)
+
+    return missing
+
 def run_entry_enrichment(
     entry_id: int,
     skip_input: bool = False,
@@ -801,6 +838,15 @@ def run_entry_enrichment(
     incrementa processing_retries i retorna les sortides de les fases per
     inspecció. És segur per provar canvis de prompt, provider, model i parser.
     """
+    # output-only: reutilitza el resultat de Primary ja persistit i
+    # executa només Output. És el camí per completar traduccions _ca/_en
+    # buides sense reescriure Primary, BIHP, etiquetes ni revisió editorial.
+    #
+    # No admet Input: si es combina amb run_input=True no és output-only
+    # real i es manté el flux habitual.
+    if run_output and not run_primary and not run_input:
+        return run_output_only(entry_id=entry_id, persist=persist)
+
     conn = get_connection()
     phase_results: Dict[str, Any] = {}
 
@@ -1015,7 +1061,23 @@ def run_entry_enrichment(
                 "result": output_result_raw,
             }
 
-            final_result = _validate_and_normalize_final_output(primary_result, output_result_raw)
+            final_result = _validate_and_normalize_final_output(
+                primary_result,
+                output_result_raw,
+            )
+
+            missing_output_fields = find_incomplete_output_fields(
+                primary_result,
+                final_result,
+            )
+
+            if missing_output_fields:
+                raise ValueError(
+                    "La resposta de la fase Output sembla truncada o ha superat "
+                    "max_tokens: camps bilingües buits ("
+                    + ", ".join(missing_output_fields)
+                    + ")."
+                )
 
             if persist:
                 cur.execute("""
