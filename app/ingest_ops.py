@@ -3,7 +3,7 @@ AsimovWatch · Fase 5 · Peça 5.3 — Operacions d'ingesta (backend).
 
 Router de la pantalla Ingesta → Operacions:
   GET  /ingest-ops/summary            Salut del pipeline i estat de la cua automàtica d'enriquiment.
-  GET  /ingest-ops/entries            Llistes paginades (pendents, errors, descartades) amb diagnòstic.
+  GET  /ingest-ops/entries            Llistes paginades (pendents, errors, descartades, incompletes) amb diagnòstic.
   POST /ingest-ops/reprocess-preview  Validació prèvia d'un reprocessament, amb l'estat de cada fase (no modifica res).
   GET  /ingest-ops/queue-config       Configuració de la cua automàtica d'enriquiment.
   PUT  /ingest-ops/queue-config       Desa la configuració (valida els rangs; només claus entry_enrichment_*).
@@ -13,6 +13,8 @@ El reprocessament real continua sent POST /api/batch/process (main.py): aquest m
 Disseny:
   - La classe d'error (permanent / retryable / unknown) i els marcadors surten d'app.enrichment_queue,
     perquè la pantalla vegi exactament el mateix que la cua automàtica.
+  - Pestanya «Incompletes»: entrades ENRICHED a les quals falta alguna traducció (_ca / _en). Es reparen amb el
+    mode «output-only» (vegeu app.output_repair), que només omple els camps buits.
   - Aquest mòdul NO importa app.main (evita imports circulars).
 """
 import re
@@ -33,7 +35,8 @@ from app.enrichment_queue import (
 
 router_ingest_ops = APIRouter(prefix="/ingest-ops", tags=["ingest-ops"])
 
-TABS = {"pending": "RAW", "errors": "ERROR", "discarded": "DISCARDED"}
+TABS = {"pending": "RAW", "errors": "ERROR", "discarded": "DISCARDED", "incomplete": "ENRICHED"}
+INCOMPLETE_DIAGNOSES = ("translation_missing_ca", "translation_missing_en", "translation_missing_both")
 
 # Idèntics a BATCH_MODES de main.py (fase requerida per mode).
 VALID_MODES = ("input-only", "primary-only", "output-only", "semifull", "full")
@@ -57,6 +60,9 @@ SUGGESTED_TIMEOUT_MS = {
 UI_RECOMMENDED_MAX_IDS = 50
 API_MAX_IDS = 500
 ACTIVE_STATUSES = ("QUEUED", "RUNNING")
+
+# Camps de text que han de tenir versió _ca i _en quan el base té text.
+TRANSLATION_BASES = ("summary_factual", "why_it_matters", "human_protection_notes")
 
 CONFIG_KEYS = (
     "entry_enrichment_frequency_minutes",
@@ -95,15 +101,26 @@ def _marker_params(retry_max: int) -> Dict[str, Any]:
     }
 
 
+def _missing_sql(lang: str) -> str:
+    """Expressió SQL: algun camp de text té base però no té la versió `lang` (ca | en)."""
+    parts = [
+        f"(COALESCE(btrim({b}), '') <> '' AND COALESCE(btrim({b}_{lang}), '') = '')"
+        for b in TRANSLATION_BASES
+    ]
+    return "(" + " OR ".join(parts) + ")"
+
+
 # CTE comuna: calcula diagnòstic, classe d'error i estat respecte a la cua d'una sola vegada.
 # NOTA: no hi ha cap '%' literal; tots els patrons LIKE van com a paràmetres.
-CLASSIFIED_CTE = """
+CLASSIFIED_CTE = f"""
 WITH base AS (
     SELECT id, source_title, source_domain, detected_at, ingested_at, updated_at,
            processing_status, processing_error, processing_retries,
            input_relevance, ready_for_primary, input_relevance_reason, enriched_model,
            (COALESCE(btrim(raw_content), '') <> '' OR COALESCE(btrim(raw_snippet), '') <> '') AS has_content,
-           lower(COALESCE(processing_error, '')) AS pe
+           lower(COALESCE(processing_error, '')) AS pe,
+           {_missing_sql('ca')} AS miss_ca,
+           {_missing_sql('en')} AS miss_en
     FROM public.entries
     WHERE processing_status = %(status)s
 ),
@@ -130,6 +147,13 @@ classified AS (
                 END
             WHEN processing_status = 'DISCARDED' THEN
                 CASE WHEN has_content THEN 'discarded_by_input' ELSE 'discarded_no_content' END
+            WHEN processing_status = 'ENRICHED' THEN
+                CASE
+                    WHEN miss_ca AND miss_en THEN 'translation_missing_both'
+                    WHEN miss_ca THEN 'translation_missing_ca'
+                    WHEN miss_en THEN 'translation_missing_en'
+                    ELSE 'enrichment_complete'
+                END
             ELSE 'other'
         END AS diagnosis,
         CASE
@@ -165,8 +189,11 @@ def _retry_max() -> int:
     return int(get_enrichment_queue_config()["retry_max"])
 
 
-def _where(params: Dict[str, Any], diagnosis=None, queue_state=None, source_domain=None, q=None) -> str:
+def _where(params: Dict[str, Any], diagnosis=None, queue_state=None, source_domain=None, q=None,
+           only_incomplete: bool = False) -> str:
     conds: List[str] = []
+    if only_incomplete:
+        conds.append("diagnosis IN ('translation_missing_ca', 'translation_missing_en', 'translation_missing_both')")
     if diagnosis:
         conds.append("diagnosis = %(diagnosis)s")
         params["diagnosis"] = diagnosis
@@ -224,6 +251,7 @@ def ingest_summary():
     error_by_class = _group_counts("ERROR", retry_max, "error_class")
     blocked = sum(v for k, v in error_by_queue.items() if k.startswith("blocked"))
     error_picked = error_by_queue.get("will_be_picked", 0)
+    incomplete_by_diag = _group_counts("ENRICHED", retry_max, "diagnosis", only_incomplete=True)
 
     cfg_rows = _query(
         "SELECT key, value FROM public.config WHERE key = ANY(%(keys)s)", {"keys": list(CONFIG_KEYS)}
@@ -257,6 +285,7 @@ def ingest_summary():
             "will_be_picked": error_picked,
         },
         "discarded": {"by_diagnosis": _group_counts("DISCARDED", retry_max, "diagnosis")},
+        "incomplete": {"by_diagnosis": incomplete_by_diag, "total": sum(incomplete_by_diag.values())},
         "queue": {
             "config": cfg,
             "frequency_minutes": frequency,
@@ -280,7 +309,7 @@ def ingest_summary():
 
 @router_ingest_ops.get("/entries")
 def list_ingest_entries(
-    tab: str = Query("pending", description="pending (RAW) | errors (ERROR) | discarded (DISCARDED)"),
+    tab: str = Query("pending", description="pending (RAW) | errors (ERROR) | discarded (DISCARDED) | incomplete (ENRICHED sense alguna traducció)"),
     diagnosis: Optional[str] = Query(None),
     queue_state: Optional[str] = Query(None, description="Un valor concret o «blocked» (totes les bloquejades)"),
     source_domain: Optional[str] = Query(None),
@@ -295,11 +324,12 @@ def list_ingest_entries(
         raise HTTPException(status_code=400, detail=f"sort no vàlid: {sort}")
 
     status = TABS[tab]
+    incomplete = tab == "incomplete"
     retry_max = _retry_max()
     base_params = {"status": status, **_marker_params(retry_max)}
 
     list_params = dict(base_params)
-    where = _where(list_params, diagnosis, queue_state, source_domain, q)
+    where = _where(list_params, diagnosis, queue_state, source_domain, q, only_incomplete=incomplete)
     order = (
         "detected_at ASC NULLS LAST, id ASC" if sort == "oldest" else "detected_at DESC NULLS LAST, id DESC"
     )
@@ -313,7 +343,7 @@ def list_ingest_entries(
                COALESCE(processing_retries, 0) AS processing_retries,
                input_relevance, ready_for_primary,
                LEFT(input_relevance_reason, 300) AS input_relevance_reason,
-               enriched_model, has_content, diagnosis, error_class, queue_state
+               enriched_model, has_content, diagnosis, error_class, queue_state, miss_ca, miss_en
         FROM final {where}
         ORDER BY {order}
         LIMIT %(limit)s OFFSET %(offset)s""",
@@ -323,14 +353,16 @@ def list_ingest_entries(
     # Facetes: cada una ignora el seu propi filtre perquè el desplegable mostri totes les opcions.
     facets = {
         "diagnosis": _group_counts(
-            status, retry_max, "diagnosis", queue_state=queue_state, source_domain=source_domain, q=q
+            status, retry_max, "diagnosis", queue_state=queue_state, source_domain=source_domain, q=q,
+            only_incomplete=incomplete,
         ),
         "queue_state": _group_counts(
-            status, retry_max, "queue_state", diagnosis=diagnosis, source_domain=source_domain, q=q
+            status, retry_max, "queue_state", diagnosis=diagnosis, source_domain=source_domain, q=q,
+            only_incomplete=incomplete,
         ),
     }
     dom_params = dict(base_params)
-    dom_where = _where(dom_params, diagnosis, queue_state, None, q)
+    dom_where = _where(dom_params, diagnosis, queue_state, None, q, only_incomplete=incomplete)
     dom_rows = _query(
         f"{CLASSIFIED_CTE} SELECT lower(COALESCE(source_domain, '(desconeguda)')) AS k, COUNT(*) AS n "
         f"FROM final {dom_where} GROUP BY 1 ORDER BY n DESC, k ASC LIMIT 10",
@@ -363,6 +395,10 @@ class ReprocessPreviewRequest(BaseModel):
 _PHASE_IN_ERROR = re.compile(r"fase\s+(input|primary|output)", re.IGNORECASE)
 
 
+def _is_empty(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, (list, dict)) and not value)
+
+
 def _phase_persisted(row: Dict[str, Any], phase: str) -> bool:
     """Mateixa regla que phase_is_persisted de main.py."""
     if phase == "input":
@@ -376,11 +412,22 @@ def _phase_persisted(row: Dict[str, Any], phase: str) -> bool:
     return False
 
 
-def _output_done(row: Dict[str, Any]) -> bool:
-    """Output ha corregut si hi ha camps traduïts (ca/en); el mode primary-only desa Primary sense traduir."""
+def _translation_gaps(row: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Camps de text amb base però sense la versió _ca / _en."""
+    gaps: Dict[str, List[str]] = {"ca": [], "en": []}
+    for base in TRANSLATION_BASES:
+        if _is_empty(row.get(base)):
+            continue
+        for lang in ("ca", "en"):
+            if _is_empty(row.get(f"{base}_{lang}")):
+                gaps[lang].append(base)
+    return gaps
+
+
+def _any_translation(row: Dict[str, Any]) -> bool:
     return any(
-        row.get(k) is not None
-        for k in ("summary_factual_ca", "summary_factual_en", "why_it_matters_ca", "why_it_matters_en")
+        not _is_empty(row.get(f"{b}_{lang}"))
+        for b in ("summary_factual", "why_it_matters") for lang in ("ca", "en")
     )
 
 
@@ -395,25 +442,30 @@ def _failed_phase(row: Dict[str, Any]) -> Optional[str]:
 def _phase_states(row: Dict[str, Any]) -> Dict[str, str]:
     """
     Estat de cada fase d'una entrada:
-      done      feta i desada
-      unsaved   feta però no desada (Primary quan Output ha fallat: el pipeline no la desa fins al final)
-      failed    és on ha fallat
-      pending   encara no feta
-      n/a       no s'executarà (descartada per Input)
+      done        feta i desada
+      incomplete  Output ha corregut però falten traduccions (entrada ENRICHED incompleta)
+      unsaved     feta però no desada (Primary quan Output ha fallat: el pipeline no la desa fins al final)
+      failed      és on ha fallat
+      pending     encara no feta
+      n/a         no s'executarà (descartada per Input)
     """
     status = (row.get("processing_status") or "").upper()
     input_done = _phase_persisted(row, "input")
     primary_saved = _phase_persisted(row, "primary")
-    output_done = _output_done(row)
     failed = _failed_phase(row)
 
     if status == "DISCARDED":
         return {"input": "done" if input_done else "n/a", "primary": "n/a", "output": "n/a"}
     if status == "ENRICHED":
+        gaps = _translation_gaps(row)
+        if gaps["ca"] or gaps["en"]:
+            output = "incomplete" if _any_translation(row) else "pending"
+        else:
+            output = "done" if _any_translation(row) else "pending"
         return {
             "input": "done" if input_done else "n/a",
             "primary": "done" if primary_saved else "n/a",
-            "output": "done" if output_done else "pending",
+            "output": output,
         }
     return {
         "input": "done" if input_done else ("failed" if failed == "input" else "pending"),
@@ -423,7 +475,7 @@ def _phase_states(row: Dict[str, Any]) -> Dict[str, str]:
             else "unsaved" if failed == "output"
             else "pending"
         ),
-        "output": "done" if output_done else ("failed" if failed == "output" else "pending"),
+        "output": "done" if _any_translation(row) else ("failed" if failed == "output" else "pending"),
     }
 
 
@@ -476,8 +528,9 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     retry_max = _retry_max()
     rows = _query(
         "SELECT id, processing_status, processing_error, processing_retries, input_relevance, "
-        "ready_for_primary, summary_factual, why_it_matters, enriched_at, "
-        "summary_factual_ca, summary_factual_en, why_it_matters_ca, why_it_matters_en "
+        "ready_for_primary, summary_factual, why_it_matters, human_protection_notes, enriched_at, "
+        "summary_factual_ca, summary_factual_en, why_it_matters_ca, why_it_matters_en, "
+        "human_protection_notes_ca, human_protection_notes_en "
         "FROM public.entries WHERE id = ANY(%(ids)s)",
         {"ids": ids},
     )
@@ -487,10 +540,12 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     counts_by_status: Dict[str, int] = {}
     requires_full_ids: List[int] = []
     enriched_ids: List[int] = []
+    complete_enriched_ids: List[int] = []
     queue_ids: List[int] = []
     will_run = 0
     phase_summary = {
-        "total": 0, "input_done": 0, "primary_saved": 0, "output_done": 0, "unsaved_primary": 0,
+        "total": 0, "input_done": 0, "primary_saved": 0, "output_done": 0, "output_incomplete": 0,
+        "unsaved_primary": 0,
         "failed_by_phase": {"input": 0, "primary": 0, "output": 0, "unknown": 0},
     }
 
@@ -505,17 +560,20 @@ def reprocess_preview(body: ReprocessPreviewRequest):
         counts_by_status[status] = counts_by_status.get(status, 0) + 1
         if not _phase_persisted(row, "input"):
             requires_full_ids.append(entry_id)
+        phases = _phase_states(row)
         if status == "ENRICHED":
             enriched_ids.append(entry_id)
+            if phases["output"] == "done":
+                complete_enriched_ids.append(entry_id)
         if _would_queue_pick(row, retry_max):
             queue_ids.append(entry_id)
 
-        phases = _phase_states(row)
         failed = _failed_phase(row)
         phase_summary["total"] += 1
         phase_summary["input_done"] += 1 if phases["input"] == "done" else 0
         phase_summary["primary_saved"] += 1 if phases["primary"] == "done" else 0
         phase_summary["output_done"] += 1 if phases["output"] == "done" else 0
+        phase_summary["output_incomplete"] += 1 if phases["output"] == "incomplete" else 0
         phase_summary["unsaved_primary"] += 1 if phases["primary"] == "unsaved" else 0
         if status == "ERROR":
             phase_summary["failed_by_phase"][failed or "unknown"] += 1
@@ -552,6 +610,10 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     if enriched_ids and mode in ("full", "semifull", "input-only", "primary-only"):
         warnings.append({"code": "overwrites_enriched", "count": len(enriched_ids), "entry_ids": enriched_ids[:50],
                          "message": f"{len(enriched_ids)} entrades ja estan ENRICHED: aquest mode en sobreescriuria el resultat."})
+    if mode == "output-only" and complete_enriched_ids:
+        warnings.append({"code": "output_already_complete", "count": len(complete_enriched_ids),
+                         "entry_ids": complete_enriched_ids[:50],
+                         "message": f"{len(complete_enriched_ids)} entrades ja tenen totes les traduccions: no s'hi canviarà res, però es gastaria una crida."})
     if queue_ids:
         warnings.append({"code": "queue_will_pick", "count": len(queue_ids), "entry_ids": queue_ids[:50],
                          "message": f"{len(queue_ids)} entrades les agafaria igualment la cua automàtica."})
