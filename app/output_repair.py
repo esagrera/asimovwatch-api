@@ -93,8 +93,8 @@ def run_output_only(entry_id: int, persist: bool = True) -> Dict[str, Any]:
             prompt_key="Output",
             prompt_overrides={"input_text": json.dumps(primary_like, ensure_ascii=False, default=str)},
         )
-        from app.crawler import parse_json_output
-        raw = parse_json_output(llm["output"], phase="Output")
+        from app.crawler import _parse_json_output
+        raw = _parse_json_output(llm["output"], phase="Output")
 
         updates: Dict[str, Any] = {}
         missing: List[str] = []
