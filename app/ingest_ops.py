@@ -1,10 +1,12 @@
 """
-AsimovWatch · Fase 5 · Peça 5.3 — Operacions d'ingesta (backend, només lectura).
+AsimovWatch · Fase 5 · Peça 5.3 — Operacions d'ingesta (backend).
 
-Router de lectura per a la pantalla Ingesta → Operacions:
+Router de la pantalla Ingesta → Operacions:
   GET  /ingest-ops/summary            Salut del pipeline i estat de la cua automàtica d'enriquiment.
   GET  /ingest-ops/entries            Llistes paginades (pendents, errors, descartades) amb diagnòstic.
-  POST /ingest-ops/reprocess-preview  Validació prèvia d'un reprocessament (no modifica res).
+  POST /ingest-ops/reprocess-preview  Validació prèvia d'un reprocessament, amb l'estat de cada fase (no modifica res).
+  GET  /ingest-ops/queue-config       Configuració de la cua automàtica d'enriquiment.
+  PUT  /ingest-ops/queue-config       Desa la configuració (valida els rangs; només claus entry_enrichment_*).
 
 El reprocessament real continua sent POST /api/batch/process (main.py): aquest mòdul NO llança res.
 
@@ -13,6 +15,7 @@ Disseny:
     perquè la pantalla vegi exactament el mateix que la cua automàtica.
   - Aquest mòdul NO importa app.main (evita imports circulars).
 """
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -279,7 +282,7 @@ def ingest_summary():
 def list_ingest_entries(
     tab: str = Query("pending", description="pending (RAW) | errors (ERROR) | discarded (DISCARDED)"),
     diagnosis: Optional[str] = Query(None),
-    queue_state: Optional[str] = Query(None),
+    queue_state: Optional[str] = Query(None, description="Un valor concret o «blocked» (totes les bloquejades)"),
     source_domain: Optional[str] = Query(None),
     q: Optional[str] = Query(None, description="Text al títol o ID exacte"),
     limit: int = Query(50, ge=1, le=200),
@@ -357,6 +360,9 @@ class ReprocessPreviewRequest(BaseModel):
     skip_existing: bool = True
 
 
+_PHASE_IN_ERROR = re.compile(r"fase\s+(input|primary|output)", re.IGNORECASE)
+
+
 def _phase_persisted(row: Dict[str, Any], phase: str) -> bool:
     """Mateixa regla que phase_is_persisted de main.py."""
     if phase == "input":
@@ -368,6 +374,57 @@ def _phase_persisted(row: Dict[str, Any], phase: str) -> bool:
             or row.get("enriched_at") is not None
         )
     return False
+
+
+def _output_done(row: Dict[str, Any]) -> bool:
+    """Output ha corregut si hi ha camps traduïts (ca/en); el mode primary-only desa Primary sense traduir."""
+    return any(
+        row.get(k) is not None
+        for k in ("summary_factual_ca", "summary_factual_en", "why_it_matters_ca", "why_it_matters_en")
+    )
+
+
+def _failed_phase(row: Dict[str, Any]) -> Optional[str]:
+    """Fase on ha fallat una entrada ERROR, si el missatge ho diu («La fase Output ha retornat JSON invàlid…»)."""
+    if (row.get("processing_status") or "").upper() != "ERROR":
+        return None
+    match = _PHASE_IN_ERROR.search(row.get("processing_error") or "")
+    return match.group(1).lower() if match else None
+
+
+def _phase_states(row: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Estat de cada fase d'una entrada:
+      done      feta i desada
+      unsaved   feta però no desada (Primary quan Output ha fallat: el pipeline no la desa fins al final)
+      failed    és on ha fallat
+      pending   encara no feta
+      n/a       no s'executarà (descartada per Input)
+    """
+    status = (row.get("processing_status") or "").upper()
+    input_done = _phase_persisted(row, "input")
+    primary_saved = _phase_persisted(row, "primary")
+    output_done = _output_done(row)
+    failed = _failed_phase(row)
+
+    if status == "DISCARDED":
+        return {"input": "done" if input_done else "n/a", "primary": "n/a", "output": "n/a"}
+    if status == "ENRICHED":
+        return {
+            "input": "done" if input_done else "n/a",
+            "primary": "done" if primary_saved else "n/a",
+            "output": "done" if output_done else "pending",
+        }
+    return {
+        "input": "done" if input_done else ("failed" if failed == "input" else "pending"),
+        "primary": (
+            "done" if primary_saved
+            else "failed" if failed == "primary"
+            else "unsaved" if failed == "output"
+            else "pending"
+        ),
+        "output": "done" if output_done else ("failed" if failed == "output" else "pending"),
+    }
 
 
 def _skip_reason(row: Dict[str, Any], mode: str, skip_existing: bool) -> Optional[str]:
@@ -399,7 +456,7 @@ def _would_queue_pick(row: Dict[str, Any], retry_max: int) -> bool:
 
 @router_ingest_ops.post("/reprocess-preview")
 def reprocess_preview(body: ReprocessPreviewRequest):
-    """Valida un reprocessament abans de llançar-lo. No modifica res."""
+    """Valida un reprocessament abans de llançar-lo i informa de l'estat de cada fase. No modifica res."""
     blockers: List[Dict[str, str]] = []
     warnings: List[Dict[str, Any]] = []
 
@@ -419,7 +476,8 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     retry_max = _retry_max()
     rows = _query(
         "SELECT id, processing_status, processing_error, processing_retries, input_relevance, "
-        "ready_for_primary, summary_factual, why_it_matters, enriched_at "
+        "ready_for_primary, summary_factual, why_it_matters, enriched_at, "
+        "summary_factual_ca, summary_factual_en, why_it_matters_ca, why_it_matters_en "
         "FROM public.entries WHERE id = ANY(%(ids)s)",
         {"ids": ids},
     )
@@ -431,12 +489,17 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     enriched_ids: List[int] = []
     queue_ids: List[int] = []
     will_run = 0
+    phase_summary = {
+        "total": 0, "input_done": 0, "primary_saved": 0, "output_done": 0, "unsaved_primary": 0,
+        "failed_by_phase": {"input": 0, "primary": 0, "output": 0, "unknown": 0},
+    }
 
     for entry_id in ids:
         row = by_id.get(entry_id)
         if row is None:
             items.append({"id": entry_id, "processing_status": None, "will_run": False,
-                          "skip_reason": "entry_not_found"})
+                          "skip_reason": "entry_not_found", "phases": None, "failed_phase": None,
+                          "error": None, "retries": None})
             continue
         status = (row.get("processing_status") or "").upper()
         counts_by_status[status] = counts_by_status.get(status, 0) + 1
@@ -446,10 +509,31 @@ def reprocess_preview(body: ReprocessPreviewRequest):
             enriched_ids.append(entry_id)
         if _would_queue_pick(row, retry_max):
             queue_ids.append(entry_id)
+
+        phases = _phase_states(row)
+        failed = _failed_phase(row)
+        phase_summary["total"] += 1
+        phase_summary["input_done"] += 1 if phases["input"] == "done" else 0
+        phase_summary["primary_saved"] += 1 if phases["primary"] == "done" else 0
+        phase_summary["output_done"] += 1 if phases["output"] == "done" else 0
+        phase_summary["unsaved_primary"] += 1 if phases["primary"] == "unsaved" else 0
+        if status == "ERROR":
+            phase_summary["failed_by_phase"][failed or "unknown"] += 1
+
         reason = _skip_reason(row, mode, body.skip_existing)
         runs = reason is None
         will_run += 1 if runs else 0
-        items.append({"id": entry_id, "processing_status": status, "will_run": runs, "skip_reason": reason})
+        error_text = (row.get("processing_error") or "")[:300] or None
+        items.append({
+            "id": entry_id,
+            "processing_status": status,
+            "will_run": runs,
+            "skip_reason": reason,
+            "phases": phases,
+            "failed_phase": failed,
+            "error": error_text,
+            "retries": int(row.get("processing_retries") or 0),
+        })
 
     skipped = len(items) - will_run
     if will_run == 0:
@@ -503,6 +587,7 @@ def reprocess_preview(body: ReprocessPreviewRequest):
         "will_run": will_run,
         "skipped": skipped,
         "counts_by_status": counts_by_status,
+        "phase_summary": phase_summary,
         "items": items,
         "blockers": blockers,
         "warnings": warnings,
@@ -516,6 +601,7 @@ def reprocess_preview(body: ReprocessPreviewRequest):
         "queue_retry_max": retry_max,
     }
 
+
 # ---------------------------------------------------------------------------
 # Configuració de la cua automàtica (5.3-C)
 # ---------------------------------------------------------------------------
@@ -528,7 +614,8 @@ QUEUE_CONFIG_KEYS = {
     "timeout_seconds": "entry_enrichment_timeout_seconds",
     "frequency_minutes": "entry_enrichment_frequency_minutes",
 }
-# Els quatre primers rangs són els de enrichment_queue.py; la freqüència segueix el mínim del crawler d'entrades.
+# Els quatre primers rangs són els de enrichment_queue.py. La freqüència admet des de 5 min: el scheduler
+# s'avalua cada 15 min i amb 15 la cua s'executa a la pràctica cada ~30 (vegeu la guia).
 QUEUE_CONFIG_LIMITS = {
     "max_per_run": (1, 100),
     "max_per_source": (1, 100),
