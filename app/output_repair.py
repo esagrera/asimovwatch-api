@@ -18,7 +18,7 @@ run_output=True, run_primary=False i run_input=False.
 import json
 from typing import Any, Dict, List
 
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import RealDictCursor
 
 from app.db import get_connection
 from app.llm_config import call_llm_for_prompt
@@ -122,7 +122,7 @@ def run_output_only(entry_id: int, persist: bool = True) -> Dict[str, Any]:
             values: List[Any] = []
             for col, value in updates.items():
                 sets.append(f"{col} = %s")
-                values.append(Json(value) if col.rsplit("_", 1)[0] in JSON_FIELDS else value)
+                values.append(value)
             sets.append("updated_at = NOW()")
             values.append(entry_id)
             with conn.cursor() as cur:
