@@ -122,7 +122,7 @@ WITH base AS (
            {_missing_sql('ca')} AS miss_ca,
            {_missing_sql('en')} AS miss_en
     FROM public.entries
-    WHERE processing_status = %(status)s
+    WHERE (%(status)s::text IS NULL OR processing_status = %(status)s)
 ),
 classified AS (
     SELECT base.*,
@@ -318,6 +318,11 @@ def list_ingest_entries(
     queue_state: Optional[str] = Query(None, description="Un valor concret o «blocked» (totes les bloquejades)"),
     source_domain: Optional[str] = Query(None),
     q: Optional[str] = Query(None, description="Text al títol o ID exacte"),
+    lookup_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description="ID exacte: cerca global, ignora l'estat de la pestanya",
+    ),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     sort: str = Query("oldest", description="oldest | newest (per data de detecció)"),
@@ -326,6 +331,35 @@ def list_ingest_entries(
         raise HTTPException(status_code=400, detail=f"tab no vàlid: {tab}")
     if sort not in ("oldest", "newest"):
         raise HTTPException(status_code=400, detail=f"sort no vàlid: {sort}")
+
+    if lookup_id is not None:
+        retry_max = _retry_max()
+        lookup_params = {"status": None, "lookup_id": lookup_id, **_marker_params(retry_max)}
+        lookup_rows = _query(
+            f"""{CLASSIFIED_CTE}
+            SELECT id, source_title, source_domain, detected_at, ingested_at, updated_at,
+                   processing_status, review_status, LEFT(processing_error, 300) AS processing_error,
+                   COALESCE(processing_retries, 0) AS processing_retries,
+                   input_relevance, ready_for_primary,
+                   LEFT(input_relevance_reason, 300) AS input_relevance_reason,
+                   enriched_model, has_content, diagnosis, error_class, queue_state,
+                   miss_ca, miss_en
+            FROM final
+            WHERE id = %(lookup_id)s""",
+            lookup_params,
+        )
+        return {
+            "tab": tab,
+            "processing_status": None,
+            "items": lookup_rows,
+            "total": len(lookup_rows),
+            "limit": limit,
+            "offset": 0,
+            "facets": {"diagnosis": {}, "queue_state": {}, "source_domain": {}},
+            "retry_max": retry_max,
+            "global_lookup": True,
+            "lookup_id": lookup_id,
+        }
 
     status = TABS[tab]
     incomplete = tab == "incomplete"
