@@ -493,8 +493,13 @@ def _skip_reason(row: Dict[str, Any], mode: str, skip_existing: bool) -> Optiona
             return "input_already_persisted"
         if mode == "primary-only" and _phase_persisted(row, "primary"):
             return "primary_already_persisted"
+        # Una entrada ENRICHED només se salta en output-only si les
+        # traduccions requerides ja són completes. Si en falta una,
+        # output-only és precisament la reparació segura.
         if mode == "output-only" and row.get("enriched_at") is not None:
-            return "output_already_persisted"
+            gaps = _translation_gaps(row)
+            if not gaps["ca"] and not gaps["en"]:
+                return "output_already_persisted"
     return None
 
 
