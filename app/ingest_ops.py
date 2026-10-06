@@ -115,7 +115,7 @@ def _missing_sql(lang: str) -> str:
 CLASSIFIED_CTE = f"""
 WITH base AS (
     SELECT id, source_title, source_domain, detected_at, ingested_at, updated_at,
-           processing_status, processing_error, processing_retries,
+           processing_status, review_status, processing_error, processing_retries,
            input_relevance, ready_for_primary, input_relevance_reason, enriched_model,
            (COALESCE(btrim(raw_content), '') <> '' OR COALESCE(btrim(raw_snippet), '') <> '') AS has_content,
            lower(COALESCE(processing_error, '')) AS pe,
@@ -193,7 +193,11 @@ def _where(params: Dict[str, Any], diagnosis=None, queue_state=None, source_doma
            only_incomplete: bool = False) -> str:
     conds: List[str] = []
     if only_incomplete:
-        conds.append("diagnosis IN ('translation_missing_ca', 'translation_missing_en', 'translation_missing_both')")
+        conds.append(
+            "diagnosis IN ('translation_missing_ca', 'translation_missing_en', "
+            "'translation_missing_both')"
+        )
+        conds.append("COALESCE(review_status, 'NEW') <> 'REJECTED'")
     if diagnosis:
         conds.append("diagnosis = %(diagnosis)s")
         params["diagnosis"] = diagnosis
@@ -339,7 +343,7 @@ def list_ingest_entries(
     rows = _query(
         f"""{CLASSIFIED_CTE}
         SELECT id, source_title, source_domain, detected_at, ingested_at, updated_at,
-               processing_status, LEFT(processing_error, 300) AS processing_error,
+               processing_status, review_status, LEFT(processing_error, 300) AS processing_error,
                COALESCE(processing_retries, 0) AS processing_retries,
                input_relevance, ready_for_primary,
                LEFT(input_relevance_reason, 300) AS input_relevance_reason,
@@ -527,7 +531,7 @@ def reprocess_preview(body: ReprocessPreviewRequest):
 
     retry_max = _retry_max()
     rows = _query(
-        "SELECT id, processing_status, processing_error, processing_retries, input_relevance, "
+        "SELECT id, processing_status, review_status, processing_error, processing_retries, input_relevance, "
         "ready_for_primary, summary_factual, why_it_matters, human_protection_notes, enriched_at, "
         "summary_factual_ca, summary_factual_en, why_it_matters_ca, why_it_matters_en, "
         "human_protection_notes_ca, human_protection_notes_en "
@@ -557,7 +561,42 @@ def reprocess_preview(body: ReprocessPreviewRequest):
                           "error": None, "retries": None})
             continue
         status = (row.get("processing_status") or "").upper()
+        review_status = (row.get("review_status") or "NEW").upper()
+
         counts_by_status[status] = counts_by_status.get(status, 0) + 1
+
+        # Una entrada rebutjada editorialment no ha de consumir tokens.
+        # Es mostra com a no executable i després bloqueja el batch sencer.
+        if review_status == "REJECTED":
+            phases = _phase_states(row)
+            failed = _failed_phase(row)
+
+            phase_summary["total"] += 1
+            phase_summary["input_done"] += 1 if phases["input"] == "done" else 0
+            phase_summary["primary_saved"] += 1 if phases["primary"] == "done" else 0
+            phase_summary["output_done"] += 1 if phases["output"] == "done" else 0
+            phase_summary["output_incomplete"] += 1 if phases["output"] == "incomplete" else 0
+            phase_summary["unsaved_primary"] += 1 if phases["primary"] == "unsaved" else 0
+
+            if status == "ERROR":
+                phase_summary["failed_by_phase"][failed or "unknown"] += 1
+
+            items.append({
+                "id": entry_id,
+                "processing_status": status,
+                "review_status": review_status,
+                "will_run": False,
+                "skip_reason": "editorially_rejected",
+                "phases": phases,
+                "failed_phase": failed,
+                "error": (
+                    "Entrada rebutjada editorialment: no es reprocessa "
+                    "ni es consumeixen tokens."
+                ),
+                "retries": int(row.get("processing_retries") or 0),
+            })
+            continue
+
         if not _phase_persisted(row, "input"):
             requires_full_ids.append(entry_id)
         phases = _phase_states(row)
@@ -593,7 +632,22 @@ def reprocess_preview(body: ReprocessPreviewRequest):
             "retries": int(row.get("processing_retries") or 0),
         })
 
-    skipped = len(items) - will_run
+        rejected_ids = [
+            item["id"]
+            for item in items
+            if item.get("skip_reason") == "editorially_rejected"
+        ]
+
+        if rejected_ids:
+            blockers.append({
+                "code": "editorially_rejected",
+                "message": (
+                    f"{len(rejected_ids)} entrada/es estan rebutjades editorialment. "
+                    "No es poden reprocessar."
+                ),
+            })
+
+        skipped = len(items) - will_run
     if will_run == 0:
         blockers.append({"code": "nothing_to_run",
                          "message": "Amb aquest mode no s'executaria cap entrada."})
