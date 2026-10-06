@@ -511,7 +511,14 @@ def get_entry_phase_state(cur: Any, entry_id: int) -> Optional[Dict[str, Any]]:
             ready_for_primary,
             summary_factual,
             why_it_matters,
-            enriched_at
+            human_protection_notes,
+            enriched_at,
+            summary_factual_ca,
+            summary_factual_en,
+            why_it_matters_ca,
+            why_it_matters_en,
+            human_protection_notes_ca,
+            human_protection_notes_en
         FROM public.entries
         WHERE id = %s
         """,
@@ -533,6 +540,36 @@ def phase_is_persisted(entry: Dict[str, Any], phase: str) -> bool:
             or entry.get("why_it_matters") is not None
             or entry.get("enriched_at") is not None
         )
+
+    return False
+
+TRANSLATION_BASES = (
+    "summary_factual",
+    "why_it_matters",
+    "human_protection_notes",
+)
+
+
+def _is_empty_translation_value(value: Any) -> bool:
+    return (
+        value is None
+        or (isinstance(value, str) and not value.strip())
+        or (isinstance(value, (list, dict)) and not value)
+    )
+
+
+def has_translation_gaps(entry: Dict[str, Any]) -> bool:
+    """
+    True si algun camp base no buit no té la versió catalana o anglesa.
+    Un camp base buit no exigeix traducció.
+    """
+    for base in TRANSLATION_BASES:
+        if _is_empty_translation_value(entry.get(base)):
+            continue
+
+        for lang in ("ca", "en"):
+            if _is_empty_translation_value(entry.get(f"{base}_{lang}")):
+                return True
 
     return False
 
@@ -661,7 +698,11 @@ def process_batch_job(
                     )
                     continue
 
-                if mode == "output-only" and entry.get("enriched_at"):
+                if (
+                    mode == "output-only"
+                    and entry.get("enriched_at")
+                    and not has_translation_gaps(entry)
+                ):
                     item_result.update(
                         status="skipped",
                         reason="output_already_persisted",
