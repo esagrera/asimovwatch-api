@@ -607,7 +607,14 @@ def reprocess_preview(body: ReprocessPreviewRequest):
             })
             continue
 
-        if not _phase_persisted(row, "input"):
+        # Només cal forçar full si no hi ha cap fase que permeti continuar.
+        # Si Primary ja està desada, output-only pot reparar traduccions
+        # encara que l'entrada vingui d'un flux històric o de cerca temàtica
+        # sense traça estructurada d'Input.
+        if (
+            not _phase_persisted(row, "input")
+            and not _phase_persisted(row, "primary")
+        ):
             requires_full_ids.append(entry_id)
 
         phases = _phase_states(row)
