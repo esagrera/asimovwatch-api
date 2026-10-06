@@ -548,7 +548,11 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     queue_ids: List[int] = []
     will_run = 0
     phase_summary = {
-        "total": 0, "input_done": 0, "primary_saved": 0, "output_done": 0, "output_incomplete": 0,
+        "total": 0,
+        "input_done": 0,
+        "primary_saved": 0,
+        "output_done": 0,
+        "output_incomplete": 0,
         "unsaved_primary": 0,
         "failed_by_phase": {"input": 0, "primary": 0, "output": 0, "unknown": 0},
     }
@@ -556,13 +560,20 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     for entry_id in ids:
         row = by_id.get(entry_id)
         if row is None:
-            items.append({"id": entry_id, "processing_status": None, "will_run": False,
-                          "skip_reason": "entry_not_found", "phases": None, "failed_phase": None,
-                          "error": None, "retries": None})
+            items.append({
+                "id": entry_id,
+                "processing_status": None,
+                "will_run": False,
+                "skip_reason": "entry_not_found",
+                "phases": None,
+                "failed_phase": None,
+                "error": None,
+                "retries": None,
+            })
             continue
+
         status = (row.get("processing_status") or "").upper()
         review_status = (row.get("review_status") or "NEW").upper()
-
         counts_by_status[status] = counts_by_status.get(status, 0) + 1
 
         # Una entrada rebutjada editorialment no ha de consumir tokens.
@@ -577,7 +588,6 @@ def reprocess_preview(body: ReprocessPreviewRequest):
             phase_summary["output_done"] += 1 if phases["output"] == "done" else 0
             phase_summary["output_incomplete"] += 1 if phases["output"] == "incomplete" else 0
             phase_summary["unsaved_primary"] += 1 if phases["primary"] == "unsaved" else 0
-
             if status == "ERROR":
                 phase_summary["failed_by_phase"][failed or "unknown"] += 1
 
@@ -599,6 +609,7 @@ def reprocess_preview(body: ReprocessPreviewRequest):
 
         if not _phase_persisted(row, "input"):
             requires_full_ids.append(entry_id)
+
         phases = _phase_states(row)
         if status == "ENRICHED":
             enriched_ids.append(entry_id)
@@ -624,6 +635,7 @@ def reprocess_preview(body: ReprocessPreviewRequest):
         items.append({
             "id": entry_id,
             "processing_status": status,
+            "review_status": review_status,
             "will_run": runs,
             "skip_reason": reason,
             "phases": phases,
@@ -632,45 +644,71 @@ def reprocess_preview(body: ReprocessPreviewRequest):
             "retries": int(row.get("processing_retries") or 0),
         })
 
-        rejected_ids = [
-            item["id"]
-            for item in items
-            if item.get("skip_reason") == "editorially_rejected"
-        ]
+    rejected_ids = [
+        item["id"]
+        for item in items
+        if item.get("skip_reason") == "editorially_rejected"
+    ]
+    if rejected_ids:
+        blockers.append({
+            "code": "editorially_rejected",
+            "message": (
+                f"{len(rejected_ids)} entrada/es estan rebutjades editorialment. "
+                "No es poden reprocessar."
+            ),
+        })
 
-        if rejected_ids:
-            blockers.append({
-                "code": "editorially_rejected",
-                "message": (
-                    f"{len(rejected_ids)} entrada/es estan rebutjades editorialment. "
-                    "No es poden reprocessar."
-                ),
-            })
-
-        skipped = len(items) - will_run
+    skipped = len(items) - will_run
     if will_run == 0:
-        blockers.append({"code": "nothing_to_run",
-                         "message": "Amb aquest mode no s'executaria cap entrada."})
+        blockers.append({
+            "code": "nothing_to_run",
+            "message": "Amb aquest mode no s'executaria cap entrada.",
+        })
 
     if len(ids) > UI_RECOMMENDED_MAX_IDS:
-        warnings.append({"code": "over_recommended",
-                         "message": f"Més de {UI_RECOMMENDED_MAX_IDS} entrades: risc de batch llarg i de reinici del servidor."})
+        warnings.append({
+            "code": "over_recommended",
+            "message": (
+                f"Més de {UI_RECOMMENDED_MAX_IDS} entrades: "
+                "risc de batch llarg i de reinici del servidor."
+            ),
+        })
     if skipped and will_run:
-        warnings.append({"code": "skipped_entries", "count": skipped,
-                         "message": f"{skipped} entrades es saltarien en aquest mode."})
+        warnings.append({
+            "code": "skipped_entries",
+            "count": skipped,
+            "message": f"{skipped} entrades es saltarien en aquest mode.",
+        })
     if requires_full_ids and mode != "full":
-        warnings.append({"code": "mode_skips_without_input", "count": len(requires_full_ids),
-                         "message": "Hi ha entrades sense la fase Input: només el mode «full» les processa."})
+        warnings.append({
+            "code": "mode_skips_without_input",
+            "count": len(requires_full_ids),
+            "message": "Hi ha entrades sense la fase Input: només el mode «full» les processa.",
+        })
     if enriched_ids and mode in ("full", "semifull", "input-only", "primary-only"):
-        warnings.append({"code": "overwrites_enriched", "count": len(enriched_ids), "entry_ids": enriched_ids[:50],
-                         "message": f"{len(enriched_ids)} entrades ja estan ENRICHED: aquest mode en sobreescriuria el resultat."})
+        warnings.append({
+            "code": "overwrites_enriched",
+            "count": len(enriched_ids),
+            "entry_ids": enriched_ids[:50],
+            "message": f"{len(enriched_ids)} entrades ja estan ENRICHED: aquest mode en sobreescriuria el resultat.",
+        })
     if mode == "output-only" and complete_enriched_ids:
-        warnings.append({"code": "output_already_complete", "count": len(complete_enriched_ids),
-                         "entry_ids": complete_enriched_ids[:50],
-                         "message": f"{len(complete_enriched_ids)} entrades ja tenen totes les traduccions: no s'hi canviarà res, però es gastaria una crida."})
+        warnings.append({
+            "code": "output_already_complete",
+            "count": len(complete_enriched_ids),
+            "entry_ids": complete_enriched_ids[:50],
+            "message": (
+                f"{len(complete_enriched_ids)} entrades ja tenen totes les traduccions: "
+                "no s'hi canviarà res, però es gastaria una crida."
+            ),
+        })
     if queue_ids:
-        warnings.append({"code": "queue_will_pick", "count": len(queue_ids), "entry_ids": queue_ids[:50],
-                         "message": f"{len(queue_ids)} entrades les agafaria igualment la cua automàtica."})
+        warnings.append({
+            "code": "queue_will_pick",
+            "count": len(queue_ids),
+            "entry_ids": queue_ids[:50],
+            "message": f"{len(queue_ids)} entrades les agafaria igualment la cua automàtica.",
+        })
 
     active_runs = _query(
         "SELECT run_id, status, current_stage, started_at FROM public.scheduler_runs "
@@ -678,22 +716,37 @@ def reprocess_preview(body: ReprocessPreviewRequest):
     )
     active_batches = _query(
         "SELECT batch_id, mode, status, processed, total, "
-        "COALESCE(array_length(ARRAY(SELECT x FROM unnest(entry_ids) AS x WHERE x = ANY(%(ids)s)), 1), 0) "
-        "AS overlap_count "
-        "FROM public.batch_jobs WHERE status IN ('QUEUED','RUNNING') AND mode = ANY(%(modes)s)",
+        "COALESCE(array_length(ARRAY(SELECT x FROM unnest(entry_ids) AS x "
+        "WHERE x = ANY(%(ids)s)), 1), 0) AS overlap_count "
+        "FROM public.batch_jobs "
+        "WHERE status IN ('QUEUED','RUNNING') AND mode = ANY(%(modes)s)",
         {"ids": ids, "modes": list(VALID_MODES)},
     )
+
     if active_runs:
         stage = active_runs[0].get("current_stage") or "—"
-        warnings.append({"code": "scheduler_active", "count": len(active_runs),
-                         "message": f"Hi ha un cicle del scheduler en marxa (etapa: {stage}); pot processar les mateixes entrades."})
+        warnings.append({
+            "code": "scheduler_active",
+            "count": len(active_runs),
+            "message": (
+                f"Hi ha un cicle del scheduler en marxa (etapa: {stage}); "
+                "pot processar les mateixes entrades."
+            ),
+        })
     if active_batches:
-        warnings.append({"code": "batch_active", "count": len(active_batches),
-                         "message": "Hi ha un batch d'enriquiment en marxa."})
+        warnings.append({
+            "code": "batch_active",
+            "count": len(active_batches),
+            "message": "Hi ha un batch d'enriquiment en marxa.",
+        })
+
     overlapping = sum(int(b["overlap_count"] or 0) for b in active_batches)
     if overlapping:
-        warnings.append({"code": "batch_overlap", "count": overlapping,
-                         "message": f"{overlapping} d'aquestes entrades ja són en un batch en marxa."})
+        warnings.append({
+            "code": "batch_overlap",
+            "count": overlapping,
+            "message": f"{overlapping} d'aquestes entrades ja són en un batch en marxa.",
+        })
 
     recommended_mode = "full" if requires_full_ids else mode
     return {
@@ -709,11 +762,16 @@ def reprocess_preview(body: ReprocessPreviewRequest):
         "warnings": warnings,
         "requires_full": bool(requires_full_ids),
         "requires_full_ids": requires_full_ids[:100],
-        "recommended": {"mode": recommended_mode,
-                        "timeout_per_entry_ms": SUGGESTED_TIMEOUT_MS[recommended_mode]},
+        "recommended": {
+            "mode": recommended_mode,
+            "timeout_per_entry_ms": SUGGESTED_TIMEOUT_MS[recommended_mode],
+        },
         "estimate": {"llm_calls_max": will_run * LLM_CALLS_PER_ENTRY[mode]},
-        "overlap": {"scheduler_active": active_runs, "batches_active": active_batches,
-                    "queue_will_pick_ids": queue_ids[:100]},
+        "overlap": {
+            "scheduler_active": active_runs,
+            "batches_active": active_batches,
+            "queue_will_pick_ids": queue_ids[:100],
+        },
         "queue_retry_max": retry_max,
     }
 
