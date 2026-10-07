@@ -571,7 +571,6 @@ def discover_source_candidates(payload: SourceCandidateDiscoverRequest):
                     )
                 )
                 inserted.append(cur.fetchone())
-                inserted.append(cur.fetchone())
 
             if not payload.dry_run:
                 conn.commit()
