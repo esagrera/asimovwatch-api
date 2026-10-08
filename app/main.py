@@ -121,6 +121,10 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+# Hora d'arrencada d'aquest procés (UTC). Es reinicia a cada redeploy o
+# reinici de la instància. Exposada a GET /system/health.
+PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
 def get_config_map():
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -3939,6 +3943,18 @@ def get_stats():
     finally:
         cur.close()
         conn.close()
+
+@protected_router.get(
+    "/system/health",
+    summary="Estat bàsic del procés del backend",
+)
+def get_system_health():
+    now = datetime.now(timezone.utc)
+    return {
+        "status": "ok",
+        "process_started_at": PROCESS_STARTED_AT.isoformat(),
+        "server_time": now.isoformat(),
+    }
 
 @protected_router.get(
     "/scheduler/runs/{run_id}",

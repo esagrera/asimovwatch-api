@@ -29,6 +29,8 @@ from app.llm_config import (
     PROVIDER_CLIENT_MAP,
     list_llm_provider_models,
     list_llm_provider_status,
+    is_llm_provider_error_active,
+    resolve_llm_provider_error,
     replace_provider_models,
     get_default_model,
     get_recommended_models,
@@ -86,6 +88,10 @@ class LLMProviderRegistryCreate(BaseModel):
     supports_test: bool = True
     supports_usage_tracking: bool = False
     notes: Optional[str] = None
+
+class LLMProviderResolveErrorRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+    resolved_by: str = Field(min_length=1, max_length=100)
 
 VALID_PHASES = {"fallback"}
 
@@ -162,6 +168,9 @@ def list_providers_registry():
                 m["last_error_at"] = s["last_error_at"] if s else None
                 m["last_error_type"] = s["last_error_type"] if s else None
                 m["last_error_message"] = s["last_error_message"] if s else None
+                m["resolved_at"] = s["resolved_at"] if s else None
+                m["resolved_by"] = s["resolved_by"] if s else None
+                m["error_active"] = is_llm_provider_error_active(s)
 
             item["models"] = provider_models
             item["default_model"] = get_default_model(conn, provider)
@@ -244,6 +253,9 @@ def get_provider_registry_detail(provider: str):
             m["last_error_at"] = s["last_error_at"] if s else None
             m["last_error_type"] = s["last_error_type"] if s else None
             m["last_error_message"] = s["last_error_message"] if s else None
+            m["resolved_at"] = s["resolved_at"] if s else None
+            m["resolved_by"] = s["resolved_by"] if s else None
+            m["error_active"] = is_llm_provider_error_active(s)
 
         item["models"] = models
         item["default_model"] = get_default_model(conn, provider)
@@ -255,6 +267,66 @@ def get_provider_registry_detail(provider: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+@router_llm_admin.post("/providers/registry/{provider}/resolve-error")
+def resolve_provider_error(
+    provider: str,
+    payload: LLMProviderResolveErrorRequest,
+):
+    conn = None
+
+    try:
+        provider = _normalize_provider(provider)
+        model = (payload.model or "").strip()
+        resolved_by = (payload.resolved_by or "").strip()
+
+        if not model:
+            raise HTTPException(status_code=400, detail="model buit")
+
+        if not resolved_by:
+            raise HTTPException(status_code=400, detail="resolved_by buit")
+
+        conn = get_connection()
+
+        result, status_row = resolve_llm_provider_error(
+            conn,
+            provider,
+            model,
+            resolved_by,
+        )
+
+        if result == "not_found":
+            raise HTTPException(
+                status_code=404,
+                detail=f"No existeix estat per a {provider}/{model}",
+            )
+
+        if result == "no_active_error":
+            raise HTTPException(
+                status_code=409,
+                detail=f"No hi ha cap error actiu per a {provider}/{model}",
+            )
+
+        status_row["error_active"] = is_llm_provider_error_active(status_row)
+
+        return {
+            "status": "resolved",
+            "provider": provider,
+            "model": model,
+            "item": status_row,
+        }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         if conn:
             conn.close()

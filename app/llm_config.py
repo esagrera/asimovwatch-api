@@ -521,6 +521,83 @@ def get_llm_provider_status_item(conn, provider: str, model: str):
         row = cur.fetchone()
         return dict(row) if row else None
 
+def is_llm_provider_error_active(status_row: Optional[dict]) -> bool:
+    """
+    Determina si l'últim error d'un model continua actiu.
+
+    La regla és única i és la font de veritat del backend:
+    - ha d'existir last_error_at;
+    - l'error ha de ser posterior a l'últim èxit, si n'hi ha;
+    - l'error ha de ser posterior a la resolució manual, si n'hi ha.
+    """
+    if not status_row or not status_row.get("last_error_at"):
+        return False
+
+    last_error_at = status_row["last_error_at"]
+    last_ok_at = status_row.get("last_ok_at")
+    resolved_at = status_row.get("resolved_at")
+
+    return (
+        (last_ok_at is None or last_error_at > last_ok_at)
+        and (resolved_at is None or last_error_at > resolved_at)
+    )
+
+def resolve_llm_provider_error(
+    conn,
+    provider: str,
+    model: str,
+    resolved_by: str,
+) -> tuple[str, Optional[dict]]:
+    """
+    Resol de manera atòmica l'error actiu d'una parella provider/model.
+
+    No esborra cap camp last_error_*.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM public.llm_provider_status
+            WHERE provider = %s
+              AND model = %s
+            """,
+            (provider, model),
+        )
+        current = cur.fetchone()
+
+        if current is None:
+            return "not_found", None
+
+        current = dict(current)
+
+        if not is_llm_provider_error_active(current):
+            return "no_active_error", current
+
+        cur.execute(
+            """
+            UPDATE public.llm_provider_status
+            SET
+                resolved_at = now(),
+                resolved_by = %s,
+                updated_at = now()
+            WHERE provider = %s
+              AND model = %s
+              AND last_error_at IS NOT NULL
+              AND last_error_at > COALESCE(last_ok_at, '-infinity'::timestamptz)
+              AND last_error_at > COALESCE(resolved_at, '-infinity'::timestamptz)
+            RETURNING *
+            """,
+            (resolved_by, provider, model),
+        )
+        updated = cur.fetchone()
+
+    if updated is None:
+        conn.rollback()
+        return "no_active_error", current
+
+    conn.commit()
+    return "resolved", dict(updated)
+
 PROVIDER_ERROR_SIGNATURES = {
     "gemini": {
         "model_not_found": ["404", "not_found", "no longer available", "is not found for api version"],
