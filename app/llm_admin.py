@@ -30,6 +30,7 @@ from app.llm_config import (
     list_llm_provider_models,
     list_llm_provider_status,
     is_llm_provider_error_active,
+    is_llm_provider_error_resolved,
     resolve_llm_provider_error,
     replace_provider_models,
     get_default_model,
@@ -171,6 +172,7 @@ def list_providers_registry():
                 m["resolved_at"] = s["resolved_at"] if s else None
                 m["resolved_by"] = s["resolved_by"] if s else None
                 m["error_active"] = is_llm_provider_error_active(s)
+                m["error_resolved"] = is_llm_provider_error_resolved(s)
 
             item["models"] = provider_models
             item["default_model"] = get_default_model(conn, provider)
@@ -256,6 +258,7 @@ def get_provider_registry_detail(provider: str):
             m["resolved_at"] = s["resolved_at"] if s else None
             m["resolved_by"] = s["resolved_by"] if s else None
             m["error_active"] = is_llm_provider_error_active(s)
+            m["error_resolved"] = is_llm_provider_error_resolved(s)
 
         item["models"] = models
         item["default_model"] = get_default_model(conn, provider)
@@ -311,6 +314,7 @@ def resolve_provider_error(
             )
 
         status_row["error_active"] = is_llm_provider_error_active(status_row)
+        status_row["error_resolved"] = is_llm_provider_error_resolved(status_row)
 
         return {
             "status": "resolved",

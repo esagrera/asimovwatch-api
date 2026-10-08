@@ -542,6 +542,22 @@ def is_llm_provider_error_active(status_row: Optional[dict]) -> bool:
         and (resolved_at is None or last_error_at > resolved_at)
     )
 
+def is_llm_provider_error_resolved(status_row: Optional[dict]) -> bool:
+    """
+    True si l'últim error ha estat resolt manualment i el model no ha
+    tornat a funcionar des d'aleshores. Si el model ha tingut un èxit
+    posterior a la resolució, retorna False (el model funciona).
+    """
+    if not status_row:
+        return False
+    if not status_row.get("last_error_at") or not status_row.get("resolved_at"):
+        return False
+    if is_llm_provider_error_active(status_row):
+        return False
+
+    last_ok_at = status_row.get("last_ok_at")
+    return last_ok_at is None or status_row["resolved_at"] > last_ok_at
+
 def resolve_llm_provider_error(
     conn,
     provider: str,
