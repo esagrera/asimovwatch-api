@@ -335,6 +335,136 @@ def resolve_provider_error(
         if conn:
             conn.close()
 
+# ---------- C4 · Saldo manual per provider (peça 5.4) ----------
+BALANCE_STALE_AFTER_DAYS = 7
+
+
+class LLMBalanceUpdateRequest(BaseModel):
+    amount: float = Field(ge=0)
+    alert_threshold: Optional[float] = Field(default=None, ge=0)
+
+
+def _balance_key(provider: str, field: str) -> str:
+    return f"llm_balance_{provider}_{field}"
+
+
+def _to_float_or_none(value) -> Optional[float]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_balance_rows(conn) -> dict:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT key, value, updated_at FROM public.config WHERE key LIKE %s",
+            ("llm\\_balance\\_%",),
+        )
+        return {row["key"]: row for row in cur.fetchall()}
+
+
+def _build_balance_item(registry_item: dict, rows: dict) -> dict:
+    provider = registry_item["provider"]
+    amount_row = rows.get(_balance_key(provider, "amount"))
+    threshold_row = rows.get(_balance_key(provider, "alert_threshold"))
+    amount = _to_float_or_none(amount_row["value"]) if amount_row else None
+    threshold = _to_float_or_none(threshold_row["value"]) if threshold_row else None
+    updated_at = amount_row["updated_at"] if (amount_row and amount is not None) else None
+
+    age_days = None
+    stale = False
+    if updated_at is not None:
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - updated_at).days
+        stale = age_days >= BALANCE_STALE_AFTER_DAYS
+
+    if amount is None:
+        status = "unknown"
+    elif threshold is not None and amount <= threshold:
+        status = "low"
+    else:
+        status = "ok"
+
+    return {
+        "provider": provider,
+        "display_name": registry_item.get("display_name"),
+        "billing_url": registry_item.get("billing_url"),
+        "dashboard_url": registry_item.get("dashboard_url"),
+        "amount": amount,
+        "alert_threshold": threshold,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "age_days": age_days,
+        "stale": stale,
+        "status": status,
+    }
+
+
+@router_llm_admin.get("/balance")
+def list_llm_balance():
+    conn = None
+    try:
+        conn = get_connection()
+        registry = list_llm_provider_registry(conn)
+        rows = _load_balance_rows(conn)
+        items = [_build_balance_item(r, rows) for r in registry]
+        return {
+            "status": "ok",
+            "stale_after_days": BALANCE_STALE_AFTER_DAYS,
+            "count": len(items),
+            "items": items,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
+@router_llm_admin.put("/balance/{provider}")
+def update_llm_balance(provider: str, payload: LLMBalanceUpdateRequest):
+    conn = None
+    try:
+        provider = normalize_provider(provider)
+        conn = get_connection()
+        registry_item = get_llm_provider_registry_item(conn, provider)
+        if not registry_item:
+            raise HTTPException(status_code=404, detail=f"Provider no trobat al registry: {provider}")
+
+        threshold_value = "" if payload.alert_threshold is None else str(payload.alert_threshold)
+        with conn.cursor() as cur:
+            for field, value in (
+                ("amount", str(payload.amount)),
+                ("alert_threshold", threshold_value),
+            ):
+                cur.execute(
+                    """
+                    INSERT INTO public.config (key, value, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = now()
+                    """,
+                    (_balance_key(provider, field), value),
+                )
+        conn.commit()
+
+        rows = _load_balance_rows(conn)
+        return {"status": "updated", "item": _build_balance_item(registry_item, rows)}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
 @router_llm_admin.put("/providers/registry/{provider}/models")
 def replace_provider_models_admin(
     provider: str,
