@@ -650,6 +650,7 @@ PROVIDER_ERROR_SIGNATURES = {
         "rate_limited": ["429"],
         "service_unavailable": ["502", "503", "504", "unavailable"],
         "config_error": ["401", "xai_api_key no configurada", "unauthorized"],
+        "quota_exceeded": ["used all available credits", "monthly spending limit", "purchase more credits"],
     },
 }
 
