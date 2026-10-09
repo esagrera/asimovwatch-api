@@ -428,7 +428,7 @@ def list_llm_balance():
 def update_llm_balance(provider: str, payload: LLMBalanceUpdateRequest):
     conn = None
     try:
-        provider = normalize_provider(provider)
+        provider = _normalize_provider(provider)
         conn = get_connection()
         registry_item = get_llm_provider_registry_item(conn, provider)
         if not registry_item:
