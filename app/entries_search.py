@@ -119,6 +119,7 @@ class EntriesSearchRequest(BaseModel):
     needs_info: Optional[bool] = None
     processing_status: Optional[str] = None
     q: Optional[str] = None
+    entry_category: Optional[str] = None
 
     # --- Provider / Model (fora del constructor, pero combinables aqui) ---
     analyzed_provider: Optional[str] = None
@@ -254,6 +255,10 @@ def _build_basic_filters_sql(body: EntriesSearchRequest, params: List[Any]) -> L
         fragments.append("processing_status = %s")
         params.append(body.processing_status.strip().upper())
 
+    if body.entry_category:
+        fragments.append("entry_category = %s")
+        params.append(body.entry_category.strip())
+
     if body.analyzed_provider:
         fragments.append("LOWER(analyzed_provider) = LOWER(%s)")
         params.append(body.analyzed_provider.strip())
@@ -307,7 +312,7 @@ def build_entries_search_query(body: EntriesSearchRequest) -> Tuple[str, str, Li
             source_language, country_region, institution_type, risk_level,
             review_status, reviewer, needs_info, published_date, detected_at,
             ingested_at, ingest_status, summary_factual, theme_tags,
-            affected_principles, processing_status, relevance_score,
+            affected_principles, entry_category, processing_status, relevance_score,
             relevance_reason, analyzed_provider, analyzed_model,
             human_protection_declared, human_protection_verifiable,
             human_protection_depth, enriched_at, enriched_model,

@@ -975,7 +975,7 @@ def list_entries(
             SELECT id, source_url, source_domain, source_title, source_type, source_language,
                    country_region, institution_type, risk_level, review_status, reviewer,
                    needs_info, published_date, detected_at, ingested_at, ingest_status,
-                   summary_factual, theme_tags, affected_principles, processing_status,
+                   summary_factual, theme_tags, affected_principles, entry_category, processing_status,
                    relevance_score, relevance_reason, analyzed_provider, analyzed_model,
                    human_protection_declared, human_protection_verifiable, human_protection_depth,
                    enriched_at, enriched_model,
