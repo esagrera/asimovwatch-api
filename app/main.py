@@ -891,6 +891,7 @@ def list_entries(
     human_protection_verifiable: Optional[str] = None,
     human_protection_depth: Optional[str] = None,
     q: Optional[str] = None,
+    sort: Optional[str] = None,
 ):
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
