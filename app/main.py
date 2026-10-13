@@ -864,6 +864,11 @@ def db_check():
 
 BIHP_ALLOWED_VALUES = ("green", "yellow", "red", "unknown")
 
+ENTRY_SORT_ORDERS = {
+    "newest": "detected_at DESC NULLS LAST, id DESC",
+    "oldest": "detected_at ASC NULLS LAST, id ASC",
+}
+
 @protected_router.get("/entries")
 def list_entries(
     limit: int = 20,
@@ -877,6 +882,7 @@ def list_entries(
     relevance_score: Optional[str] = None,
     entry_category: Optional[str] = None,
     analyzed_provider: Optional[str] = None,
+    sort_by: Optional[str] = None,
     # --- Nous paràmetres Fase 1 (additius) ---
     institution_type: Optional[str] = None,
     analyzed_model: Optional[str] = None,
@@ -891,6 +897,12 @@ def list_entries(
     try:
         safe_limit = min(max(limit, 1), 100)
         safe_offset = max(offset, 0)
+
+        sort_key = (sort or "newest").strip().lower()
+        if sort_key not in ENTRY_SORT_ORDERS:
+            raise HTTPException(status_code=400, detail="sort ha de ser un de: newest, oldest")
+        order_by = ENTRY_SORT_ORDERS[sort_key]
+
         filters: List[str] = []
         params: List[Any] = []
 
@@ -985,7 +997,7 @@ def list_entries(
                    human_protection_notes_ca, human_protection_notes_en
             FROM public.entries
             {where_clause}
-            ORDER BY detected_at DESC NULLS LAST, id DESC
+            ORDER BY {order_by}
             LIMIT %s OFFSET %s
         """
         params_data = params + [safe_limit, safe_offset]
