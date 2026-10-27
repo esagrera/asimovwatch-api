@@ -11,7 +11,7 @@ Aquest modul decideix, per a UNA entrada, quin text s'ha d'analitzar:
   - obtencio (ContentFetcher del mòdul) amb COMMIT immediat de la fila i sense cap
     transaccio oberta durant la xarxa;
   - enllac entries.analyzed_fetch_id (UPDATE minim + COMMIT) abans que s'executi Input;
-  - tall determinista del text a PRIMARY_TEXT_MAX_CHARS.
+  - tall determinista del text: a INPUT_TEXT_MAX_CHARS per a Input i a PRIMARY_TEXT_MAX_CHARS per a Primary.
 No escriu mai ready_for_primary ni discard_reason, ni toca raw_content/raw_snippet.
 Qualsevol excepcio es "fail-open": log + continuar amb el text del feed.
 """
@@ -32,6 +32,8 @@ logger = logging.getLogger("asimovwatch.content_fetch")
 
 PRIMARY_TEXT_MAX_CHARS_ENV = "PRIMARY_TEXT_MAX_CHARS"
 DEFAULT_PRIMARY_TEXT_MAX_CHARS = 20000
+INPUT_TEXT_MAX_CHARS_ENV = "INPUT_TEXT_MAX_CHARS"
+DEFAULT_INPUT_TEXT_MAX_CHARS = 6000
 SKIP_DOMAINS_ENV = "CONTENT_FETCH_SKIP_DOMAINS"
 DEFAULT_SKIP_DOMAINS = "openai.com,fra.europa.eu"
 ENTRY_IDS_ENV = "CONTENT_FETCH_ENTRY_IDS"
@@ -57,6 +59,16 @@ def primary_text_max_chars(environ: Optional[Mapping[str, str]] = None) -> int:
     except ValueError:
         return DEFAULT_PRIMARY_TEXT_MAX_CHARS
     return value if value > 0 else DEFAULT_PRIMARY_TEXT_MAX_CHARS
+
+
+def input_text_max_chars(environ: Optional[Mapping[str, str]] = None) -> int:
+    """Limit del text que rep Input (per defecte 6000); mateixa logica d'entorn que PRIMARY_TEXT_MAX_CHARS."""
+    environ = os.environ if environ is None else environ
+    try:
+        value = int(str(environ.get(INPUT_TEXT_MAX_CHARS_ENV, "")).strip())
+    except ValueError:
+        return DEFAULT_INPUT_TEXT_MAX_CHARS
+    return value if value > 0 else DEFAULT_INPUT_TEXT_MAX_CHARS
 
 
 def skip_domains(environ: Optional[Mapping[str, str]] = None) -> List[str]:
@@ -162,7 +174,8 @@ class FetchDecision:
     failed: hi ha hagut un intent d'obtencio fallit (o un error del bloc) -> motiu de descart 'fetch_failed'
     """
     kind: str
-    text: Optional[str] = None
+    text: Optional[str] = None          # text per a Primary (capat a PRIMARY_TEXT_MAX_CHARS)
+    input_text: Optional[str] = None    # text per a Input (capat a INPUT_TEXT_MAX_CHARS; mai mes llarg que `text`)
     fetch_id: Optional[int] = None
     reason: str = ""
     failed: bool = False
@@ -190,14 +203,22 @@ def _link_entry(conn: Any, entry: Mapping[str, Any], fetch_id: int) -> None:
 
 
 def _use(conn: Any, entry: Mapping[str, Any], text: str, fetch_id: int, environ: Mapping[str, str]) -> FetchDecision:
-    capped, cut = cap_text(text, primary_text_max_chars(environ))
+    primary_limit = primary_text_max_chars(environ)
+    capped, cut = cap_text(text, primary_limit)
     if cut:
         logger.info(
-            "Entry %s: text obtingut tallat de %d a %d caracters (limit %d).",
-            entry.get("id"), len(text), len(capped), primary_text_max_chars(environ),
+            "Entry %s: text obtingut tallat de %d a %d caracters per a Primary (limit %d).",
+            entry.get("id"), len(text), len(capped), primary_limit,
+        )
+    input_limit = input_text_max_chars(environ)
+    input_text, input_cut = cap_text(capped, input_limit)     # Input mai rep mes que Primary
+    if input_cut:
+        logger.info(
+            "Entry %s: text obtingut tallat de %d a %d caracters per a Input (limit %d).",
+            entry.get("id"), len(text), len(input_text), input_limit,
         )
     _link_entry(conn, entry, fetch_id)
-    return FetchDecision("use_fetched", text=capped, fetch_id=fetch_id, reason="fetched_text")
+    return FetchDecision("use_fetched", text=capped, input_text=input_text, fetch_id=fetch_id, reason="fetched_text")
 
 
 def _from_history(

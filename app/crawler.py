@@ -1009,7 +1009,8 @@ def run_entry_enrichment(
             # --- Obtencio de contingut (NOMES amb l'interruptor encès; apagat = codi anterior) ---
             fetch_enabled = content_fetch_enabled()
             fetch_decision = None
-            analysis_text = None   # text obtingut (capat) que substitueix el del feed; None = text del feed
+            analysis_text = None   # text obtingut (capat per a Primary) que substitueix el del feed; None = text del feed
+            analysis_input_text = None   # el mateix text, capat per a Input (INPUT_TEXT_MAX_CHARS)
             if fetch_enabled and persist and run_input and not skip_input:
                 fetch_decision = _prepare_content_fetch(conn, entry, content_fetcher)
                 if fetch_decision is not None and fetch_decision.kind == "defer":
@@ -1025,6 +1026,7 @@ def run_entry_enrichment(
                     }
                 if fetch_decision is not None and fetch_decision.kind == "use_fetched":
                     analysis_text = fetch_decision.text
+                    analysis_input_text = fetch_decision.input_text
 
             if analysis_text is None and not has_analyzable_content(entry):
                 if persist:
@@ -1059,7 +1061,7 @@ def run_entry_enrichment(
                     prompt_overrides=(
                         _build_input_overrides(entry)
                         if analysis_text is None
-                        else _build_input_overrides(entry, text=analysis_text)
+                        else _build_input_overrides(entry, text=analysis_input_text)
                     ),
                 )
                 input_result = _parse_json_output(input_llm_result["output"], phase="Input")

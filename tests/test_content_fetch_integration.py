@@ -556,19 +556,22 @@ def test_primary_text_max_chars_default_and_environment():
         assert pipe.primary_text_max_chars({"PRIMARY_TEXT_MAX_CHARS": bad}) == 20000
 
 
-def test_fetched_text_is_capped_at_20000_for_input_and_primary_and_the_cut_is_logged(monkeypatch, caplog):
+def test_fetched_text_is_capped_per_consumer_and_each_cut_is_logged(monkeypatch, caplog):
     set_env(monkeypatch, CONTENT_FETCH_ENABLED="1")
     big = words(30000)
     h = Harness(monkeypatch, routes=route_set(FakeResponse(200, page("T", f"<p>{big}</p>"), HTML_HEADERS)))
     with caplog.at_level(logging.INFO, logger="asimovwatch.content_fetch"):
         assert h.run()["status"] == "enriched"
-    assert len(h.input_text) <= 20000 and big.startswith(h.input_text)
-    assert len(h.input_text) > 19000 and not h.input_text.endswith(" ")
-    assert h.overrides["Primary"]["{input_text}"].endswith(f"Contingut per analitzar:\n{h.input_text}")
-    assert [r.getMessage() for r in caplog.records if "tallat" in r.getMessage()] == [
-        f"Entry 42: text obtingut tallat de {len(big)} a {len(h.input_text)} caracters (limit 20000)."]
-    stored = h.db.fetches[-1]
-    assert stored["text_content"] == big                                           # la BD conserva el text complet
+    primary_text = h.overrides["Primary"]["{input_text}"].split("Contingut per analitzar:\n", 1)[1]
+    assert 19000 < len(primary_text) <= 20000 and big.startswith(primary_text) and not primary_text.endswith(" ")
+    assert 5000 < len(h.input_text) <= 6000 and big.startswith(h.input_text) and not h.input_text.endswith(" ")
+    assert primary_text.startswith(h.input_text) and len(primary_text) > len(h.input_text)   # Primary rep MES que Input
+    messages = [r.getMessage() for r in caplog.records if "tallat" in r.getMessage()]
+    assert messages == [
+        f"Entry 42: text obtingut tallat de {len(big)} a {len(primary_text)} caracters per a Primary (limit 20000).",
+        f"Entry 42: text obtingut tallat de {len(big)} a {len(h.input_text)} caracters per a Input (limit 6000).",
+    ]
+    assert h.db.fetches[-1]["text_content"] == big                                  # la BD conserva el text complet
 
 
 def test_cap_limit_is_configurable_by_environment(monkeypatch):
@@ -1179,3 +1182,87 @@ def test_a_previous_ok_row_below_the_threshold_is_not_reused(monkeypatch):
     result = h.run()
     assert result["status"] == "enriched" and h.input_text == "x" * 100 and h.db.entry["analyzed_fetch_id"] is None
     assert h.http_requests == []                                                    # l'intent previ no es reintenta
+
+
+# ===========================================================================
+# 15. INPUT_TEXT_MAX_CHARS (limit propi per a Input)
+# ===========================================================================
+
+def test_input_text_max_chars_default_and_environment():
+    assert pipe.input_text_max_chars({}) == 6000 == pipe.DEFAULT_INPUT_TEXT_MAX_CHARS
+    assert pipe.input_text_max_chars({"INPUT_TEXT_MAX_CHARS": "1500"}) == 1500
+    for bad in ("", "abc", "0", "-1", " "):
+        assert pipe.input_text_max_chars({"INPUT_TEXT_MAX_CHARS": bad}) == 6000
+    assert pipe.primary_text_max_chars({"INPUT_TEXT_MAX_CHARS": "10"}) == 20000      # variables independents
+
+
+def test_short_fetched_text_is_not_cut_for_input_nor_primary(monkeypatch, caplog):
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1")
+    h = Harness(monkeypatch, routes=route_set(ok_page()))
+    with caplog.at_level(logging.INFO, logger="asimovwatch.content_fetch"):
+        h.run()
+    assert h.input_text == LONG_TEXT and len(LONG_TEXT) < 6000
+    assert h.overrides["Primary"]["{input_text}"].endswith(f"Contingut per analitzar:\n{LONG_TEXT}")
+    assert not [r for r in caplog.records if "tallat" in r.getMessage()]
+
+
+def test_text_between_the_two_limits_is_cut_only_for_input(monkeypatch, caplog):
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1")
+    text = words(10000)
+    h = Harness(monkeypatch, routes=route_set(FakeResponse(200, page("T", f"<p>{text}</p>"), HTML_HEADERS)))
+    with caplog.at_level(logging.INFO, logger="asimovwatch.content_fetch"):
+        h.run()
+    assert 5000 < len(h.input_text) <= 6000
+    assert h.overrides["Primary"]["{input_text}"].endswith(f"Contingut per analitzar:\n{text}")   # Primary, sencer
+    messages = [r.getMessage() for r in caplog.records if "tallat" in r.getMessage()]
+    assert len(messages) == 1 and "per a Input" in messages[0]
+    assert h.db.fetches[-1]["text_content"] == text
+
+
+def test_input_limit_is_configurable_and_cuts_at_the_last_space(monkeypatch):
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1", INPUT_TEXT_MAX_CHARS="300")
+    h = Harness(monkeypatch, routes=route_set(ok_page()))
+    h.run()
+    assert len(h.input_text) <= 300 and LONG_TEXT.startswith(h.input_text)
+    assert LONG_TEXT[len(h.input_text)] == " "                                      # tallat just abans d'un espai
+    assert h.overrides["Primary"]["{input_text}"].endswith(f"Contingut per analitzar:\n{LONG_TEXT}")
+
+
+def test_input_never_gets_more_than_primary_even_if_the_input_limit_is_larger(monkeypatch):
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1", INPUT_TEXT_MAX_CHARS="30000", PRIMARY_TEXT_MAX_CHARS="500")
+    h = Harness(monkeypatch, routes=route_set(ok_page()))
+    h.run()
+    primary_text = h.overrides["Primary"]["{input_text}"].split("Contingut per analitzar:\n", 1)[1]
+    assert len(primary_text) <= 500 and h.input_text == primary_text
+
+
+def test_primary_limit_is_independent_of_the_input_limit(monkeypatch):
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1", INPUT_TEXT_MAX_CHARS="200", PRIMARY_TEXT_MAX_CHARS="700")
+    h = Harness(monkeypatch, routes=route_set(ok_page()))
+    h.run()
+    primary_text = h.overrides["Primary"]["{input_text}"].split("Contingut per analitzar:\n", 1)[1]
+    assert len(h.input_text) <= 200 and 500 < len(primary_text) <= 700
+
+
+def test_fetch_decision_carries_both_texts(monkeypatch):
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1")
+    h = Harness(monkeypatch, routes=route_set(FakeResponse(200, page("T", f"<p>{words(10000)}</p>"), HTML_HEADERS)))
+    decision = pipe.prepare_analysis_text(h.db.connection(), h.db.entry, h.fetcher, environ={})
+    assert decision.kind == "use_fetched" and decision.text == words(10000)
+    assert decision.input_text and len(decision.input_text) <= 6000 and decision.text.startswith(decision.input_text)
+
+
+def test_switch_off_is_untouched_by_the_input_limit(monkeypatch):
+    set_env(monkeypatch, INPUT_TEXT_MAX_CHARS="10")
+    h = Harness(monkeypatch, entry=make_entry(399), routes=route_set(ok_page()))
+    monkeypatch.setattr(cf, "ContentFetcher", lambda *a, **k: pytest.fail("no s'ha de crear cap ContentFetcher"))
+    h.run(with_fetcher=False)
+    assert h.input_text == "x" * 399 and h.http_requests == [] and h.db.fetches == []
+
+
+def test_feed_text_is_never_cut(monkeypatch):
+    """El text del feed (>= 400, no s'obte) no es retalla mai: ni amb l'interruptor encès."""
+    set_env(monkeypatch, CONTENT_FETCH_ENABLED="1", INPUT_TEXT_MAX_CHARS="100")
+    h = Harness(monkeypatch, entry=make_entry(9000), routes=route_set(ok_page()))
+    h.run()
+    assert h.input_text == "x" * 9000 and h.http_requests == []
