@@ -2228,6 +2228,18 @@ def delete_entry(entry_id: int):
 
     except HTTPException:
         raise
+    except psycopg2.errors.ForeignKeyViolation:
+        # Les FK d'entry_content_fetches (i entries.analyzed_fetch_id) son RESTRICT:
+        # no s'esborra res automaticament ni es toca analyzed_fetch_id. La politica
+        # d'esborrat d'entrades amb evidencia es decidira a part.
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No es pot esborrar l'entrada: té intents d'obtenció de contingut "
+                "registrats (entry_content_fetches) i s'han de conservar."
+            ),
+        )
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to delete entry: {str(e)}")
