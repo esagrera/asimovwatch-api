@@ -3,6 +3,7 @@ import hashlib
 import html
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -30,6 +31,15 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("asimovwatch.entries_crawler")
+
+# Interruptor de l'obtencio de contingut (Fase 1B). De moment NOMES existeix la funcio:
+# cap lloc del pipeline la crida encara. Es llegeix a cada crida, no en importar.
+CONTENT_FETCH_ENABLED_ENV = "CONTENT_FETCH_ENABLED"
+
+
+def content_fetch_enabled() -> bool:
+    """True nomes si CONTENT_FETCH_ENABLED val exactament "1", "true" o "yes" (minuscules). Per defecte False."""
+    return os.environ.get(CONTENT_FETCH_ENABLED_ENV) in ("1", "true", "yes")
 
 
 def utc_now() -> datetime:
@@ -525,14 +535,16 @@ ENTRY_CATEGORY_ALIASES = {
     "other": "other",
 }
 
-def _build_input_overrides(entry: Dict[str, Any]) -> Dict[str, str]:
+def _build_input_overrides(entry: Dict[str, Any], text: Optional[str] = None) -> Dict[str, str]:
     """
     Prepara els prompt_overrides per al prompt "Input", que espera 8
     placeholders individuals de claudàtor simple (no un bloc de text únic).
 
     {input_text} és el contingut cru: raw_content si existeix, sinó raw_snippet.
+    Si es passa `text` (no None), s'usa en lloc de raw_content/raw_snippet; amb
+    text=None el resultat és exactament l'anterior.
     """
-    content = entry.get("raw_content") or entry.get("raw_snippet") or ""
+    content = text if text is not None else (entry.get("raw_content") or entry.get("raw_snippet") or "")
 
     return {
         "{source_url}": entry.get("source_url") or "",
@@ -549,19 +561,22 @@ def _build_input_overrides(entry: Dict[str, Any]) -> Dict[str, str]:
 def _build_primary_input_text(
     entry: Dict[str, Any],
     input_result: Optional[Dict[str, Any]],
+    text: Optional[str] = None,
 ) -> str:
     """
     Construeix el text que substitueix l'únic placeholder {input_text} del
     prompt "Primary".
     - Si input_result no és None (via RSS + Input): usa clean_input_text/input_summary.
     - Si input_result és None: usa el contingut disponible directament.
+    Si es passa `text` (no None), s'usa en lloc de raw_content/raw_snippet com a text
+    de reserva; amb text=None el resultat és exactament l'anterior.
     """
+    fallback_text = text if text is not None else (entry.get("raw_content") or entry.get("raw_snippet") or "")
+
     if input_result is not None:
         clean_text = (
             input_result.get("clean_input_text")
-            or entry.get("raw_content")
-            or entry.get("raw_snippet")
-            or ""
+            or fallback_text
         )
         summary = input_result.get("input_summary") or ""
         source_note = (
@@ -573,9 +588,7 @@ def _build_primary_input_text(
 
         clean_text = (
             search_result.get("why_relevant")
-            or entry.get("raw_content")
-            or entry.get("raw_snippet")
-            or ""
+            or fallback_text
         )
 
         search_brief = raw_payload.get("search_brief") or ""
@@ -783,6 +796,61 @@ def mark_entry_discarded_no_content(
             entry_id,
         ),
     )
+
+RELEVANCE_SCORES = ("high", "medium", "low", "unknown")
+
+
+def _normalize_relevance_score(value: Any) -> Optional[str]:
+    """relevance_score de Primary: nomes 'high'/'medium'/'low'/'unknown' (minuscules, sense espais); si no, None."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in RELEVANCE_SCORES:
+            return normalized
+    return None
+
+
+def _normalize_relevance_reason(value: Any) -> Optional[str]:
+    """relevance_reason de Primary: text no buit (sense espais als extrems ni caracters NUL); si no, None."""
+    if isinstance(value, str):
+        cleaned = value.replace("\x00", "").strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _relevance_for_persist(result: Dict[str, Any], entry_id: int) -> tuple:
+    """
+    (relevance_score, relevance_reason) llestos per desar. Un valor absent o invalid es
+    retorna com a None; els UPDATE usen COALESCE(%s, columna), de manera que None CONSERVA
+    el que ja hi ha a la fila.
+    Log: clau absent o None -> debug; clau present pero valor invalid (tipus incorrecte,
+    fora de llista o text buit) -> avis. Aquest desament MAI pot fer fallar
+    l'enriquiment: qualsevol problema retorna (None, None).
+    """
+    try:
+        values = []
+        for key, normalize in (
+            ("relevance_score", _normalize_relevance_score),
+            ("relevance_reason", _normalize_relevance_reason),
+        ):
+            raw = result.get(key)
+            normalized = normalize(raw)
+            if normalized is None:
+                if raw is None:
+                    logger.debug("Entry %s: %s absent o None; es conserva el valor existent.", entry_id, key)
+                else:
+                    logger.warning(
+                        "Entry %s: %s no valid (%r); es conserva el valor existent.", entry_id, key, raw
+                    )
+            values.append(normalized)
+        return values[0], values[1]
+    except Exception:
+        logger.warning(
+            "Entry %s: no s'ha pogut preparar la rellevancia de Primary; es conserva el valor existent.",
+            entry_id,
+        )
+        return None, None
+
 
 def find_incomplete_output_fields(
     primary_result: Dict[str, Any],
@@ -993,6 +1061,7 @@ def run_entry_enrichment(
                 interim_result = _validate_and_normalize_final_output(primary_result, dict(primary_result))
 
                 if persist:
+                    interim_relevance = _relevance_for_persist(interim_result, entry_id)
                     cur.execute("""
                         UPDATE public.entries SET
                             processing_status = 'ENRICHED',
@@ -1002,6 +1071,8 @@ def run_entry_enrichment(
                             theme_tags = %s,
                             affected_principles = %s,
                             risk_level = %s,
+                            relevance_score = COALESCE(%s, relevance_score),
+                            relevance_reason = COALESCE(%s, relevance_reason),
                             debate_questions = %s,
                             confidence_notes = %s,
                             human_protection_declared = %s,
@@ -1022,6 +1093,8 @@ def run_entry_enrichment(
                         interim_result.get("theme_tags"),
                         interim_result.get("affected_principles"),
                         interim_result.get("risk_level"),
+                        interim_relevance[0],
+                        interim_relevance[1],
                         interim_result.get("debate_questions"),
                         interim_result.get("confidence_notes"),
                         interim_result.get("human_protection_declared"),
@@ -1080,6 +1153,7 @@ def run_entry_enrichment(
                 )
 
             if persist:
+                final_relevance = _relevance_for_persist(final_result, entry_id)
                 cur.execute("""
                     UPDATE public.entries
                     SET processing_status = 'ENRICHED',
@@ -1089,6 +1163,8 @@ def run_entry_enrichment(
                         theme_tags = %s,
                         affected_principles = %s,
                         risk_level = %s,
+                        relevance_score = COALESCE(%s, relevance_score),
+                        relevance_reason = COALESCE(%s, relevance_reason),
                         debate_questions = %s,
                         confidence_notes = %s,
                         human_protection_declared = %s,
@@ -1117,6 +1193,8 @@ def run_entry_enrichment(
                         final_result.get("theme_tags"),
                         final_result.get("affected_principles"),
                         final_result.get("risk_level"),
+                        final_relevance[0],
+                        final_relevance[1],
                         final_result.get("debate_questions"),
                         final_result.get("confidence_notes"),
                         final_result.get("human_protection_declared"),

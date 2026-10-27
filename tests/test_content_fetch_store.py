@@ -115,6 +115,79 @@ def test_find_reusable_fetch_ignores_empty_urls(url):
 
 
 # ---------------------------------------------------------------------------
+# get_fetch_text
+# ---------------------------------------------------------------------------
+
+def selects_only(conn):
+    for sql, _params in conn.executed:
+        flat = " ".join(sql.split())
+        assert flat.startswith("SELECT text_content, reused_from_fetch_id FROM public.entry_content_fetches WHERE id = %s")
+        assert not re.search(r"\b(INSERT|UPDATE|DELETE)\b", flat)
+    assert conn.commits == 0 and conn.rollbacks == 0
+
+
+def test_get_fetch_text_returns_the_direct_text():
+    conn = FakeConn(results=[("Text directe", None)])
+    assert store.get_fetch_text(conn, 10) == "Text directe"
+    assert [p for _, p in conn.executed] == [(10,)]
+    selects_only(conn)
+
+
+def test_get_fetch_text_resolves_a_duplicate_through_reused_from_fetch_id():
+    conn = FakeConn(results=[(None, 10), ("Text de l'original", None)])
+    assert store.get_fetch_text(conn, 11) == "Text de l'original"
+    assert [p for _, p in conn.executed] == [(11,), (10,)]
+    selects_only(conn)
+
+
+def test_get_fetch_text_follows_a_chain_of_two():
+    conn = FakeConn(results=[(None, 2), (None, 3), ("Final", None)])
+    assert store.get_fetch_text(conn, 1) == "Final"
+    assert [p for _, p in conn.executed] == [(1,), (2,), (3,)]
+
+
+def test_get_fetch_text_allows_exactly_three_hops_and_no_more():
+    three = FakeConn(results=[(None, 2), (None, 3), (None, 4), ("Quart", None)])
+    assert store.get_fetch_text(three, 1) == "Quart"                       # 3 salts
+    four = FakeConn(results=[(None, 2), (None, 3), (None, 4), (None, 5), ("Cinque", None)])
+    assert store.get_fetch_text(four, 1) is None                            # 4 salts: massa llarg
+    assert len(four.executed) == 4                                          # no consulta mes enlla del limit
+    assert store.MAX_REUSE_HOPS == 3
+
+
+def test_get_fetch_text_cycle_returns_none_without_raising():
+    conn = FakeConn(results=[(None, 2), (None, 1)])
+    assert store.get_fetch_text(conn, 1) is None
+    assert len(conn.executed) == 2                                          # no torna a la fila 1
+
+
+def test_get_fetch_text_self_reference_returns_none():
+    assert store.get_fetch_text(FakeConn(results=[(None, 5)]), 5) is None
+
+
+def test_get_fetch_text_missing_row_returns_none():
+    conn = FakeConn(results=[None])
+    assert store.get_fetch_text(conn, 99) is None
+    assert store.get_fetch_text(FakeConn(results=[(None, 7), None]), 1) is None      # enllac a una fila que no existeix
+
+
+def test_get_fetch_text_row_without_text_or_link_returns_none():
+    assert store.get_fetch_text(FakeConn(results=[(None, None)]), 3) is None
+
+
+def test_get_fetch_text_accepts_mapping_rows():
+    conn = FakeConn(results=[{"text_content": None, "reused_from_fetch_id": 4}, {"text_content": "Mapa", "reused_from_fetch_id": None}])
+    assert store.get_fetch_text(conn, 9) == "Mapa"
+
+
+@pytest.mark.parametrize("fetch_id", [None, "1", 1.5, True])
+def test_get_fetch_text_invalid_id_returns_none_without_querying(fetch_id):
+    conn = FakeConn()
+    assert store.get_fetch_text(conn, fetch_id) is None
+    assert conn.executed == [] and conn.cursors_opened == 0
+
+
+# ---------------------------------------------------------------------------
 # fetch_and_store
 # ---------------------------------------------------------------------------
 
@@ -199,5 +272,8 @@ def test_modules_never_write_to_entries_or_commit(name):
 
 @pytest.mark.parametrize("name", ["crawler.py", "main.py", "ingest_ops.py", "enrichment_queue.py"])
 def test_pipeline_modules_do_not_import_the_new_modules(name):
+    # Es comproven les sentencies d'importacio: crawler.py defineix content_fetch_enabled() i main.py
+    # esmenta entry_content_fetches en un missatge, pero cap dels dos importa els moduls nous.
     source = open(os.path.join(APP_DIR, name), encoding="utf-8").read()
-    assert "content_fetch" not in source
+    assert not re.search(r"^\s*(?:from\s+app\.content_fetch\w*\s+import|import\s+app\.content_fetch|"
+                         r"from\s+app\s+import\s+.*content_fetch)", source, re.M)

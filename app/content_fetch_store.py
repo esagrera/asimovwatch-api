@@ -118,6 +118,54 @@ def find_reusable_fetch(conn: Any, normalized_url: str) -> Optional[int]:
     return None if row is None else int(_first_value(row))
 
 
+# Una fila 'duplicate' no te text: apunta (reused_from_fetch_id) a la fila que el te.
+GET_FETCH_SQL = """
+SELECT text_content, reused_from_fetch_id
+FROM public.entry_content_fetches
+WHERE id = %s
+"""
+
+MAX_REUSE_HOPS = 3
+
+
+def get_fetch_text(conn: Any, fetch_id: int) -> Optional[str]:
+    """
+    Text d'un intent d'obtencio, o None. Nomes fa SELECT.
+
+    Si la fila te text_content, el retorna. Si no (una fila 'duplicate'), el resol
+    seguint reused_from_fetch_id, com a maxim MAX_REUSE_HOPS (3) salts. Retorna None
+    -- sense llancar excepcio -- si la fila no existeix, si no te text ni enllac, si hi
+    ha un cicle o si la cadena es mes llarga que 3 salts.
+    """
+    if not isinstance(fetch_id, int) or isinstance(fetch_id, bool):
+        return None
+
+    seen = set()
+    current: Optional[int] = fetch_id
+    for hop in range(MAX_REUSE_HOPS + 1):
+        if current is None or current in seen:
+            return None
+        seen.add(current)
+
+        with conn.cursor() as cur:
+            cur.execute(GET_FETCH_SQL, (current,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+
+        if isinstance(row, Mapping):
+            text, reused = row["text_content"], row["reused_from_fetch_id"]
+        else:
+            text, reused = row[0], row[1]
+
+        if text is not None:
+            return text
+        if reused is None:
+            return None
+        current = int(reused)  # un salt mes; el bucle talla a MAX_REUSE_HOPS
+    return None
+
+
 def fetch_and_store(
     conn: Any,
     entry_id: int,
