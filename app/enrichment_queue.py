@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2.extras
 
-from app.crawler import run_entry_enrichment
+from app.crawler import content_fetch_enabled, run_entry_enrichment
 from app.db import get_connection
 
 
@@ -170,8 +170,7 @@ def _load_candidate_entries(retry_max: int) -> List[Dict[str, Any]]:
 
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
+            sql = """
                 SELECT
                     id,
                     source_domain,
@@ -188,9 +187,48 @@ def _load_candidate_entries(retry_max: int) -> List[Dict[str, Any]]:
                     AND COALESCE(processing_retries, 0) < %s
                    )
                 ORDER BY detected_at ASC NULLS LAST, id ASC
-                """,
-                (retry_max,),
-            )
+                """
+            params: tuple = (retry_max,)
+            if content_fetch_enabled():
+                # Una entrada amb una fallada d'obtencio TEMPORAL fa menys d'1 hora no es torna a
+                # seleccionar: 'skipped' ha de deixar-la RAW sense ocupar places del cicle ni
+                # afamar les altres (la mateixa regla que is_temporary_failure del pipeline).
+                from app.content_fetch_pipeline import RETRY_MIN_INTERVAL_SECONDS
+                sql = """
+                SELECT
+                    id,
+                    source_domain,
+                    detected_at,
+                    processing_status,
+                    processing_error,
+                    processing_retries,
+                    raw_content,
+                    raw_snippet
+                FROM public.entries
+                WHERE (
+                        processing_status = 'RAW'
+                     OR (
+                            processing_status = 'ERROR'
+                        AND COALESCE(processing_retries, 0) < %s
+                     )
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM public.entry_content_fetches f
+                        WHERE f.entry_id = public.entries.id
+                          AND f.fetched_at > NOW() - (%s * INTERVAL '1 second')
+                          AND (
+                                f.fetch_status IN ('timeout', 'robots_unreachable')
+                             OR (
+                                    f.fetch_status = 'http_error'
+                                AND (f.http_status = 429 OR f.http_status BETWEEN 500 AND 599)
+                                )
+                              )
+                      )
+                ORDER BY detected_at ASC NULLS LAST, id ASC
+                """
+                params = (retry_max, RETRY_MIN_INTERVAL_SECONDS)
+            cur.execute(sql, params)
             return cur.fetchall()
     finally:
         conn.close()
@@ -413,6 +451,16 @@ def _run_selected_entries(
     }
     item_results: List[Dict[str, Any]] = []
 
+    # Una instancia de ContentFetcher per execucio de la cua (cadencia i cache de robots
+    # compartides). Amb l'interruptor apagat no es crea res i la crida es la d'abans.
+    extra_kwargs: Dict[str, Any] = {}
+    if content_fetch_enabled():
+        try:
+            from app.content_fetch import ContentFetcher
+            extra_kwargs["content_fetcher"] = ContentFetcher()
+        except Exception:
+            extra_kwargs = {}
+
     for selected_item in selected_items:
         entry_id = selected_item["id"]
         item_started_at = time.monotonic()
@@ -425,6 +473,7 @@ def _run_selected_entries(
                 run_primary=True,
                 run_output=True,
                 persist=True,
+                **extra_kwargs,
             )
             elapsed_seconds = round(time.monotonic() - item_started_at, 3)
             pipeline_status = pipeline_result.get("status", "error")

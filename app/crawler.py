@@ -562,6 +562,7 @@ def _build_primary_input_text(
     entry: Dict[str, Any],
     input_result: Optional[Dict[str, Any]],
     text: Optional[str] = None,
+    text_is_fetched: bool = False,
 ) -> str:
     """
     Construeix el text que substitueix l'únic placeholder {input_text} del
@@ -570,13 +571,19 @@ def _build_primary_input_text(
     - Si input_result és None: usa el contingut disponible directament.
     Si es passa `text` (no None), s'usa en lloc de raw_content/raw_snippet com a text
     de reserva; amb text=None el resultat és exactament l'anterior.
+
+    text_is_fetched=True (NOMES amb l'obtenció de contingut activa): `text` és el text
+    obtingut de l'article i Primary el rep DIRECTAMENT, no el clean_input_text d'Input, i
+    el bloc de metadades afegeix la línia `canonical_url:` després de `source_url:`.
+    Amb text_is_fetched=False el resultat és exactament l'anterior.
     """
     fallback_text = text if text is not None else (entry.get("raw_content") or entry.get("raw_snippet") or "")
 
     if input_result is not None:
         clean_text = (
-            input_result.get("clean_input_text")
-            or fallback_text
+            fallback_text
+            if text_is_fetched
+            else (input_result.get("clean_input_text") or fallback_text)
         )
         summary = input_result.get("input_summary") or ""
         source_note = (
@@ -612,9 +619,11 @@ def _build_primary_input_text(
     else:
         primary_language = raw_source_language
 
+    canonical_line = f"canonical_url: {entry.get('canonical_url', '')}\n" if text_is_fetched else ""
+
     return f"""Metadades de la peça:
 source_url: {entry.get('source_url', '')}
-source_domain: {entry.get('source_domain', '')}
+{canonical_line}source_domain: {entry.get('source_domain', '')}
 source_title: {entry.get('source_title', '')}
 source_type: {entry.get('source_type') or 'desconegut'}
 country_region: {entry.get('country_region') or 'desconegut'}
@@ -888,6 +897,74 @@ def find_incomplete_output_fields(
 
     return missing
 
+def _prepare_content_fetch(conn: Any, entry: Dict[str, Any], content_fetcher: Any):
+    """
+    Bloc d'obtencio de contingut (NOMES amb CONTENT_FETCH_ENABLED). Importa el modul d'integracio
+    de manera mandrosa i es FAIL-OPEN: qualsevol error -> log i continuar amb el text del feed.
+    """
+    try:
+        from app import content_fetch_pipeline
+    except Exception as exc:
+        logger.warning("Entry %s: no s'ha pogut carregar l'obtencio de contingut: %s", entry.get("id"), exc)
+        return None
+    try:
+        return content_fetch_pipeline.prepare_analysis_text(conn, entry, content_fetcher)
+    except Exception as exc:
+        # El modul ja es fail-open; aixo cobreix qualsevol cosa que n'escapi (p. ex. abans del seu try).
+        logger.warning("Entry %s: error a l'obtencio de contingut; es continua amb el text del feed: %s",
+                       entry.get("id"), exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return content_fetch_pipeline.FetchDecision("fallback", reason="error", failed=True)
+
+
+def _mark_entry_discarded_empty_with_reason(cur: Any, entry_id: int, fetch_failed: bool) -> None:
+    """
+    Descart per contingut buit AMB discard_reason (NOMES amb l'obtencio activa).
+    - fetch_failed=True: la causa es una fallada d'obtencio -> 'fetch_failed'. NO s'escriu
+      ready_for_primary='no' (ni cap camp d'Input): Input no ha executat.
+    - fetch_failed=False: no hi ha hagut intent d'obtencio -> 'no_content', amb els mateixos
+      camps que mark_entry_discarded_no_content.
+    """
+    if fetch_failed:
+        cur.execute(
+            """
+            UPDATE public.entries
+            SET
+                processing_status = 'DISCARDED',
+                processing_error = NULL,
+                discard_reason = 'fetch_failed',
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (entry_id,),
+        )
+        return
+    cur.execute(
+        """
+        UPDATE public.entries
+        SET
+            processing_status = 'DISCARDED',
+            processing_error = NULL,
+            input_relevance = 'unknown',
+            input_relevance_reason = %s,
+            ready_for_primary = 'no',
+            input_quality = 'low',
+            input_quality_notes = %s,
+            discard_reason = 'no_content',
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (
+            "No hi ha contingut RSS analitzable.",
+            "El feed no ha aportat summary, description ni content.",
+            entry_id,
+        ),
+    )
+
+
 def run_entry_enrichment(
     entry_id: int,
     skip_input: bool = False,
@@ -895,6 +972,7 @@ def run_entry_enrichment(
     run_primary: bool = True,
     run_output: bool = True,
     persist: bool = True,
+    content_fetcher: Any = None,
 ) -> Dict[str, Any]:
     """
     Executa Input -> Primary -> Output per a una entry.
@@ -905,6 +983,9 @@ def run_entry_enrichment(
     persist=False: mode de prova. No modifica cap camp de public.entries, no
     incrementa processing_retries i retorna les sortides de les fases per
     inspecció. És segur per provar canvis de prompt, provider, model i parser.
+
+    content_fetcher: ContentFetcher opcional (una instància per execució de la cua). NOMES
+    s'usa amb CONTENT_FETCH_ENABLED; si no es passa i l'interruptor és encès, es crea una local.
     """
     # output-only: reutilitza el resultat de Primary ja persistit i
     # executa només Output. És el camí per completar traduccions _ca/_en
@@ -925,9 +1006,34 @@ def run_entry_enrichment(
             if not entry:
                 return {"status": "error", "entry_id": entry_id, "detail": "Entry not found"}
 
-            if not has_analyzable_content(entry):
+            # --- Obtencio de contingut (NOMES amb l'interruptor encès; apagat = codi anterior) ---
+            fetch_enabled = content_fetch_enabled()
+            fetch_decision = None
+            analysis_text = None   # text obtingut (capat) que substitueix el del feed; None = text del feed
+            if fetch_enabled and persist and run_input and not skip_input:
+                fetch_decision = _prepare_content_fetch(conn, entry, content_fetcher)
+                if fetch_decision is not None and fetch_decision.kind == "defer":
+                    return {
+                        "status": "skipped",
+                        "entry_id": entry_id,
+                        "persisted": persist,
+                        "detail": {
+                            "reason": "content_fetch_deferred",
+                            "fetch_reason": fetch_decision.reason,
+                            **fetch_decision.detail,
+                        },
+                    }
+                if fetch_decision is not None and fetch_decision.kind == "use_fetched":
+                    analysis_text = fetch_decision.text
+
+            if analysis_text is None and not has_analyzable_content(entry):
                 if persist:
-                    mark_entry_discarded_no_content(cur, entry_id)
+                    if fetch_enabled:
+                        _mark_entry_discarded_empty_with_reason(
+                            cur, entry_id, fetch_failed=bool(fetch_decision is not None and fetch_decision.failed)
+                        )
+                    else:
+                        mark_entry_discarded_no_content(cur, entry_id)
                     conn.commit()
 
                 return {
@@ -950,7 +1056,11 @@ def run_entry_enrichment(
                 input_llm_result = call_llm_for_prompt(
                     conn,
                     "Input",
-                    prompt_overrides=_build_input_overrides(entry),
+                    prompt_overrides=(
+                        _build_input_overrides(entry)
+                        if analysis_text is None
+                        else _build_input_overrides(entry, text=analysis_text)
+                    ),
                 )
                 input_result = _parse_json_output(input_llm_result["output"], phase="Input")
                 phase_results["input"] = {
@@ -963,7 +1073,7 @@ def run_entry_enrichment(
                 ready = input_result.get("ready_for_primary")
                 if ready == "no":
                     if persist:
-                        cur.execute("""
+                        input_discard_sql = """
                             UPDATE public.entries SET
                                 processing_status = 'DISCARDED',
                                 processing_error = NULL,
@@ -975,7 +1085,14 @@ def run_entry_enrichment(
                                 input_quality_notes = %s,
                                 updated_at = NOW()
                             WHERE id = %s
-                        """, (
+                        """
+                        if fetch_enabled:
+                            # Descart per Input sobre text real: 'out_of_scope' (NOMES amb l'obtencio activa)
+                            input_discard_sql = input_discard_sql.replace(
+                                "input_quality_notes = %s,",
+                                "input_quality_notes = %s,\n                                discard_reason = 'out_of_scope',",
+                            )
+                        cur.execute(input_discard_sql, (
                             input_result.get("input_relevance"),
                             input_result.get("input_relevance_reason"),
                             ready,
@@ -1043,7 +1160,13 @@ def run_entry_enrichment(
                     },
                 }
 
-            primary_input_text = _build_primary_input_text(entry, input_result)
+            if analysis_text is None:
+                primary_input_text = _build_primary_input_text(entry, input_result)
+            else:
+                # Text obtingut: Primary el rep directament (capat), no el clean_input_text d'Input
+                primary_input_text = _build_primary_input_text(
+                    entry, input_result, text=analysis_text, text_is_fetched=True
+                )
             primary_llm_result = call_llm_for_prompt(
                 conn,
                 "Primary",

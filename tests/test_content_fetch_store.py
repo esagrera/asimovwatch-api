@@ -271,9 +271,9 @@ def test_modules_never_write_to_entries_or_commit(name):
 
 
 @pytest.mark.parametrize("name", ["crawler.py", "main.py", "ingest_ops.py", "enrichment_queue.py"])
-def test_pipeline_modules_do_not_import_the_new_modules(name):
-    # Es comproven les sentencies d'importacio: crawler.py defineix content_fetch_enabled() i main.py
-    # esmenta entry_content_fetches en un missatge, pero cap dels dos importa els moduls nous.
+def test_pipeline_modules_do_not_import_the_new_modules_at_module_level(name):
+    # Els moduls nous nomes es poden importar de manera MANDROSA (dins de funcions, amb
+    # sagnat): una importacio a nivell de modul els carregaria tambe amb l'interruptor apagat.
     source = open(os.path.join(APP_DIR, name), encoding="utf-8").read()
-    assert not re.search(r"^\s*(?:from\s+app\.content_fetch\w*\s+import|import\s+app\.content_fetch|"
+    assert not re.search(r"^(?:from\s+app\.content_fetch\w*\s+import|import\s+app\.content_fetch|"
                          r"from\s+app\s+import\s+.*content_fetch)", source, re.M)

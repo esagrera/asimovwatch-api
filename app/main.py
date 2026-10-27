@@ -762,6 +762,15 @@ def process_batch_job(
                     elapsed_seconds=round(elapsed, 3),
                 )
                 succeeded += 1
+            elif result_status == "skipped":
+                # Nomes l'obtencio de contingut (CONTENT_FETCH_ENABLED) retorna 'skipped':
+                # fallada temporal amb intents restants; l'entrada es queda RAW.
+                item_result.update(
+                    status="skipped",
+                    reason=(result.get("detail") or {}).get("reason", "skipped"),
+                    elapsed_seconds=round(elapsed, 3),
+                )
+                skipped += 1
             else:
                 item_result.update(
                     status="failed",

@@ -118,6 +118,28 @@ def find_reusable_fetch(conn: Any, normalized_url: str) -> Optional[int]:
     return None if row is None else int(_first_value(row))
 
 
+LIST_ENTRY_FETCHES_SQL = """
+SELECT id, fetch_status, http_status, fetched_at, text_length
+FROM public.entry_content_fetches
+WHERE entry_id = %s
+ORDER BY fetched_at DESC, id DESC
+"""
+
+
+def list_entry_fetches(conn: Any, entry_id: int) -> list:
+    """Intents d'obtencio d'una entrada (mes recents primer), com a dicts. Nomes SELECT."""
+    with conn.cursor() as cur:
+        cur.execute(LIST_ENTRY_FETCHES_SQL, (entry_id,))
+        rows = cur.fetchall()
+    result = []
+    for row in rows or []:
+        if isinstance(row, Mapping):
+            result.append(dict(row))
+        else:
+            result.append(dict(zip(("id", "fetch_status", "http_status", "fetched_at", "text_length"), row)))
+    return result
+
+
 # Una fila 'duplicate' no te text: apunta (reused_from_fetch_id) a la fila que el te.
 GET_FETCH_SQL = """
 SELECT text_content, reused_from_fetch_id

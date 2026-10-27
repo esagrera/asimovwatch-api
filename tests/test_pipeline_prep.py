@@ -353,7 +353,7 @@ def test_importing_crawler_never_imports_the_fetch_modules(env_value):
     code = (
         "import dotenv, sys\n"
         "dotenv.load_dotenv = lambda *a, **k: False\n"
-        "import app.crawler\n"
+        "import app.crawler, app.enrichment_queue, app.main\n"
         "bad = [m for m in ('app.content_fetch', 'app.content_fetch_store') if m in sys.modules]\n"
         "print('LOADED', bad)\n"
     )
@@ -363,25 +363,26 @@ def test_importing_crawler_never_imports_the_fetch_modules(env_value):
     assert result.stdout.strip().endswith("LOADED []")
 
 
-def test_content_fetch_enabled_is_not_called_anywhere_yet():
-    definitions, calls = 0, []
+def test_content_fetch_enabled_has_one_definition_and_is_only_called_by_crawler_and_the_queue():
+    definitions, callers = 0, set()
     for name in sorted(os.listdir(APP_DIR)):
         if not name.endswith(".py"):
             continue
-        for number, line in enumerate(open(os.path.join(APP_DIR, name), encoding="utf-8"), 1):
+        for line in open(os.path.join(APP_DIR, name), encoding="utf-8"):
             if "content_fetch_enabled" in line:
                 if re.match(r"\s*def content_fetch_enabled\(", line):
                     definitions += 1
-                else:
-                    calls.append((name, number, line.strip()))
-    assert definitions == 1 and calls == []
+                elif re.search(r"content_fetch_enabled\(\)", line):
+                    callers.add(name)
+    assert definitions == 1
+    assert callers == {"crawler.py", "enrichment_queue.py"}
 
 
 @pytest.mark.parametrize("name", ["crawler.py", "main.py", "ingest_ops.py", "enrichment_queue.py"])
-def test_pipeline_modules_have_no_import_of_the_fetch_modules(name):
+def test_pipeline_modules_have_no_module_level_import_of_the_fetch_modules(name):
     source = open(os.path.join(APP_DIR, name), encoding="utf-8").read()
-    assert not re.search(r"^\s*(?:from\s+app(?:\.content_fetch\w*)?\s+import\s+.*content_fetch|"
-                         r"from\s+app\.content_fetch\w*\s+import|import\s+app\.content_fetch)", source, re.M)
+    assert not re.search(r"^(?:from\s+app\.content_fetch\w*\s+import|import\s+app\.content_fetch|"
+                         r"from\s+app\s+import\s+.*content_fetch)", source, re.M)
 
 
 # ---------------------------------------------------------------------------
