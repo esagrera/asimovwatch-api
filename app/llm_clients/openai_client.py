@@ -44,6 +44,10 @@ def _get_openai_client():
         raise RuntimeError("OPENAI_API_KEY no configurada")
     return OpenAI(api_key=api_key)
 
+def _is_reasoning_family(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
+
 def call_openai_client(
     model: str,
     prompt: str,
@@ -54,15 +58,21 @@ def call_openai_client(
 ) -> str:
     client = _get_openai_client()
 
+    params = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+    }
+    if _is_reasoning_family(model):
+        # Els tokens de raonament compten dins max_completion_tokens
+        params["max_completion_tokens"] = max(max_tokens, 1024)
+    else:
+        params["max_tokens"] = max_tokens
+        params["temperature"] = temperature
+
     try:
-        response = client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-        )
+        response = client.chat.completions.create(**params)
     except Exception as e:
         raise RuntimeError(f"OpenAI request failed: {str(e)}") from e
 
@@ -72,6 +82,11 @@ def call_openai_client(
     final_text = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
     if not final_text:
+        if getattr(response.choices[0], "finish_reason", None) == "length":
+            raise RuntimeError(
+                "OpenAI ha retornat contingut buit (finish_reason=length; "
+                "possible consum de tokens de raonament)"
+            )
         raise RuntimeError("OpenAI ha retornat contingut buit")
 
     return final_text
