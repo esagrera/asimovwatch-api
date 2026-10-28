@@ -6,8 +6,9 @@ from typing import Optional
 from openai import OpenAI
 
 FALLBACK_MODELS = [
-    {"name": "gpt-4.1-mini", "stable": True},
-    {"name": "gpt-4.1", "stable": True},
+    {"name": "gpt-6-luna", "stable": True},
+    {"name": "gpt-5.4-mini", "stable": True},
+    {"name": "gpt-5-mini", "stable": True},
 ]
 
 _MODELS_CACHE = {"data": None, "ts": 0}
